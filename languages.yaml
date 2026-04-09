@@ -1,0 +1,105 @@
+languages:
+  python:
+    lsp:
+      server: pyright
+    formatter: black
+    treesitter: python
+
+  lua:
+    lsp:
+      server: lua_ls
+      settings:
+        Lua:
+          completion:
+            callSnippet: Replace
+          diagnostics:
+            globals: ["vim"]
+    formatter: stylua
+    treesitter: lua
+
+  go:
+    lsp:
+      server: gopls
+    formatter: [goimports, gofmt]
+    treesitter: go
+
+  javascript:
+    lsp:
+      server: ts_ls
+      filetypes: ["javascript", "javascriptreact"]
+    formatter: biome
+    treesitter: javascript
+
+  typescript:
+    lsp:
+      server: ts_ls
+      filetypes: ["typescript", "typescriptreact"]
+    formatter: prettierd
+    treesitter: typescript
+
+  html:
+    lsp:
+      server: html
+      filetypes: ["html", "template"]
+    formatter: prettierd
+    treesitter: html
+    extras:
+      additional_servers:
+        - server: emmet_language_server
+          filetypes: ["html", "templ"]
+
+  css:
+    lsp:
+      server: cssls
+    formatter: prettierd
+    treesitter: css
+
+  json:
+    formatter: prettierd
+    treesitter: json
+
+  yaml:
+    formatter: prettierd
+    treesitter: yaml
+
+  toml:
+    formatter: taplo
+    treesitter: toml
+
+  sql:
+    lsp:
+      server: postgres_lsp
+      filetypes: ["sql"]
+    formatter: pg_format
+    treesitter: sql
+
+  terraform:
+    lsp:
+      server: terraformls
+      filetypes: ["terraform", "tf"]
+    treesitter: hcl
+
+  templ:
+    lsp:
+      server: templ
+      cmd: ["templ", "lsp"]
+      filetypes: ["templ"]
+    formatter: templ
+    treesitter: templ
+    extras:
+      filetype_register:
+        extension: templ
+        name: templ
+      additional_servers:
+        - server: tailwindcss
+          filetypes: ["templ"]
+          settings:
+            tailwindCSS:
+              classAttributes: ["class"]
+              experimental:
+                classRegex:
+                  - "(?<=class=[\"'`])[^\"'`\\s]+"
+
+  gdscript:
+    formatter: gdformat
+    treesitter: gdscript
