@@ -111,12 +111,13 @@ function M.setup()
 
 	-- Treesitter
 	require("nvim-treesitter").setup({
-		ensure_installed = collect_grammars(languages),
-		auto_install = false,
-		sync_install = false,
-		highlight = { enable = true },
-		indent = { enable = true },
 		install_dir = vim.fn.stdpath("data") .. "/site",
+	})
+
+	vim.api.nvim_create_autocmd("FileType", {
+		callback = function()
+			vim.treesitter.start()
+		end,
 	})
 
 	-- Conform
