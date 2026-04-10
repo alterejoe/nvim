@@ -1,11 +1,16 @@
 languages:
   python:
+    mason:
+      - pyright
+      - black
     lsp:
       server: pyright
     formatter: black
     treesitter: python
-
   lua:
+    mason:
+      - lua-language-server
+      - stylua
     lsp:
       server: lua_ls
       settings:
@@ -16,28 +21,37 @@ languages:
             globals: ["vim"]
     formatter: stylua
     treesitter: lua
-
   go:
+    mason:
+      - gopls
+      - goimports
     lsp:
       server: gopls
     formatter: [goimports, gofmt]
     treesitter: go
-
   javascript:
+    mason:
+      - typescript-language-server
+      - biome
     lsp:
       server: ts_ls
       filetypes: ["javascript", "javascriptreact"]
     formatter: biome
     treesitter: javascript
-
   typescript:
+    mason:
+      - typescript-language-server
+      - prettierd
     lsp:
       server: ts_ls
       filetypes: ["typescript", "typescriptreact"]
     formatter: prettierd
     treesitter: typescript
-
   html:
+    mason:
+      - html-lsp
+      - prettierd
+      - emmet-language-server
     lsp:
       server: html
       filetypes: ["html", "template"]
@@ -47,39 +61,49 @@ languages:
       additional_servers:
         - server: emmet_language_server
           filetypes: ["html", "templ"]
-
   css:
+    mason:
+      - css-lsp
+      - prettierd
     lsp:
       server: cssls
     formatter: prettierd
     treesitter: css
-
   json:
+    mason:
+      - prettierd
     formatter: prettierd
     treesitter: json
-
   yaml:
+    mason:
+      - prettierd
     formatter: prettierd
     treesitter: yaml
-
   toml:
+    mason:
+      - taplo
     formatter: taplo
     treesitter: toml
-
   sql:
+    mason:
+      - postgres-language-server
+      - pg_format
     lsp:
       server: postgres_lsp
       filetypes: ["sql"]
     formatter: pg_format
     treesitter: sql
-
   terraform:
+    mason:
+      - terraform-ls
     lsp:
       server: terraformls
       filetypes: ["terraform", "tf"]
     treesitter: hcl
-
   templ:
+    mason:
+      - templ
+      - tailwindcss-language-server
     lsp:
       server: templ
       cmd: ["templ", "lsp"]
@@ -99,7 +123,8 @@ languages:
               experimental:
                 classRegex:
                   - "(?<=class=[\"'`])[^\"'`\\s]+"
-
   gdscript:
+    mason:
+      - gdtoolkit
     formatter: gdformat
     treesitter: gdscript
