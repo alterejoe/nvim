@@ -4,11 +4,11 @@
 --
 -- Keymaps:
 --   <leader>ra  Start Air for current project (requires .air.toml in cwd)
---   <leader>ro  Open Air output in a vsplit terminal (live, full nvim controls)
+--   <leader>ro  Toggle Air log buffer (vsplit, live, navigable)
+--   <leader>rr  Restart Air session
 --   <leader>rq  Kill Air session for current project
 
 local M = {}
-
 local AIR_PREFIX = "air-"
 
 local function in_tmux()
@@ -27,6 +27,10 @@ local function session_name()
     return AIR_PREFIX .. project_name()
 end
 
+local function log_path()
+    return "/tmp/air-" .. project_name() .. ".log"
+end
+
 local function session_exists(name)
     vim.fn.system("tmux has-session -t=" .. vim.fn.shellescape(name) .. " 2>/dev/null")
     return vim.v.shell_error == 0
@@ -34,6 +38,41 @@ end
 
 local function has_air_toml()
     return vim.fn.filereadable(vim.fn.getcwd() .. "/.air.toml") == 1
+end
+
+local function open_log_buffer()
+    local log = log_path()
+    local bufname = "air-log-" .. project_name()
+
+    local attempts = 0
+    local function try_open()
+        attempts = attempts + 1
+        if vim.fn.filereadable(log) == 0 and attempts < 20 then
+            vim.defer_fn(try_open, 100)
+            return
+        end
+        vim.cmd("vsplit")
+        local buf = vim.api.nvim_create_buf(false, true)
+        vim.api.nvim_win_set_buf(0, buf)
+        vim.fn.termopen("tail -f " .. vim.fn.shellescape(log))
+        vim.api.nvim_buf_set_name(buf, bufname)
+        vim.bo[buf].bufhidden = "hide"
+        vim.cmd("stopinsert")
+    end
+    try_open()
+end
+
+local function close_log_buffer()
+    local bufname = "air-log-" .. project_name()
+    local was_open = false
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf):find(bufname, 1, true) then
+            was_open = #vim.fn.win_findbuf(buf) > 0
+            vim.api.nvim_buf_delete(buf, { force = true })
+            break
+        end
+    end
+    return was_open
 end
 
 -- ── start ────────────────────────────────────────────────────────────────────
@@ -54,12 +93,17 @@ vim.keymap.set("n", "<leader>ra", function()
         return
     end
 
+    local log = log_path()
     local cwd = vim.fn.shellescape(vim.fn.getcwd())
+
+    vim.fn.system("rm -f " .. vim.fn.shellescape(log))
     tmux("new-session -ds " .. vim.fn.shellescape(name) .. " -c " .. cwd .. " 'air'")
+    tmux("pipe-pane -t " .. vim.fn.shellescape(name) .. " 'cat >> " .. log .. "'")
+
     vim.notify("air: started [" .. name .. "]")
 end, { desc = "Air: start" })
 
--- ── open output ──────────────────────────────────────────────────────────────
+-- ── toggle log ───────────────────────────────────────────────────────────────
 
 vim.keymap.set("n", "<leader>ro", function()
     if not in_tmux() then
@@ -73,9 +117,8 @@ vim.keymap.set("n", "<leader>ro", function()
         return
     end
 
-    local bufname = "air-attach-" .. project_name()
+    local bufname = "air-log-" .. project_name()
 
-    -- Find existing buffer
     local existing_buf = nil
     for _, buf in ipairs(vim.api.nvim_list_bufs()) do
         if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf):find(bufname, 1, true) then
@@ -87,24 +130,49 @@ vim.keymap.set("n", "<leader>ro", function()
     if existing_buf then
         local wins = vim.fn.win_findbuf(existing_buf)
         if #wins > 0 then
-            -- Visible — close it (toggle off)
             for _, win in ipairs(wins) do
                 vim.api.nvim_win_close(win, true)
             end
         else
-            -- Exists but hidden — show it
             vim.cmd("vsplit")
             vim.api.nvim_win_set_buf(0, existing_buf)
         end
         return
     end
 
-    -- Doesn't exist — create it
-    vim.cmd("vsplit")
-    vim.cmd("terminal tmux attach-session -t " .. vim.fn.shellescape(name) .. " -r")
-    vim.cmd("file " .. bufname)
-    vim.cmd("startinsert")
-end, { desc = "Air: toggle output" })
+    open_log_buffer()
+end, { desc = "Air: toggle log" })
+
+-- ── restart ───────────────────────────────────────────────────────────────────
+
+vim.keymap.set("n", "<leader>rr", function()
+    if not in_tmux() then
+        return
+    end
+
+    local name = session_name()
+    if not session_exists(name) then
+        vim.notify("air: no session for this project", vim.log.levels.WARN)
+        return
+    end
+
+    local log = log_path()
+    local was_open = close_log_buffer()
+
+    tmux("pipe-pane -t " .. vim.fn.shellescape(name))
+    tmux("kill-session -t " .. vim.fn.shellescape(name))
+    vim.fn.system("rm -f " .. vim.fn.shellescape(log))
+
+    local cwd = vim.fn.shellescape(vim.fn.getcwd())
+    tmux("new-session -ds " .. vim.fn.shellescape(name) .. " -c " .. cwd .. " 'air'")
+    tmux("pipe-pane -t " .. vim.fn.shellescape(name) .. " 'cat >> " .. log .. "'")
+
+    vim.notify("air: restarted [" .. name .. "]")
+
+    if was_open then
+        open_log_buffer()
+    end
+end, { desc = "Air: restart" })
 
 -- ── kill ─────────────────────────────────────────────────────────────────────
 
@@ -119,16 +187,9 @@ vim.keymap.set("n", "<leader>rq", function()
         return
     end
 
-    -- Close any terminal buffers attached to this session
-    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-        if vim.api.nvim_buf_is_valid(buf) then
-            local bname = vim.api.nvim_buf_get_name(buf)
-            if bname:find("air%-attach%-" .. project_name(), 1, true) then
-                vim.api.nvim_buf_delete(buf, { force = true })
-            end
-        end
-    end
-
+    close_log_buffer()
+    tmux("pipe-pane -t " .. vim.fn.shellescape(name))
+    vim.fn.system("rm -f " .. vim.fn.shellescape(log_path()))
     tmux("kill-session -t " .. vim.fn.shellescape(name))
     vim.notify("air: killed [" .. name .. "]")
 end, { desc = "Air: kill" })

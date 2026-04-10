@@ -144,6 +144,13 @@ for i, key in ipairs({ "j", "k", "l", ";", "u", "i", "o", "p" }) do
         switch_slot(i)
     end, { desc = "Tmux slot " .. i, noremap = true })
 end
+
+for i, key in ipairs({ "J", "K", "L", ":", "U", "I", "O", "P" }) do
+    vim.keymap.set("n", "<M-" .. key .. ">", function()
+        switch_slot(i + 8)
+    end, { desc = "Tmux slot " .. (i + 8), noremap = true })
+end
+
 -- ── sessionizer ──────────────────────────────────────────────────────────────
 vim.keymap.set("n", "<C-f>", function()
     if not in_tmux() then

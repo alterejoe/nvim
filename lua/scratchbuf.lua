@@ -91,6 +91,79 @@ local function diff(original, current)
     }
 end
 
+local function fuzzy_filter(buf, win, lines)
+    local ns = vim.api.nvim_create_namespace("scratchbuf_filter")
+    local query = ""
+
+    local function apply(q)
+        local filtered = {}
+        for _, l in ipairs(lines) do
+            if q == "" or l:lower():find(q:lower(), 1, true) then
+                table.insert(filtered, l)
+            end
+        end
+        if #filtered == 0 then
+            filtered = lines
+        end
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, filtered)
+        vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+        vim.api.nvim_buf_set_extmark(buf, ns, 0, 0, {
+            virt_text = { { "  /" .. q .. "▋", "Comment" } },
+            virt_text_pos = "eol",
+        })
+        vim.api.nvim_win_set_cursor(win, { 1, 0 })
+        vim.cmd("redraw")
+        return filtered
+    end
+
+    local filtered = apply("")
+
+    local function loop()
+        while true do
+            local ok, ch = pcall(vim.fn.getcharstr)
+            if not ok then
+                break
+            end
+
+            if ch == "\27" then -- Esc — cancel
+                vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+                vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+                vim.cmd("redraw")
+                break
+            elseif ch == "\r" then -- CR — accept
+                vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+                vim.cmd("redraw")
+                break
+                -- elseif ch ~= "\r" and ch ~= "\27" then
+            elseif ch == "\8" or ch == "\127" or ch == "\x80\xfd-" or ch == "\x80kb" then -- BS
+                -- vim.notify(string.format("key: %q len:%d byte:%d", ch, #ch, ch:byte(1)), vim.log.levels.INFO)
+                if #query > 0 then
+                    query = query:sub(1, -2)
+                    filtered = apply(query)
+                end
+            elseif ch == "\14" or ch == "j" then -- ctrl-n or j — down
+                local row = vim.api.nvim_win_get_cursor(win)[1]
+                local total = vim.api.nvim_buf_line_count(buf)
+                if row < total then
+                    vim.api.nvim_win_set_cursor(win, { row + 1, 0 })
+                    vim.cmd("redraw")
+                end
+            elseif ch == "\16" or ch == "k" then -- ctrl-p or k — up
+                local row = vim.api.nvim_win_get_cursor(win)[1]
+                if row > 1 then
+                    vim.api.nvim_win_set_cursor(win, { row - 1, 0 })
+                    vim.cmd("redraw")
+                end
+            elseif #ch == 1 and ch:byte() >= 32 then -- printable
+                query = query .. ch
+                filtered = apply(query)
+            end
+        end
+    end
+
+    loop()
+end
+
 local function get_lines(buf)
     local result = {}
     for _, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
@@ -126,23 +199,6 @@ local function set_win_opts(win)
     vim.wo[win].number = true
     vim.wo[win].signcolumn = "no"
     vim.wo[win].wrap = false
-end
-
-local function fuzzy_filter(buf, original_lines)
-    local input = vim.fn.input("Filter: ")
-    if input == "" then
-        vim.api.nvim_buf_set_lines(buf, 0, -1, false, original_lines)
-        return
-    end
-    local pattern = input:lower()
-    local filtered = vim.tbl_filter(function(l)
-        return l:lower():find(pattern, 1, true) ~= nil
-    end, original_lines)
-    if #filtered == 0 then
-        vim.notify("scratchbuf: no matches for '" .. input .. "'", vim.log.levels.WARN)
-        return
-    end
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, filtered)
 end
 
 function M.open(opts)
@@ -277,7 +333,7 @@ function M.open(opts)
     end, "Paste above")
 
     map("/", function()
-        fuzzy_filter(buf, original)
+        fuzzy_filter(buf, win, get_lines(buf))
     end, "Fuzzy filter")
 
     map("r", function()

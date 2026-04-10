@@ -13,6 +13,7 @@
   "lazy.nvim": { "branch": "main", "commit": "306a05526ada86a7b30af95c5cc81ffba93fef97" },
   "mason.nvim": { "branch": "main", "commit": "b03fb0f20bc1d43daf558cda981a2be22e73ac42" },
   "nvim-cmp": { "branch": "main", "commit": "a1d504892f2bc56c2e79b65c6faded2fd21f3eca" },
+  "nvim-emmet": { "branch": "main", "commit": "cde4fb2968704aae5c18b7f8a9bc2508767bb78d" },
   "nvim-lspconfig": { "branch": "master", "commit": "c588db330592fa477a70d2fee6ba20a57194bdc3" },
   "nvim-treesitter": { "branch": "master", "commit": "4916d6592ede8c07973490d9322f187e07dfefac" },
   "nvim-web-devicons": { "branch": "master", "commit": "c72328a5494b4502947a022fe69c0c47e53b6aa6" },
@@ -21,5 +22,8 @@
   "telescope-egrepify.nvim": { "branch": "master", "commit": "cd9342b95c1a8cff2e41ba5041ae3912f47595cc" },
   "telescope-fzf-native.nvim": { "branch": "main", "commit": "6fea601bd2b694c6f2ae08a6c6fab14930c60e2c" },
   "telescope-tmuxing.nvim": { "branch": "main", "commit": "97326b70fb7a6316eefd0179cad1ecf764877f3b" },
-  "telescope.nvim": { "branch": "master", "commit": "48d2656e54d3e3953ae647153ccdaffa50d4d76b" }
+  "telescope.nvim": { "branch": "master", "commit": "48d2656e54d3e3953ae647153ccdaffa50d4d76b" },
+  "vim-dadbod": { "branch": "master", "commit": "6d1d41da4873a445c5605f2005ad2c68c99d8770" },
+  "vim-dadbod-completion": { "branch": "master", "commit": "a8dac0b3cf6132c80dc9b18bef36d4cf7a9e1fe6" },
+  "vim-dadbod-ui": { "branch": "master", "commit": "460432301a5cb280ea265ddfa15c9f3dcd1d26b7" }
 }
