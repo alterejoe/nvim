@@ -65,57 +65,57 @@ vim.keymap.set("n", "<C-f>", function()
     end
     table.insert(dirs, 1, vim.fn.getcwd())
 
-    require("telescope.pickers").new({}, {
-        prompt_title = "Tmux Sessionizer",
-        finder = require("telescope.finders").new_table({
-            results = dirs,
-            entry_maker = function(entry)
-                return {
-                    value   = entry,
-                    display = vim.fn.fnamemodify(entry, ":~"),
-                    ordinal = entry,
-                }
+    require("telescope.pickers")
+        .new({}, {
+            prompt_title = "Tmux Sessionizer",
+            finder = require("telescope.finders").new_table({
+                results = dirs,
+                entry_maker = function(entry)
+                    return {
+                        value = entry,
+                        display = vim.fn.fnamemodify(entry, ":~"),
+                        ordinal = entry,
+                    }
+                end,
+            }),
+            sorter = require("telescope.config").values.generic_sorter({}),
+            attach_mappings = function(prompt_bufnr)
+                require("telescope.actions").select_default:replace(function()
+                    local sel = require("telescope.actions.state").get_selected_entry()
+                    require("telescope.actions").close(prompt_bufnr)
+                    if sel then
+                        sessionize(sel.value)
+                    end
+                end)
+                return true
             end,
-        }),
-        sorter = require("telescope.config").values.generic_sorter({}),
-        attach_mappings = function(prompt_bufnr)
-            require("telescope.actions").select_default:replace(function()
-                local sel = require("telescope.actions.state").get_selected_entry()
-                require("telescope.actions").close(prompt_bufnr)
-                if sel then sessionize(sel.value) end
-            end)
-            return true
-        end,
-    }):find()
+        })
+        :find()
 end, { desc = "Tmux sessionizer" })
 
 -- Oil-style session editor
 vim.keymap.set("n", "<leader>ts", function()
-    if not in_tmux() then return end
+    if not in_tmux() then
+        return
+    end
     scratchbuf.open({
-        title   = "Tmux Sessions",
-        lines   = get_sessions(),
+        title = "Tmux Sessions",
+        lines = get_sessions(),
         refresh = get_sessions,
         on_open = function(entry)
             tmux("switch-client -t " .. vim.fn.shellescape(entry))
         end,
         on_save = function(changes)
             for _, r in ipairs(changes.renamed) do
-                tmux("rename-session -t " .. vim.fn.shellescape(r.old)
-                    .. " " .. vim.fn.shellescape(r.new))
+                tmux("rename-session -t " .. vim.fn.shellescape(r.old) .. " " .. vim.fn.shellescape(r.new))
             end
             for _, d in ipairs(changes.deleted) do
                 tmux("kill-session -t " .. vim.fn.shellescape(d))
             end
             for _, c in ipairs(changes.created) do
-                local path = vim.fn.input(
-                    "Path for [" .. c .. "]: ",
-                    vim.fn.getcwd(),
-                    "dir"
-                )
+                local path = vim.fn.input("Path for [" .. c .. "]: ", vim.fn.getcwd(), "dir")
                 if path and path ~= "" then
-                    tmux("new-session -ds " .. vim.fn.shellescape(c)
-                        .. " -c " .. vim.fn.shellescape(path))
+                    tmux("new-session -ds " .. vim.fn.shellescape(c) .. " -c " .. vim.fn.shellescape(path))
                     tmux("switch-client -t " .. vim.fn.shellescape(c))
                 end
             end
@@ -125,7 +125,9 @@ end, { desc = "Tmux sessions (edit)" })
 
 -- Rename current session inline
 vim.keymap.set("n", "<leader>tr", function()
-    if not in_tmux() then return end
+    if not in_tmux() then
+        return
+    end
     local current = vim.fn.system("tmux display-message -p '#S'"):gsub("%s+", "")
     local name = vim.fn.input("Rename session [" .. current .. "]: ")
     if name and name ~= "" then
@@ -136,11 +138,59 @@ end, { desc = "Tmux rename session" })
 
 -- Splits
 vim.keymap.set("n", "<leader>t|", function()
-    if not in_tmux() then return end
+    if not in_tmux() then
+        return
+    end
     tmux("split-window -h -c " .. vim.fn.shellescape(vim.fn.getcwd()))
 end, { desc = "Tmux vertical split" })
 
 vim.keymap.set("n", "<leader>t-", function()
-    if not in_tmux() then return end
+    if not in_tmux() then
+        return
+    end
     tmux("split-window -v -c " .. vim.fn.shellescape(vim.fn.getcwd()))
 end, { desc = "Tmux horizontal split" })
+
+vim.keymap.set("n", "<C-f>", function()
+    if not in_tmux() then
+        vim.notify("Not in tmux", vim.log.levels.WARN)
+        return
+    end
+
+    local scan = require("plenary.scandir")
+    local dirs = scan.scan_dir(vim.fn.getcwd(), {
+        depth = 2,
+        only_dirs = true,
+        silent = true,
+        respect_gitignore = true,
+    })
+
+    table.insert(dirs, 1, vim.fn.getcwd())
+
+    require("telescope.pickers")
+        .new({}, {
+            prompt_title = "Tmux Sessionizer",
+            finder = require("telescope.finders").new_table({
+                results = dirs,
+                entry_maker = function(entry)
+                    return {
+                        value = entry,
+                        display = vim.fn.fnamemodify(entry, ":~"),
+                        ordinal = entry,
+                    }
+                end,
+            }),
+            sorter = require("telescope.config").values.generic_sorter({}),
+            attach_mappings = function(prompt_bufnr)
+                require("telescope.actions").select_default:replace(function()
+                    local sel = require("telescope.actions.state").get_selected_entry()
+                    require("telescope.actions").close(prompt_bufnr)
+                    if sel then
+                        sessionize(sel.value)
+                    end
+                end)
+                return true
+            end,
+        })
+        :find()
+end, { desc = "Tmux sessionizer" })

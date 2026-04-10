@@ -25,8 +25,8 @@ return {
                 defaults = {
                     mappings = {
                         i = {
+                            ["jk"] = false,
                             ["<C-h>"] = "which_key",
-                            ["jk"] = require("telescope.actions").close,
                         },
                     },
                 },
@@ -62,38 +62,6 @@ return {
         dependencies = {
             "nvim-telescope/telescope.nvim",
             "nvim-lua/plenary.nvim",
-        },
-        keys = {
-            {
-                "<leader>ts",
-                "<cmd>lua require('telescope').extensions.tmux.switch_session({ list_sessions = 'simple'})<cr>",
-                desc = "Switch Tmux session",
-            },
-            {
-                "<leader>tS",
-                "<cmd>lua require('telescope').extensions.tmux.switch_window()<cr>",
-                desc = "Switch Tmux window",
-            },
-            {
-                "<leader>ta",
-                "<cmd>lua require('telescope').extensions.tmux.switch_session({ list_sessions = 'full'})<cr>",
-                desc = "All Tmux sessions",
-            },
-            {
-                "<leader>tc",
-                "<cmd>lua require('telescope').extensions.tmux.create_session()<cr>",
-                desc = "Create Tmux session",
-            },
-            {
-                "<leader>tr",
-                "<cmd>lua require('telescope').extensions.tmux.rename_current_session()<cr>",
-                desc = "Rename Tmux session",
-            },
-            {
-                "<leader>tk",
-                "<cmd>lua require('telescope').extensions.tmux.kill_current_session()<cr>",
-                desc = "Kill Tmux session",
-            },
         },
     },
 }

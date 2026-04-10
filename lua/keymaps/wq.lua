@@ -12,8 +12,12 @@ vim.keymap.set("n", "Q", function()
     local delete_by_name = { output = true }
     local delete_by_ft = { ["kulala://ui"] = true }
 
-    if delete_by_name[bufname] then return force_delete(buf) end
-    if delete_by_ft[filetype] then return force_delete(buf) end
+    if delete_by_name[bufname] then
+        return force_delete(buf)
+    end
+    if delete_by_ft[filetype] then
+        return force_delete(buf)
+    end
 
     if buftype == "terminal" then
         vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-c>", true, true, true), "i", false)
