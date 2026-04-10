@@ -97,7 +97,7 @@ local function ordered_sessions()
     --    is deterministic regardless of which session tmux lists first
     local unseen = {}
     for _, s in ipairs(live) do
-        if not seen[s] then
+        if not seen[s] and not s:find("^air%-") then
             table.insert(unseen, s)
         end
     end
@@ -145,7 +145,6 @@ for i, key in ipairs({ "j", "k", "l", ";", "u", "i", "o", "p" }) do
     end, { desc = "Tmux slot " .. i, noremap = true })
 end
 -- ── sessionizer ──────────────────────────────────────────────────────────────
-
 vim.keymap.set("n", "<C-f>", function()
     if not in_tmux() then
         vim.notify("Not in tmux", vim.log.levels.WARN)
@@ -153,21 +152,32 @@ vim.keymap.set("n", "<C-f>", function()
     end
 
     local scan = require("plenary.scandir")
-    local search_dirs = {
-        vim.fn.expand("~/Projects"),
-        vim.fn.expand("~/personal"),
-    }
+    local cwd = vim.fn.getcwd()
+    local home_projects = vim.fn.expand("~/projects")
 
     local dirs = {}
-    for _, base in ipairs(search_dirs) do
-        if vim.fn.isdirectory(base) == 1 then
-            local found = scan.scan_dir(base, { depth = 1, only_dirs = true, silent = true })
-            for _, d in ipairs(found) do
-                table.insert(dirs, d)
-            end
+    local seen = {}
+
+    local function add(d)
+        if not seen[d] then
+            seen[d] = true
+            table.insert(dirs, d)
         end
     end
-    table.insert(dirs, 1, vim.fn.getcwd())
+
+    add(cwd)
+
+    -- scan ~/projects one level deep for project roots
+    if vim.fn.isdirectory(home_projects) == 1 then
+        for _, d in ipairs(scan.scan_dir(home_projects, { depth = 1, only_dirs = true, silent = true })) do
+            add(d)
+        end
+    end
+
+    -- scan cwd fully for nested dirs
+    for _, d in ipairs(scan.scan_dir(cwd, { only_dirs = true, silent = true })) do
+        add(d)
+    end
 
     require("telescope.pickers")
         .new({}, {
@@ -195,9 +205,7 @@ vim.keymap.set("n", "<C-f>", function()
             end,
         })
         :find()
-end, { desc = "Tmux sessionizer" })
-
--- ── session editor ───────────────────────────────────────────────────────────
+end, { desc = "Tmux sessionizer" }) -- ── session editor ───────────────────────────────────────────────────────────
 
 vim.keymap.set("n", "<leader>ts", function()
     if not in_tmux() then
@@ -265,6 +273,28 @@ vim.keymap.set("n", "<leader>ts", function()
         end,
     })
 end, { desc = "Tmux sessions (edit)" })
+
+vim.keymap.set("n", "<leader>tS", function()
+    if not in_tmux() then
+        return
+    end
+    local all = vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null")
+    if vim.v.shell_error ~= 0 or #all == 0 then
+        vim.notify("tmux: no sessions", vim.log.levels.WARN)
+        return
+    end
+    scratchbuf.open({
+        title = "All Tmux Sessions (incl. air)",
+        lines = all,
+        refresh = function()
+            return vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null")
+        end,
+        on_open = function(entry)
+            tmux("switch-client -t " .. vim.fn.shellescape(entry))
+        end,
+        on_save = function() end, -- read-only, no save logic
+    })
+end, { desc = "Tmux: all sessions (debug)" })
 
 -- ── rename ───────────────────────────────────────────────────────────────────
 
