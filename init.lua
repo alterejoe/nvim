@@ -9,3 +9,4 @@ end
 require("filetypes")
 require("lazycfg")
 require("settings")
+require("keymaps")

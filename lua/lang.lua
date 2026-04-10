@@ -91,6 +91,18 @@ local function collect_formatters(languages)
 	return formatters_by_ft
 end
 
+local function collect_mason_packages(languages)
+local packages = {}
+for _, config in pairs(languages) do
+if config.mason then
+for _, pkg in ipairs(config.mason) do
+table.insert(packages, pkg)
+end
+end
+end
+return packages
+end
+
 function M.setup()
 	local config_path = vim.fn.stdpath("config") .. "/languages.yaml"
 	local data = parse_yaml(config_path)
@@ -114,11 +126,11 @@ function M.setup()
 		install_dir = vim.fn.stdpath("data") .. "/site",
 	})
 
-	vim.api.nvim_create_autocmd("FileType", {
-		callback = function()
-			vim.treesitter.start()
-		end,
-	})
+    vim.api.nvim_create_autocmd("FileType", {
+        callback = function()
+            pcall(vim.treesitter.start)
+        end,
+    })
 
 	-- Conform
 	require("conform").setup({
