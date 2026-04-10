@@ -1,0 +1,6 @@
+vim.keymap.set("n", "zh", function()
+    local col = vim.fn.virtcol(".")
+    local width = vim.api.nvim_win_get_width(0)
+    local offset = math.max(0, col - math.floor(width / 2))
+    vim.fn.winrestview({ leftcol = offset })
+end)
