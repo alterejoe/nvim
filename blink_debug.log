@@ -1,0 +1,2 @@
+After blink.cmp.setup:
+imap <Tab>: "<Lua 25: vim/_defaults.lua:0>"

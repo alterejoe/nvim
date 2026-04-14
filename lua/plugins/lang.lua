@@ -15,8 +15,4 @@ return {
 		commit = "086a40d",
 		event = "BufWritePre",
 	},
-	{
-		"hrsh7th/cmp-nvim-lsp",
-		commit = "a8912b8", -- needed for capabilities
-	},
 }

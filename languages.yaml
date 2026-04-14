@@ -1,3 +1,27 @@
+# languages.yaml
+#
+# Each language entry supports these top-level keys:
+#
+#   mason:      list of mason packages to install
+#   lsp:        LSP server configuration
+#     server:     server name (required)
+#     cmd:        optional command override
+#     filetypes:  optional filetype list
+#     settings:   optional server settings table
+#   formatter:  string or list of conform formatter names
+#   treesitter: grammar name (string) or list of grammar names
+#   blink:      (optional) blink.cmp source overrides for this filetype
+#     sources:       fully replace default sources  [lsp, path, snippets, buffer]
+#     extra_sources: prepend extra sources in front of defaults
+#   extras:     miscellaneous extra config
+#     filetype_register:
+#       extension:  file extension to register
+#       name:       filetype name
+#     additional_servers: list of extra LSP servers to enable alongside the primary
+#       - server:   server name
+#         filetypes: ...
+#         settings:  ...
+
 languages:
   python:
     mason:
@@ -7,6 +31,7 @@ languages:
       server: pyright
     formatter: black
     treesitter: python
+
   lua:
     mason:
       - lua-language-server
@@ -21,6 +46,7 @@ languages:
             globals: ["vim"]
     formatter: stylua
     treesitter: lua
+
   go:
     mason:
       - gopls
@@ -29,6 +55,7 @@ languages:
       server: gopls
     formatter: [goimports, gofmt]
     treesitter: go
+
   javascript:
     mason:
       - typescript-language-server
@@ -38,6 +65,7 @@ languages:
       filetypes: ["javascript", "javascriptreact"]
     formatter: biome
     treesitter: javascript
+
   typescript:
     mason:
       - typescript-language-server
@@ -47,6 +75,7 @@ languages:
       filetypes: ["typescript", "typescriptreact"]
     formatter: prettierd
     treesitter: typescript
+
   html:
     mason:
       - html-lsp
@@ -61,6 +90,7 @@ languages:
       additional_servers:
         - server: emmet_language_server
           filetypes: ["html", "templ"]
+
   css:
     mason:
       - css-lsp
@@ -69,21 +99,25 @@ languages:
       server: cssls
     formatter: prettierd
     treesitter: css
+
   json:
     mason:
       - prettierd
     formatter: prettierd
     treesitter: json
+
   yaml:
     mason:
       - prettierd
     formatter: prettierd
     treesitter: yaml
+
   toml:
     mason:
       - taplo
     formatter: taplo
     treesitter: toml
+
   sql:
     mason:
       - postgres-language-server
@@ -93,6 +127,10 @@ languages:
       filetypes: ["sql"]
     formatter: pg_format
     treesitter: sql
+    # example: add a dadbod source for SQL buffers on top of defaults
+    # blink:
+    #   extra_sources: [dadbod]
+
   terraform:
     mason:
       - terraform-ls
@@ -100,6 +138,7 @@ languages:
       server: terraformls
       filetypes: ["terraform", "tf"]
     treesitter: hcl
+
   templ:
     mason:
       - templ
@@ -123,6 +162,7 @@ languages:
               experimental:
                 classRegex:
                   - "(?<=class=[\"'`])[^\"'`\\s]+"
+
   gdscript:
     mason:
       - gdtoolkit
