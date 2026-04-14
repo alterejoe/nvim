@@ -23,17 +23,17 @@ return {
 					opts = { skip = true },
 				},
 			},
+			views = {
+				mini = {
+					position = { row = -2, col = 0 }, -- bottom-left
+					align = "message-left",
+				},
+			},
 			presets = {
 				bottom_search = true,
 				command_palette = true,
 				long_message_to_split = true,
 			},
 		},
-		config = function(_, opts)
-			require("noice").setup(opts)
-			-- View history with :Noice history
-			-- Copy from history, see messages clearly
-			vim.keymap.set("n", "<leader>nh", "<cmd>Noice history<CR>", { desc = "Notification history" })
-		end,
 	},
 }

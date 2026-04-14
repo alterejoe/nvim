@@ -15,6 +15,24 @@ local M = {}
 -- Cached parsed data so YAML is only read once per session.
 local _languages = nil
 
+-- Check neovim version
+local function check_nvim_version(major, minor, patch)
+	local v = vim.version()
+	if v.major > major then
+		return true
+	end
+	if v.major < major then
+		return false
+	end
+	if v.minor > minor then
+		return true
+	end
+	if v.minor < minor then
+		return false
+	end
+	return v.patch >= patch
+end
+
 local function languages()
 	if _languages then
 		return _languages
@@ -35,10 +53,18 @@ function M.setup()
 		return
 	end
 
+	local has_0_12 = check_nvim_version(0, 12, 0)
+
 	-- order matters: filetypes must be registered before LSP attaches
 	require("lang.filetypes").setup(langs)
 	require("lang.lsp").setup(langs)
+
+	-- if has_0_12 then
 	require("lang.treesitter").setup(langs)
+	-- else
+	-- 	vim.notify("lang: nvim < 0.12, treesitter setup skipped", vim.log.levels.WARN)
+	-- end
+
 	require("lang.conform").setup(langs)
 end
 
