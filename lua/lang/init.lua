@@ -46,10 +46,12 @@ local function languages()
 	return _languages
 end
 
---- Run all sub-system setup functions. Call this from after/plugin/lang.lua.
 function M.setup()
+	-- vim.notify("DEBUG: M.setup() called", vim.log.levels.INFO)
 	local langs = languages()
+	-- vim.notify("DEBUG: languages() returned type=" .. type(langs) .. ", value=" .. vim.inspect(langs), vim.log.levels.INFO)
 	if not langs then
+		vim.notify("DEBUG: langs is nil, returning early", vim.log.levels.WARN)
 		return
 	end
 

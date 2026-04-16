@@ -31,7 +31,6 @@ languages:
       server: pyright
     formatter: black
     treesitter: python
-
   lua:
     mason:
       - lua-language-server
@@ -46,7 +45,6 @@ languages:
             globals: ["vim"]
     formatter: stylua
     treesitter: lua
-
   go:
     mason:
       - gopls
@@ -55,7 +53,6 @@ languages:
       server: gopls
     formatter: [goimports, gofmt]
     treesitter: go
-
   javascript:
     mason:
       - typescript-language-server
@@ -65,7 +62,6 @@ languages:
       filetypes: ["javascript", "javascriptreact"]
     formatter: biome
     treesitter: javascript
-
   typescript:
     mason:
       - typescript-language-server
@@ -75,7 +71,6 @@ languages:
       filetypes: ["typescript", "typescriptreact"]
     formatter: prettierd
     treesitter: typescript
-
   html:
     mason:
       - html-lsp
@@ -90,7 +85,6 @@ languages:
       additional_servers:
         - server: emmet_language_server
           filetypes: ["html", "templ"]
-
   css:
     mason:
       - css-lsp
@@ -99,25 +93,21 @@ languages:
       server: cssls
     formatter: prettierd
     treesitter: css
-
   json:
     mason:
       - prettierd
     formatter: prettierd
     treesitter: json
-
   yaml:
     mason:
       - prettierd
     formatter: prettierd
     treesitter: yaml
-
   toml:
     mason:
       - taplo
     formatter: taplo
     treesitter: toml
-
   sql:
     mason:
       - postgres-language-server
@@ -127,10 +117,13 @@ languages:
       filetypes: ["sql"]
     formatter: pg_format
     treesitter: sql
-    # example: add a dadbod source for SQL buffers on top of defaults
-    # blink:
-    #   extra_sources: [dadbod]
-
+  hcl:
+    mason:
+      - terraform-ls
+    lsp:
+      server: terraformls
+      filetypes: ["hcl"]
+    treesitter: hcl
   terraform:
     mason:
       - terraform-ls
@@ -138,7 +131,6 @@ languages:
       server: terraformls
       filetypes: ["terraform", "tf"]
     treesitter: hcl
-
   templ:
     mason:
       - templ
@@ -162,7 +154,6 @@ languages:
               experimental:
                 classRegex:
                   - "(?<=class=[\"'`])[^\"'`\\s]+"
-
   gdscript:
     mason:
       - gdtoolkit
