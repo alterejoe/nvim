@@ -1,4 +1,5 @@
 return {
+	{ "gabrielpoca/replacer.nvim" },
 	{ "mbbill/undotree" },
 	{
 		"folke/noice.nvim",

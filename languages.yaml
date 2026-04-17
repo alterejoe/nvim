@@ -123,6 +123,7 @@ languages:
     lsp:
       server: terraformls
       filetypes: ["hcl"]
+    formatter: hcl
     treesitter: hcl
   terraform:
     mason:
