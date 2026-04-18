@@ -14,9 +14,10 @@ vim.g.clipboard = {
 		["*"] = "powershell.exe -command Get-Clipboard",
 	},
 }
+
+require("settings")
 require("filetypes")
 require("lazycfg")
 require("air")
-require("settings")
 require("keymaps")
 require("clipboard").setup()

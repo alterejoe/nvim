@@ -1,4 +1,5 @@
 return {
+	{ "feline-nvim/feline.nvim" }, -- status bar
 	{ "gabrielpoca/replacer.nvim" },
 	{ "mbbill/undotree" },
 	{
