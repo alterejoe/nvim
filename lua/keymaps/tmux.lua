@@ -159,6 +159,7 @@ vim.keymap.set("n", "<C-f>", function()
 	local scan = require("plenary.scandir")
 	local cwd = vim.fn.getcwd()
 	local home_projects = vim.fn.expand("~/projects")
+	local tools = vim.fn.expand("~/tools")
 
 	local dirs = {}
 	local seen = {}
@@ -175,6 +176,13 @@ vim.keymap.set("n", "<C-f>", function()
 	-- scan ~/projects one level deep for project roots
 	if vim.fn.isdirectory(home_projects) == 1 then
 		for _, d in ipairs(scan.scan_dir(home_projects, { depth = 1, only_dirs = true, silent = true })) do
+			add(d)
+		end
+	end
+
+	-- scan ~/tools one level deep for project roots
+	if vim.fn.isdirectory(tools) == 1 then
+		for _, d in ipairs(scan.scan_dir(tools, { depth = 1, only_dirs = true, silent = true })) do
 			add(d)
 		end
 	end
