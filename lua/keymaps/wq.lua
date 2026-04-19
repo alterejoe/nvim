@@ -12,13 +12,18 @@ local function force_delete(buf)
 end
 
 local function close_window()
+	-- If we're in a floating window, just close it
+	if vim.api.nvim_win_get_config(0).relative ~= "" then
+		vim.cmd("close")
+		return
+	end
+
 	local non_floating = 0
 	for _, win in ipairs(vim.api.nvim_list_wins()) do
 		if vim.api.nvim_win_get_config(win).relative == "" then
 			non_floating = non_floating + 1
 		end
 	end
-
 	if non_floating <= 1 then
 		vim.cmd("qa!")
 	else
