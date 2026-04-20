@@ -18,6 +18,7 @@ vim.g.clipboard = {
 require("settings")
 require("filetypes")
 require("lazycfg")
+require("tmux_projects")
 require("air")
 require("keymaps")
 require("clipboard").setup()

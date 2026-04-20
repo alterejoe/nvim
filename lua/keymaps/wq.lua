@@ -14,7 +14,7 @@ end
 local function close_window()
 	-- If we're in a floating window, just close it
 	if vim.api.nvim_win_get_config(0).relative ~= "" then
-		vim.cmd("close")
+		vim.cmd("q!")
 		return
 	end
 
@@ -24,10 +24,11 @@ local function close_window()
 			non_floating = non_floating + 1
 		end
 	end
+
 	if non_floating <= 1 then
 		vim.cmd("qa!")
 	else
-		vim.cmd("close")
+		vim.cmd("close!")
 	end
 end
 
