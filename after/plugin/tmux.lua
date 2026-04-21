@@ -1,8 +1,22 @@
 local tmux = require("tmux_projects")
 
 tmux.setup({
-	project_order = { "work", "side" },
+	project_order = { "trading", "work", "side" },
 	projects = {
+		trading = {
+			{ name = "trading/kraken", path = "~/projects/trading/kraken/" },
+			{ name = "trading/migrations", path = "~/projects/trading/migrations/" },
+			{ name = "trading/cli", path = "~/projects/trading/strat-cli/" },
+			{ name = "trading/sdk", path = "~/projects/trading/strat-sdk/" },
+			{ name = "trading/terraform", path = "~/projects/trading/terraform/" },
+			{ name = "trading/trading", path = "~/projects/trading/trading/" },
+			{ name = "trading/web", path = "~/projects/trading/web/" },
+			{ name = "tools/forge", path = "~/tools/forge" },
+			{ name = "tools/forge-templates", path = "~/tools/forge_templates" },
+			{ name = "tools/primitives", path = "~/tools/primitive-templates" },
+			{ name = "tools/primitive-templates", path = "~/tools/primitives" },
+			{ name = "tools/statey", path = "~/tools/statey" },
+		},
 		work = {
 			{ name = "portal/admin", path = "~/projects/portal/adminserver/" },
 			{ name = "portal/client", path = "~/projects/portal/clientserver/" },

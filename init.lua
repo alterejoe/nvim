@@ -22,3 +22,9 @@ require("tmux_projects")
 require("air")
 require("keymaps")
 require("clipboard").setup()
+
+vim.api.nvim_create_autocmd("VimEnter", {
+	callback = function()
+		require("keymaps.wq")
+	end,
+})
