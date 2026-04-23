@@ -12,9 +12,9 @@ local function force_delete(buf)
 end
 
 local function close_window()
-	-- If we're in a floating window, just close it
+	-- floating window: just close it
 	if vim.api.nvim_win_get_config(0).relative ~= "" then
-		vim.cmd("q!")
+		vim.api.nvim_win_close(0, true)
 		return
 	end
 
@@ -26,7 +26,9 @@ local function close_window()
 	end
 
 	if non_floating <= 1 then
-		vim.cmd("qa!")
+		-- last window: delete the buffer instead of quitting
+		-- this lets your dashboard or empty state take over
+		vim.cmd("bd!")
 	else
 		vim.cmd("close!")
 	end
@@ -89,13 +91,18 @@ vim.keymap.set("n", "Q", function()
 	local buf = vim.api.nvim_get_current_buf()
 	local kind = classify_buffer()
 
+	-- floating windows: always just close the window
+	if vim.api.nvim_win_get_config(0).relative ~= "" then
+		vim.api.nvim_win_close(0, true)
+		return
+	end
+
 	if kind == "terminal" then
 		vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-c>", true, true, true), "i", false)
 		force_delete(buf)
 	elseif kind == "special" then
 		force_delete(buf)
 	else
-		-- normal and other: close the window
 		close_window()
 	end
 end, { desc = "Smart window close" })
@@ -103,20 +110,45 @@ end, { desc = "Smart window close" })
 -- ---------------------------------------------------------------------------
 -- W: force save (silent on success, loud on failure)
 -- ---------------------------------------------------------------------------
-vim.keymap.set("n", "W", function()
+vim.keymap.set("n", "Q", function()
+	local buf = vim.api.nvim_get_current_buf()
 	local kind = classify_buffer()
 
-	if kind == "normal" then
-		local ok, err = pcall(vim.cmd, "write!")
-		if not ok then
-			vim.notify(err, vim.log.levels.ERROR)
-		end
-	elseif kind == "special" then
-		-- acwrite buffers (oil) use plain :write to trigger their save handler
-		local ok, err = pcall(vim.cmd, "write")
-		if not ok then
-			vim.notify(err, vim.log.levels.ERROR)
+	-- floating windows: always just close the window
+	if vim.api.nvim_win_get_config(0).relative ~= "" then
+		vim.api.nvim_win_close(0, true)
+		return
+	end
+
+	-- count how many non-floating windows show this buffer
+	local wins_with_buf = 0
+	local non_floating = 0
+	for _, win in ipairs(vim.api.nvim_list_wins()) do
+		if vim.api.nvim_win_get_config(win).relative == "" then
+			non_floating = non_floating + 1
+			if vim.api.nvim_win_get_buf(win) == buf then
+				wins_with_buf = wins_with_buf + 1
+			end
 		end
 	end
-	-- terminal/other: silently do nothing
-end, { desc = "Force save" })
+
+	-- multiple windows open: just close this pane regardless of buffer type
+	if non_floating > 1 then
+		vim.cmd("close!")
+		return
+	end
+
+	-- last window standing
+	if kind == "terminal" then
+		vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-c>", true, true, true), "i", false)
+		force_delete(buf)
+	elseif kind == "special" then
+		force_delete(buf)
+	else
+		if vim.fn.expand("%") == "" and not vim.bo.modified then
+			vim.cmd("qa!")
+		else
+			vim.cmd("bd!")
+		end
+	end
+end, { desc = "Smart window close" })
