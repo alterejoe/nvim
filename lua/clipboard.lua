@@ -10,14 +10,13 @@
 --   <CR>         paste entry at cursor (after)
 --   P            paste entry at cursor (before)
 --   y            copy entry into + and " without pasting
---   R            raw view — show escaped bytes for entry (spot invisible chars)
+--   R            raw view show escaped bytes for entry (spot invisible chars)
 --   d            delete entry from history
 --   q / <Esc>    close
 
 local M = {}
 
--- ── constants ────────────────────────────────────────────────────────────────
-
+-- constants
 local HISTORY_MAX = 50
 
 local TYPE_LABELS = {
@@ -26,20 +25,7 @@ local TYPE_LABELS = {
 	["\22"] = "block",
 }
 
-local function strip_icons(text)
-	-- Remove common icon characters and their associated whitespace
-	return text:gsub("[\xE2\x80\x94\xE2\x81\x83\xE2\x88\xA9\xC3\xBF\xC2\xA1\xC2\xA7]+%s*", "")
-end
-
-local function strip_whitespace(text)
-	-- Remove leading/trailing whitespace from each line and the whole text
-	text = text:gsub("^%s+", ""):gsub("%s+$", "") -- trim start/end
-	text = text:gsub("\n%s+", "\n"):gsub("%s+\n", "\n") -- trim each line
-	return text
-end
-
--- ── suspicious content scanning ──────────────────────────────────────────────
---
+-- suspicious content scanning --
 -- Three distinct threat classes are tracked here:
 --
 --   1. INVISIBLE / BIDI CHARACTERS
@@ -50,23 +36,23 @@ end
 --   2. VIM MODELINE INJECTION
 --      Patterns that exploit Vim's modeline feature to execute arbitrary code
 --      when a file is opened. Relevant CVEs from 2026:
---        CVE-2026-34714 — tabpanel %{expr} injection + autocmd_add() sandbox escape
---        CVE-2026-34982 — complete/guitabtooltip/printheader missing P_MLE/P_SECURE flags
+--        CVE-2026-34714 tabpanel %{expr} injection + autocmd_add() sandbox escape
+--        CVE-2026-34982 complete/guitabtooltip/printheader missing P_MLE/P_SECURE flags
 --      Modelines are enabled by default; modelineexpr does NOT need to be on.
 --      If you paste one of these into a file and someone opens it, it fires.
 --
 --   3. UNICODE LOOKALIKE CHARACTERS (UTS#39 "confusables")
 --      "Confusables" is the Unicode Consortium's official term (UTS#39: Unicode
 --      Security Mechanisms) for characters that are visually identical or nearly
---      identical to other characters. Think Cyrillic 'е' vs Latin 'e'. The term
---      itself is jargon — what it means in practice is: characters that look like
+--      identical to other characters. Think Cyrillic '?' vs Latin 'e'. The term
+--      itself is jargon what it means in practice is: characters that look like
 --      ASCII but aren't, used to sneak past code review or fool humans reading
 --      identifiers. M.update_confusables() downloads the full authoritative list.
 --
--- We never silently strip — we flag and let you decide.
+-- We never silently strip we flag and let you decide.
 
 local SUSPICIOUS_PATTERNS = {
-	-- ── invisible / zero-width characters ──────────────────────────────────
+	-- invisible / zero-width characters
 	{ bytes = "\xE2\x80\x8B", label = "zero-width space", codepoint = "U+200B" },
 	{ bytes = "\xE2\x80\x8C", label = "zero-width non-joiner", codepoint = "U+200C" },
 	{ bytes = "\xE2\x80\x8D", label = "zero-width joiner", codepoint = "U+200D" },
@@ -74,7 +60,7 @@ local SUSPICIOUS_PATTERNS = {
 	{ bytes = "\xC2\xAD", label = "soft hyphen", codepoint = "U+00AD" },
 	{ bytes = "\xE2\x81\xA0", label = "word joiner", codepoint = "U+2060" },
 	{ bytes = "\xE1\xA0\x8E", label = "mongolian vowel sep", codepoint = "U+180E" },
-	-- ── bidi overrides — the "display != content" attack ───────────────────
+	-- bidi overrides the "display != content" attack
 	{ bytes = "\xE2\x80\xAA", label = "LTR embedding", codepoint = "U+202A" },
 	{ bytes = "\xE2\x80\xAB", label = "RTL embedding", codepoint = "U+202B" },
 	{ bytes = "\xE2\x80\xAC", label = "pop directional fmt", codepoint = "U+202C" },
@@ -87,39 +73,31 @@ local SUSPICIOUS_PATTERNS = {
 	{ bytes = "\xE2\x81\xA7", label = "RTL isolate", codepoint = "U+2067" },
 	{ bytes = "\xE2\x81\xA8", label = "first strong isolate", codepoint = "U+2068" },
 	{ bytes = "\xE2\x81\xA9", label = "pop directional isolate", codepoint = "U+2069" },
-	-- ── terminal sequences ──────────────────────────────────────────────────
-	-- Dangerous if the text is ever re-pasted into a shell
+	-- terminal sequences -- Dangerous if the text is ever re-pasted into a shell
 	{ bytes = "\x1b%[", label = "ANSI escape sequence", codepoint = "ESC[" },
 	{ bytes = "\x1b]", label = "ANSI OSC sequence", codepoint = "ESC]" },
 }
 
--- ── vim modeline injection patterns ──────────────────────────────────────────
---
+-- vim modeline injection patterns --
 -- These are Lua patterns (not plain strings) matched against full text.
 -- Each entry also carries a cve field for display in the viewer.
 --
 -- Matching strategy: we look for a modeline directive on any line, then check
 -- whether it sets one of the known-dangerous options. A bare "vim:" line is
--- not flagged — only dangerous option combinations are.
+-- not flagged only dangerous option combinations are.
 --
 -- Reference: `:help modeline`, CVE-2019-12735, CVE-2026-34714, CVE-2026-34982
 
 local VIM_INJECTION_PATTERNS = {
 	{
-		-- tabpanel + %{expr}: the CVE-2026-34714 vector.
-		-- tabpanel lacks P_MLE so expressions eval without modelineexpr.
-		-- autocmd_add() then lets sandboxed code escape post-sandbox.
 		pattern = "[^\n]*vim?%s*:[^\n]*tabpanel[^\n]*%%{",
 		label = "vim modeline: tabpanel %{expr} injection (CVE-2026-34714)",
 	},
 	{
-		-- complete= with a lambda/funcref: CVE-2026-34982 vector.
-		-- complete lacks P_SECURE and P_MLE, so lambda expressions are accepted.
 		pattern = "[^\n]*vim?%s*:[^\n]*complete%s*=[^\n]*[{F]",
 		label = "vim modeline: complete= lambda expression (CVE-2026-34982)",
 	},
 	{
-		-- guitabtooltip or printheader via modeline — same missing-flag class.
 		pattern = "[^\n]*vim?%s*:[^\n]*gui[Tt]ab[Tt]ool[Tt]ip",
 		label = "vim modeline: guitabtooltip option (CVE-2026-34982)",
 	},
@@ -128,36 +106,31 @@ local VIM_INJECTION_PATTERNS = {
 		label = "vim modeline: printheader option (CVE-2026-34982)",
 	},
 	{
-		-- mapset() abuse via modeline — allows arbitrary key mapping injection.
 		pattern = "[^\n]*vim?%s*:[^\n]*mapset",
 		label = "vim modeline: mapset() call (CVE-2026-34982 chain)",
 	},
 	{
-		-- Classic CVE-2019-12735 style: foldexpr / fde= in a modeline.
-		-- Patched long ago but still worth flagging — sandbox escapes recur.
 		pattern = "[^\n]*vim?%s*:[^\n]*f[od][el][de]?%s*=",
 		label = "vim modeline: fold expression option (CVE-2019-12735 class)",
 	},
 	{
-		-- Any modeline setting an expr-capable option with a system()/call().
-		-- Catches improvised variants not covered by the specific CVEs above.
 		pattern = "[^\n]*vim?%s*:[^\n]*system%s*(",
 		label = "vim modeline: system() call",
 	},
 	{
 		pattern = "[^\n]*vim?%s*:[^\n]*libcall%s*(",
-		label = "vim modeline: libcall() — arbitrary library execution",
+		label = "vim modeline: libcall() arbitrary library execution",
 	},
 	{
-		-- autocmd_add inside any modeline expression context.
 		pattern = "[^\n]*vim?%s*:[^\n]*autocmd_add",
-		label = "vim modeline: autocmd_add() — sandbox escape (CVE-2026-34714)",
+		label = "vim modeline: autocmd_add() sandbox escape (CVE-2026-34714)",
 	},
 }
 
--- Built-in fallback homoglyph table — used when the UTS#39 cache hasn't been
+-- Built-in fallback homoglyph table used when the UTS#39 cache hasn't been
 -- fetched yet. Call M.update_confusables() to download the full authoritative
 -- set (~7 000 entries) from unicode.org/Public/security/latest/confusables.txt
+
 local BUILTIN_HOMOGLYPHS = {
 	["\xD0\xB0"] = "looks like 'a' (U+0430 Cyrillic)",
 	["\xD0\x90"] = "looks like 'A' (U+0410 Cyrillic)",
@@ -181,11 +154,10 @@ local BUILTIN_HOMOGLYPHS = {
 	["\xCF\x81"] = "looks like 'p' (U+03C1 Greek)",
 }
 
--- Live table — replaced wholesale by load_confusables_cache / update_confusables
+-- Live table replaced wholesale by load_confusables_cache / update_confusables
 local homoglyph_map = BUILTIN_HOMOGLYPHS
 
--- ── confusables cache (UTS#39) ────────────────────────────────────────────────
-
+-- confusables cache (UTS#39)
 local CACHE_PATH = vim.fn.stdpath("data") .. "/clipboard_confusables.tsv"
 
 -- Encode a Unicode codepoint as a UTF-8 Lua string.
@@ -206,25 +178,18 @@ local function cp_to_utf8(cp)
 	end
 end
 
--- Parse the raw text of confusables.txt into a utf8_bytes→description map.
+-- Parse the raw text of confusables.txt into a utf8_bytesdescription map.
 -- Only retains entries where a non-ASCII source maps to a single printable
--- ASCII target — the only case that matters for visual deception in code.
+-- ASCII target the only case that matters for visual deception in code.
 local function parse_confusables_txt(raw)
 	local map = {}
 	for line in raw:gmatch("[^\n]+") do
 		if not line:match("^%s*#") then
-			-- format: source_hex ; target_hex ; type  # comment
 			local src_hex, tgt_hex = line:match("^%s*(%x+)%s*;%s*(%x+)%s*;")
 			if src_hex and tgt_hex then
 				local src_cp = tonumber(src_hex, 16)
 				local tgt_cp = tonumber(tgt_hex, 16)
-				if
-					src_cp
-					and tgt_cp
-					and src_cp > 0x7F -- source is non-ASCII
-					and tgt_cp >= 0x21 -- target is printable ASCII
-					and tgt_cp <= 0x7E
-				then
+				if src_cp and tgt_cp and src_cp > 0x7F and tgt_cp >= 0x21 and tgt_cp <= 0x7E then
 					local src_utf8 = cp_to_utf8(src_cp)
 					local tgt_char = string.char(tgt_cp)
 					map[src_utf8] = string.format("looks like '%s' (U+%04X)", tgt_char, src_cp)
@@ -242,7 +207,7 @@ local function save_confusables_cache(map)
 		vim.notify("clipboard: could not write confusables cache to " .. CACHE_PATH, vim.log.levels.ERROR)
 		return false
 	end
-	f:write("# clipboard.lua UTS#39 confusables cache — do not edit manually\n")
+	f:write("# clipboard.lua UTS#39 confusables cache do not edit manually\n")
 	for utf8_bytes, desc in pairs(map) do
 		local hex = utf8_bytes:gsub(".", function(c)
 			return string.format("%02X", c:byte())
@@ -287,15 +252,11 @@ end
 
 ---Scan text for suspicious characters. Returns a list of finding strings,
 ---empty if clean.
----
----Homoglyph check walks the text once (O(n)) and does a table lookup per
----UTF-8 sequence — safe even with the full ~7 000-entry UTS#39 map loaded.
 ---@param text string
 ---@return string[]
 local function scan_suspicious(text)
 	local findings = {}
 	local seen = {}
-
 	local function flag(label)
 		if not seen[label] then
 			seen[label] = true
@@ -310,14 +271,14 @@ local function scan_suspicious(text)
 		end
 	end
 
-	-- vim modeline injection checks (CVE-2026-34714, CVE-2026-34982, CVE-2019-12735 class)
+	-- vim modeline injection checks
 	for _, p in ipairs(VIM_INJECTION_PATTERNS) do
 		if text:find(p.pattern) then
-			flag("⚡ " .. p.label)
+			flag("? " .. p.label)
 		end
 	end
 
-	-- homoglyph check — single pass through text, O(1) lookup per sequence
+	-- homoglyph check single pass through text, O(1) lookup per sequence
 	do
 		local i = 1
 		while i <= #text do
@@ -336,11 +297,10 @@ local function scan_suspicious(text)
 		end
 	end
 
-	-- raw control characters (except tab 0x09 and newline 0x0a which are normal in code)
+	-- raw control characters (except tab 0x09 and newline 0x0a)
 	for i = 1, #text do
 		local b = text:byte(i)
 		if b ~= 0x09 and b ~= 0x0a and b < 0x20 and b ~= 0x1b then
-			-- 0x1b (ESC) is already caught by the ANSI pattern above
 			flag("raw control character (non-printable byte 0x" .. string.format("%02X", b) .. ")")
 			break
 		end
@@ -362,7 +322,7 @@ local function to_raw_view(text)
 			table.insert(out, "\\t")
 			i = i + 1
 		elseif b == 0x0a then
-			table.insert(out, "↵\n")
+			table.insert(out, "?\n")
 			i = i + 1
 		elseif b == 0x0d then
 			table.insert(out, "\\r")
@@ -380,12 +340,10 @@ local function to_raw_view(text)
 			local seqlen = b >= 0xF0 and 4 or b >= 0xE0 and 3 or b >= 0xC0 and 2 or 1
 			if i + seqlen - 1 <= #text then
 				local seq = text:sub(i, i + seqlen - 1)
-				-- homoglyph map is the authoritative source for labelling
 				local desc = homoglyph_map[seq]
 				if desc then
 					table.insert(out, "<" .. desc .. ">")
 				else
-					-- check invisible/bidi patterns
 					local flagged = false
 					for _, p in ipairs(SUSPICIOUS_PATTERNS) do
 						if seq == p.bytes then
@@ -408,7 +366,7 @@ local function to_raw_view(text)
 	return table.concat(out)
 end
 
--- ── environment detection ────────────────────────────────────────────────────
+-- environment detection
 
 local function is_wsl()
 	return vim.fn.has("wsl") == 1
@@ -426,7 +384,7 @@ local function has_nvim_010()
 	return vim.fn.has("nvim-0.10") == 1
 end
 
--- ── provider setup ───────────────────────────────────────────────────────────
+-- provider setup
 
 local function setup_wsl()
 	vim.g.clipboard = {
@@ -436,7 +394,6 @@ local function setup_wsl()
 			["*"] = "clip.exe",
 		},
 		paste = {
-			-- strip \r\n at source so ^M never reaches nvim
 			["+"] = 'powershell.exe -NoProfile -c [Console]::Out.Write($(Get-Clipboard -Raw).ToString().Replace("`r`n","`n").Replace("`r","`n"))',
 			["*"] = 'powershell.exe -NoProfile -c [Console]::Out.Write($(Get-Clipboard -Raw).ToString().Replace("`r`n","`n").Replace("`r","`n"))',
 		},
@@ -445,8 +402,6 @@ local function setup_wsl()
 end
 
 local function setup_osc52()
-	-- Neovim 0.10+ ships vim.ui.clipboard.osc52 — works over any SSH session
-	-- as long as the terminal supports OSC 52 (WezTerm, iTerm2, kitty, foot, etc.)
 	local osc = require("vim.ui.clipboard.osc52")
 	vim.g.clipboard = {
 		name = "OSC52",
@@ -457,7 +412,6 @@ local function setup_osc52()
 end
 
 local function detect_linux_tool()
-	-- Wayland first, then X11
 	if vim.fn.executable("wl-copy") == 1 then
 		return "wl-clipboard"
 	elseif vim.fn.executable("xclip") == 1 then
@@ -475,15 +429,13 @@ local function setup_provider()
 		if has_nvim_010() then
 			setup_osc52()
 		else
-			-- Older nvim over SSH: we still track yanks internally.
-			-- No system clipboard provider available; viewer still works.
 			vim.notify(
-				"clipboard: SSH + nvim < 0.10 — no OSC 52 support. Upgrade for clipboard sync.",
+				"clipboard: SSH + nvim < 0.10 no OSC 52 support. Upgrade for clipboard sync.",
 				vim.log.levels.WARN
 			)
 		end
 	elseif is_mac() then
-		-- pbcopy/pbpaste: neovim picks them up automatically, nothing to set
+		-- pbcopy/pbpaste: neovim picks them up automatically
 	else
 		local tool = detect_linux_tool()
 		if not tool then
@@ -495,35 +447,33 @@ local function setup_provider()
 	end
 
 	-- Do NOT set unnamedplus globally. That forces a provider sync check on
-	-- every p/P keypress to see if the OS clipboard changed — that's where
-	-- the WSL/SSH delay comes from. Instead we manage the two directions
-	-- independently below (see TextYankPost and pull_from_os).
+	-- every p/P keypress. Instead we manage the two directions independently.
 	vim.opt.clipboard = ""
 end
 
--- ── clipboard direction management ───────────────────────────────────────────
---
+-- clipboard direction management --
 -- Two directions, two latency budgets:
 --
---   nvim → OS  (on every yank, async fire-and-forget)
---     Happens in the background. Never blocks. If it fails, nvim is unaffected.
+--   nvim  OS  (on every yank, debounced async fire-and-forget)
+--     Happens in the background after a short idle. Never blocks.
+--     Debounce prevents race conditions on rapid yanks.
 --
---   OS → nvim  (only when you explicitly ask, or on FocusGained)
---     <leader>p / <leader>P  — pull OS clipboard then paste. Delay is expected.
---     FocusGained            — async background sync so that by the time you
+--   OS  nvim  (only when you explicitly ask, or on FocusGained)
+--     <leader>p / <leader>P  pull OS clipboard then paste. Delay is expected.
+--     FocusGained            async background sync so that by the time you
 --                              press p after switching windows, it's already ready.
 --
---   p / P  — always instant. reads " register which is in-memory only.
---            normalization (strip \r, fix linewise) is pure Lua, zero I/O.
+--   p / P  always instant. reads " register which is in-memory only.
+--            normalization is pure Lua, zero I/O. Uses scratch register z
+--            to avoid mutating " during async operations.
 
 local _last_internal_text = nil -- tracks last text yanked inside nvim
 local _os_cache = { text = nil, type = nil } -- last successfully pulled OS content
 
--- Push the current " register to the OS clipboard asynchronously.
--- Called from TextYankPost — never blocks the editor.
+-- Push the current text to the OS clipboard asynchronously.
+-- Called from TextYankPost (debounced) never blocks the editor.
 local function push_to_os(text, regtype)
 	if is_wsl() then
-		-- clip.exe reads from stdin, so pipe via shell
 		local job = vim.fn.jobstart({ "clip.exe" }, {
 			on_exit = function() end,
 		})
@@ -532,8 +482,6 @@ local function push_to_os(text, regtype)
 			vim.fn.chanclose(job, "stdin")
 		end
 	elseif is_ssh() and has_nvim_010() then
-		-- OSC 52: write the escape sequence directly to the terminal.
-		-- The terminal handles the Windows clipboard — zero process spawns.
 		local encoded = vim.base64 and vim.base64.encode(text) or vim.fn.system("base64 -w0", text):gsub("\n", "")
 		io.write("\x1b]52;c;" .. encoded .. "\x1b\\")
 		io.flush()
@@ -565,11 +513,11 @@ local function push_to_os(text, regtype)
 			end
 		end
 	end
-	-- mirror into internal " so p/P always have it without a provider call
+
 	_os_cache = { text = text, type = regtype }
 end
 
--- Pull OS clipboard into " register. Has latency — only call explicitly.
+-- Pull OS clipboard into " register. Has latency only call explicitly.
 local function pull_from_os(callback)
 	local function normalize(text, regtype)
 		text = text:gsub("\r\n", "\n"):gsub("\r", "\n")
@@ -583,6 +531,20 @@ local function pull_from_os(callback)
 		return text, regtype
 	end
 
+	local function handle_stdout(_, data)
+		if not data then
+			return
+		end
+		local text, regtype = normalize(table.concat(data, "\n"), "v")
+		if text ~= "" then
+			_os_cache = { text = text, type = regtype }
+			vim.fn.setreg('"', text, regtype)
+			if callback then
+				callback(text, regtype)
+			end
+		end
+	end
+
 	if is_wsl() then
 		vim.fn.jobstart({
 			"powershell.exe",
@@ -591,36 +553,12 @@ local function pull_from_os(callback)
 			'[Console]::Out.Write($(Get-Clipboard -Raw).ToString().Replace("`r`n","`n").Replace("`r","`n"))',
 		}, {
 			stdout_buffered = true,
-			on_stdout = function(_, data)
-				if not data then
-					return
-				end
-				local text, regtype = normalize(table.concat(data, "\n"), "v")
-				if text ~= "" then
-					_os_cache = { text = text, type = regtype }
-					vim.fn.setreg('"', text, regtype)
-					if callback then
-						callback(text, regtype)
-					end
-				end
-			end,
+			on_stdout = handle_stdout,
 		})
 	elseif is_mac() then
 		vim.fn.jobstart({ "pbpaste" }, {
 			stdout_buffered = true,
-			on_stdout = function(_, data)
-				if not data then
-					return
-				end
-				local text, regtype = normalize(table.concat(data, "\n"), "v")
-				if text ~= "" then
-					_os_cache = { text = text, type = regtype }
-					vim.fn.setreg('"', text, regtype)
-					if callback then
-						callback(text, regtype)
-					end
-				end
-			end,
+			on_stdout = handle_stdout,
 		})
 	else
 		local tool = detect_linux_tool()
@@ -633,29 +571,16 @@ local function pull_from_os(callback)
 		end
 		vim.fn.jobstart(cmd, {
 			stdout_buffered = true,
-			on_stdout = function(_, data)
-				if not data then
-					return
-				end
-				local text, regtype = normalize(table.concat(data, "\n"), "v")
-				if text ~= "" then
-					_os_cache = { text = text, type = regtype }
-					vim.fn.setreg('"', text, regtype)
-					if callback then
-						callback(text, regtype)
-					end
-				end
-			end,
+			on_stdout = handle_stdout,
 		})
 	end
 end
 
--- ── history ring ─────────────────────────────────────────────────────────────
+-- history ring
 
-local history = {} ---@type {text:string, register:string, type:string, time:integer}[]
+local history = {} ---@type {text:string, register:string, type:string, time:integer, warnings:string[]}[]
 
 local function add_history(entry)
-	-- skip operator-pending/internal yanks into special registers
 	local skip = { ["/"] = true, [":"] = true, ["."] = true, ["%"] = true, ["#"] = true }
 	if skip[entry.register] then
 		return
@@ -671,120 +596,142 @@ local function add_history(entry)
 end
 
 local _in_setreg = false -- re-entry guard
+local _push_timer = nil
+local _push_debounce_ms = 150
 
 vim.api.nvim_create_autocmd("TextYankPost", {
-	desc = "Clipboard: record yank + async push to OS",
+	desc = "Clipboard: record yank + debounced async push to OS",
 	callback = function()
 		if _in_setreg then
 			return
 		end
 		local ev = vim.v.event
 		local text = table.concat(ev.regcontents, "\n")
-		text = strip_icons(text)
-		text = strip_whitespace(text)
+
+		-- Preserve exactly what was yanked. No silent mutations.
 		if text == "" then
 			return
 		end
-		local warnings = scan_suspicious(text)
+
 		local reg = (ev.regname == "" or ev.regname == nil) and '"' or ev.regname
 		_last_internal_text = text
-		add_history({
+
+		-- Record in history immediately, scan deferred
+		local entry = {
 			text = text,
 			register = reg,
 			type = ev.regtype,
 			time = os.time(),
-			warnings = warnings,
-		})
-		-- Push to OS clipboard asynchronously ΓÇö fire and forget, never blocks.
-		-- Delay is acceptable here; you're copying, not waiting to paste.
-		push_to_os(text, ev.regtype)
+			warnings = {},
+		}
+		add_history(entry)
+
+		-- Defer suspicious scan so it never blocks the yank
+		vim.schedule(function()
+			entry.warnings = scan_suspicious(text)
+		end)
+
+		-- Debounced push to OS: if you yank twice within 150ms,
+		-- only the second yank reaches the OS clipboard.
+		-- Kills the race condition where rapid yanks fight over clip.exe.
+		local push_text = text
+		local push_type = ev.regtype
+		if _push_timer then
+			_push_timer:stop()
+			_push_timer:close()
+			_push_timer = nil
+		end
+		_push_timer = vim.uv.new_timer()
+		_push_timer:start(
+			_push_debounce_ms,
+			0,
+			vim.schedule_wrap(function()
+				push_to_os(push_text, push_type)
+				if _push_timer then
+					_push_timer:stop()
+					_push_timer:close()
+					_push_timer = nil
+				end
+			end)
+		)
 	end,
 })
 
--- Sync OS → " on FocusGained so external clipboard content is ready
+-- Sync OS  " on FocusGained so external clipboard content is ready
 -- before you press p, not after.
 vim.api.nvim_create_autocmd("FocusGained", {
 	desc = "Clipboard: background sync from OS on focus",
 	callback = function()
-		pull_from_os(nil) -- no callback — just warm the cache silently
+		pull_from_os(nil)
 	end,
 })
 
--- ── paste normalization ───────────────────────────────────────────────────────
---
--- p / P  — instant. reads " (in-memory). normalization is pure Lua, zero I/O.
--- <leader>p / <leader>P — pull OS clipboard first (has latency), then paste.
---
--- This separation is why p/P feel instant: they never touch the OS clipboard
--- provider. The OS sync happens either on FocusGained (background) or when
--- you explicitly use <leader>p.
-
-local function normalize_reg()
+-- paste normalization --
+-- Read " register, return normalized text + type WITHOUT writing back.
+-- This is the key fix: p/P no longer mutate " in place, which could
+-- collide with async clipboard operations.
+local function get_normalized_reg()
 	local text = vim.fn.getreg('"')
 	local regtype = vim.fn.getregtype('"')
-
 	local normalized = text:gsub("\r\n", "\n"):gsub("\r", "\n")
-
 	local without_trail = normalized:match("^(.*)\n$")
 	if without_trail and not without_trail:match("\n$") then
 		normalized = without_trail
 	end
-
 	if regtype == "V" and not normalized:find("\n") then
 		regtype = "v"
 	end
-
-	if normalized ~= text or regtype ~= vim.fn.getregtype('"') then
-		_in_setreg = true
-		vim.fn.setreg('"', normalized, regtype)
-		_in_setreg = false
-	end
+	return normalized, regtype
 end
 
--- Add padded_paste HERE, after normalize_reg
-local function padded_paste()
-	normalize_reg()
-	local text = vim.fn.getreg('"')
-	local regtype = vim.fn.getregtype('"')
+-- Instant paste: normalize into scratch register z, paste from there.
+-- Never touches " so there's no collision with async OS sync.
+local function instant_paste(after)
+	local text, regtype = get_normalized_reg()
+	_in_setreg = true
+	vim.fn.setreg("z", text, regtype)
+	_in_setreg = false
+	vim.cmd('normal! "z' .. (after and "p" or "P"))
+end
 
+local function padded_paste()
+	local text, regtype = get_normalized_reg()
 	if regtype == "V" then
 		text = "\n" .. text .. "\n"
 	else
 		text = text .. "\n"
 	end
-
-	vim.fn.setreg('"', text, regtype)
-	vim.cmd("normal! p")
+	_in_setreg = true
+	vim.fn.setreg("z", text, regtype)
+	_in_setreg = false
+	vim.cmd('normal! "zp')
 end
--- Instant paste — reads " only, never invokes OS clipboard provider.
+
+-- p / P  always instant. Uses scratch register, zero I/O.
 vim.keymap.set({ "n", "x" }, "p", function()
-	normalize_reg()
-	return "p"
-end, { expr = true, desc = "Paste after (instant)", noremap = true })
+	instant_paste(true)
+end, { desc = "Paste after (instant)", noremap = true })
 
 vim.keymap.set({ "n", "x" }, "P", function()
-	normalize_reg()
-	return "P"
-end, { expr = true, desc = "Paste before (instant)", noremap = true })
+	instant_paste(false)
+end, { desc = "Paste before (instant)", noremap = true })
 
 vim.keymap.set("n", "]p", padded_paste, { desc = "Paste with padding" })
 
--- OS clipboard paste — pulls from OS first, then pastes. Delay is expected.
-vim.keymap.set("n", "<leader>p", function()
-	pull_from_os(function()
-		normalize_reg()
-		vim.cmd("normal! p")
-	end)
-end, { desc = "Paste from OS clipboard (after)" })
+-- OS clipboard paste: pulls from OS first, then pastes. Delay is expected.
+-- vim.keymap.set("n", "<leader>p", function()
+-- 	pull_from_os(function()
+-- 		instant_paste(true)
+-- 	end)
+-- end, { desc = "Paste from OS clipboard (after)" })
 
 vim.keymap.set("n", "<leader>P", function()
 	pull_from_os(function()
-		normalize_reg()
-		vim.cmd("normal! P")
+		instant_paste(false)
 	end)
 end, { desc = "Paste from OS clipboard (before)" })
 
--- ── viewer ───────────────────────────────────────────────────────────────────
+-- viewer
 
 local viewer_state = { buf = nil, win = nil }
 
@@ -804,29 +751,25 @@ local function render_history()
 	if #history == 0 then
 		return { "  (no yanks recorded yet)" }, {}
 	end
-
 	local lines = {}
 	local map = {}
-
 	for i, entry in ipairs(history) do
 		local type_label = TYPE_LABELS[entry.type] or "?    "
 		local reg_label = entry.register == '"' and '""' or ('"' .. entry.register)
-		local warn_flag = (entry.warnings and #entry.warnings > 0) and "  ⚠" or ""
-		-- header line
+		local warn_flag = (entry.warnings and #entry.warnings > 0) and "  ?" or ""
+
 		local header =
 			string.format(" %2d  reg %-3s  %s  %s%s", i, reg_label, type_label, age_str(entry.time), warn_flag)
 		table.insert(lines, header)
 		map[#lines] = i
 
-		-- warning detail lines
 		if entry.warnings and #entry.warnings > 0 then
 			for _, w in ipairs(entry.warnings) do
-				table.insert(lines, "     ⚠ " .. w)
+				table.insert(lines, "     ? " .. w)
 				map[#lines] = i
 			end
 		end
 
-		-- preview lines (up to 3)
 		local preview_lines = vim.split(entry.text, "\n", { plain = true })
 		for j = 1, math.min(3, #preview_lines) do
 			local pline = "     " .. preview_lines[j]:gsub("\t", "  "):sub(1, 74)
@@ -834,13 +777,11 @@ local function render_history()
 			map[#lines] = i
 		end
 		if #preview_lines > 3 then
-			table.insert(lines, "     …(" .. (#preview_lines - 3) .. " more lines)")
+			-- table.insert(lines, "     .(" .. (#preview_lines - 3) .. " more lines)")
 			map[#lines] = i
 		end
-
-		table.insert(lines, "") -- spacer
+		table.insert(lines, "")
 	end
-
 	return lines, map
 end
 
@@ -854,14 +795,12 @@ end
 
 local function viewer_redraw(map_ref)
 	local lines, new_map = render_history()
-	-- update map in place so keymaps still reference it
 	for k in pairs(map_ref) do
 		map_ref[k] = nil
 	end
 	for k, v in pairs(new_map) do
 		map_ref[k] = v
 	end
-
 	vim.bo[viewer_state.buf].modifiable = true
 	vim.api.nvim_buf_set_lines(viewer_state.buf, 0, -1, false, lines)
 	vim.bo[viewer_state.buf].modifiable = false
@@ -898,15 +837,13 @@ local function viewer_open()
 	vim.wo[win].wrap = false
 	vim.wo[win].number = false
 
-	-- highlight groups (set once)
 	vim.api.nvim_set_hl(0, "ClipboardHeader", { link = "Title", default = true })
 	vim.api.nvim_set_hl(0, "ClipboardPreview", { link = "Comment", default = true })
 
 	local map = {}
 	viewer_redraw(map)
 
-	-- ── viewer keymaps ──────────────────────────────────────────────────────
-
+	-- viewer keymaps
 	local function km(key, fn, desc)
 		vim.keymap.set("n", key, fn, { buffer = buf, desc = desc, nowait = true, silent = true })
 	end
@@ -952,7 +889,7 @@ local function viewer_open()
 		end
 		vim.fn.setreg('"', entry.text, entry.type)
 		vim.fn.setreg("+", entry.text, entry.type)
-		vim.notify("clipboard: pulled to + register — " .. entry.text:sub(1, 48))
+		vim.notify("clipboard: pulled to + register " .. entry.text:sub(1, 48))
 	end, "Copy to clipboard without pasting")
 
 	km("d", function()
@@ -969,13 +906,9 @@ local function viewer_open()
 		if not entry then
 			return
 		end
-
-		-- open a small secondary float showing the escaped raw content
 		local raw = to_raw_view(entry.text)
 		local raw_lines = vim.split(raw, "\n", { plain = true })
-
-		-- prefix each line so it's obvious this is the raw view
-		local display = { " RAW VIEW — suspicious chars shown as <U+XXXX>", " " }
+		local display = { " RAW VIEW suspicious chars shown as <U+XXXX>", " " }
 		for _, l in ipairs(raw_lines) do
 			table.insert(display, " " .. l)
 		end
@@ -1001,7 +934,6 @@ local function viewer_open()
 		})
 		vim.wo[rwin].wrap = true
 
-		-- close with q/Esc, return focus to history viewer
 		for _, k in ipairs({ "q", "<Esc>", "R" }) do
 			vim.keymap.set("n", k, function()
 				vim.api.nvim_win_close(rwin, true)
@@ -1010,24 +942,24 @@ local function viewer_open()
 				end
 			end, { buffer = rbuf, nowait = true, silent = true })
 		end
-	end, "Raw view — inspect escaped bytes")
+	end, "Raw view inspect escaped bytes")
 
 	km("q", viewer_close, "Close")
 	km("<Esc>", viewer_close, "Close")
 end
 
--- ── public API ───────────────────────────────────────────────────────────────
+-- public API
 
 ---Download the latest UTS#39 confusables.txt from unicode.org, parse it,
 ---save a local cache, and hot-swap the live homoglyph map.
 ---Run once after install, then again whenever you want to update.
----Requires curl. Async — does not block the editor.
+---Requires curl. Async does not block the editor.
 function M.update_confusables()
 	if vim.fn.executable("curl") ~= 1 then
-		vim.notify("clipboard: curl not found — cannot fetch confusables.txt", vim.log.levels.ERROR)
+		vim.notify("clipboard: curl not found cannot fetch confusables.txt", vim.log.levels.ERROR)
 		return
 	end
-	vim.notify("clipboard: fetching UTS#39 confusables.txt from unicode.org…", vim.log.levels.INFO)
+	vim.notify("clipboard: fetching UTS#39 confusables.txt from unicode.org.", vim.log.levels.INFO)
 	vim.fn.jobstart({
 		"curl",
 		"--silent",
@@ -1047,10 +979,9 @@ function M.update_confusables()
 				count = count + 1
 			end
 			if count == 0 then
-				vim.notify("clipboard: no entries parsed — response may be malformed", vim.log.levels.WARN)
+				vim.notify("clipboard: no entries parsed response may be malformed", vim.log.levels.WARN)
 				return
 			end
-			-- keep built-ins for anything the official list doesn't cover
 			for k, v in pairs(BUILTIN_HOMOGLYPHS) do
 				if not new_map[k] then
 					new_map[k] = v
@@ -1065,7 +996,7 @@ function M.update_confusables()
 		end,
 		on_stderr = function(_, data)
 			if data and data[1] and data[1] ~= "" then
-				vim.notify("clipboard: curl error — " .. table.concat(data, " "), vim.log.levels.ERROR)
+				vim.notify("clipboard: curl error " .. table.concat(data, " "), vim.log.levels.ERROR)
 			end
 		end,
 	})
@@ -1073,9 +1004,7 @@ end
 
 function M.setup(opts)
 	opts = opts or {}
-
 	setup_provider()
-
 	local key = (opts.history_key ~= nil) and opts.history_key or "<leader>ch"
 	if key and key ~= "" then
 		vim.keymap.set("n", key, viewer_open, { desc = "Clipboard history" })
@@ -1085,7 +1014,7 @@ end
 -- Expose internals for power users / testing
 M.history = history
 M.open_viewer = viewer_open
-M.homoglyph_map = homoglyph_map -- current live map (read-only reference)
+M.homoglyph_map = homoglyph_map
 M.confusables_cache = CACHE_PATH
 
 return M

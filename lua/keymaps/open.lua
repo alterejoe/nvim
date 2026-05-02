@@ -1,4 +1,4 @@
-vim.keymap.set("n", "<leader>wo", function()
+vim.keymap.set("n", "<leader>O", function()
 	local path = vim.fn.expand("%:p")
 	if path:match("^oil://") then
 		path = path:gsub("^oil://", "")

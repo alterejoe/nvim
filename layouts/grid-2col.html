@@ -1,0 +1,26 @@
+<!-- layouts/grid-2col.html
+     2-column grid, wraps to additional rows automatically.
+     Reference panels with <devproxy-panel id="1"/> etc.
+-->
+<div
+  style="
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px;
+    height: calc(100vh - 28px);
+    background: #1a1a1a;
+  "
+>
+  <div style="overflow: auto; background: #fff">
+    <devproxy-panel id="1" />
+  </div>
+  <div style="overflow: auto; background: #fff">
+    <devproxy-panel id="2" />
+  </div>
+  <div style="overflow: auto; background: #fff">
+    <devproxy-panel id="3" />
+  </div>
+  <div style="overflow: auto; background: #fff">
+    <devproxy-panel id="4" />
+  </div>
+</div>

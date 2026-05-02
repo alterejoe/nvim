@@ -15,4 +15,7 @@ return {
 		commit = "086a40d",
 		event = "BufWritePre",
 	},
+	{ "mfussenegger/nvim-dap" },
+	{ "nvim-neotest/nvim-nio" },
+	{ "igorlfs/nvim-dap-view" }, -- your existing preference over dap-ui
 }

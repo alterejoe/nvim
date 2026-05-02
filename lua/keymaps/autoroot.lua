@@ -55,8 +55,8 @@ end, { noremap = true, silent = true, desc = "CD up one dir" })
 
 -- CD to go.work root
 vim.keymap.set("n", "<leader>5", function()
-	local function find_gowork(cwd, depth, max)
-		if cwd == "/" or cwd == "." then
+	local function find_gowork(cwd, depth)
+		if depth > 10 or cwd == "/" or cwd == "" then
 			vim.notify("No go.work found", vim.log.levels.WARN)
 			return
 		end
@@ -67,9 +67,7 @@ vim.keymap.set("n", "<leader>5", function()
 				return
 			end
 		end
-		if depth < max then
-			find_gowork(vim.fn.fnamemodify(cwd, ":h"), depth + 1, max)
-		end
+		find_gowork(vim.fn.fnamemodify(cwd, ":h"), depth + 1)
 	end
-	find_gowork(current_dir(), 0, 10)
+	find_gowork(vim.fn.getcwd(), 0)
 end, { noremap = true, silent = true, desc = "CD to go.work root" })

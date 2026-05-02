@@ -25,14 +25,14 @@ W     save persists slot order
 r     refresh
 q     close
 Project keymaps (set in after/):
-<leader>tp  Pick project (scratchbuf) - <CR> to load
+<leader>tp  Pick project (scratchbuf) - <CR> to load, S to switch (kills old)
 <leader>tP  Recover active project (recreate missing sessions)
 --]]
 local scratchbuf = require("scratchbuf")
 local M = {}
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 -- Persistence
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 local order_file = vim.fn.stdpath("data") .. "/tmux_session_slots"
 local active_project_file = vim.fn.stdpath("data") .. "/tmux_active_project"
 local function load_order()
@@ -61,9 +61,9 @@ local function save_order(slots)
 	end
 	f:close()
 end
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 -- Helpers
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 local function in_tmux()
 	return vim.env.TMUX ~= nil
 end
@@ -89,7 +89,7 @@ local function ordered_sessions()
 	end
 	local unseen = {}
 	for _, s in ipairs(live) do
-		if not seen[s] and not s:find("^air%-") then
+		if not seen[s] and not s:find("^air%-") and not s:find("^browser%-") and not s:find("^devproxy%-") then
 			table.insert(unseen, s)
 		end
 	end
@@ -110,9 +110,9 @@ local function sessionize(path)
 		tmux("switch-client -t " .. vim.fn.shellescape(name))
 	end
 end
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 -- Slot switching
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 local function switch_slot(index)
 	if not in_tmux() then
 		vim.notify("Not in tmux", vim.log.levels.WARN)
@@ -138,9 +138,9 @@ for i, key in ipairs({ "J", "K", "L", ":" }) do
 		switch_slot(i + 4)
 	end, { desc = "Tmux slot " .. (i + 4), noremap = true })
 end
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 -- Sessionizer
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 vim.keymap.set("n", "<C-f>", function()
 	if not in_tmux() then
 		vim.notify("Not in tmux", vim.log.levels.WARN)
@@ -199,9 +199,9 @@ vim.keymap.set("n", "<C-f>", function()
 		})
 		:find()
 end, { desc = "Tmux sessionizer" })
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 -- Session editor
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 vim.keymap.set("n", "<leader>ts", function()
 	if not in_tmux() then
 		return
@@ -281,9 +281,9 @@ vim.keymap.set("n", "<leader>tS", function()
 		on_save = function() end,
 	})
 end, { desc = "Tmux: all sessions (debug)" })
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 -- Rename
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 vim.keymap.set("n", "<leader>tr", function()
 	if not in_tmux() then
 		return
@@ -303,9 +303,9 @@ vim.keymap.set("n", "<leader>tr", function()
 		vim.notify("Session renamed to: " .. name)
 	end
 end, { desc = "Tmux rename session" })
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 -- Splits
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 vim.keymap.set("n", "<leader>t|", function()
 	if not in_tmux() then
 		return
@@ -318,9 +318,9 @@ vim.keymap.set("n", "<leader>t-", function()
 	end
 	tmux("split-window -v -c " .. vim.fn.shellescape(vim.fn.getcwd()))
 end, { desc = "Tmux horizontal split" })
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 -- Join / Break pane
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 vim.keymap.set("n", "<leader>ta", function()
 	if not in_tmux() then
 		return
@@ -341,9 +341,9 @@ vim.keymap.set("n", "<leader>tb", function()
 	end
 	tmux("break-pane -d -s !")
 end, { desc = "Tmux: break pane back to session" })
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 -- Kill all sessions
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 vim.keymap.set("n", "<leader>tT", function()
 	if not in_tmux() then
 		return
@@ -354,9 +354,9 @@ vim.keymap.set("n", "<leader>tT", function()
 		vim.notify("tmux: all sessions killed", vim.log.levels.INFO)
 	end
 end, { desc = "Tmux: kill all sessions" })
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 -- Projects
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------------------------
 M.projects = {}
 M.default = {}
 M.nvim = false
@@ -384,7 +384,6 @@ local function create_session(s)
 		vim.trim(vim.fn.system("tmux has-session -t=" .. vim.fn.shellescape(s.name) .. " 2>/dev/null; echo $?"))
 	if exists ~= "0" then
 		local cmd = "new-session -ds " .. vim.fn.shellescape(s.name) .. " -c " .. vim.fn.shellescape(path)
-		-- launch nvim unless explicitly disabled for this session
 		if s.nvim ~= false and M.nvim then
 			cmd = cmd .. " " .. vim.fn.shellescape("nvim .")
 		end
@@ -398,12 +397,10 @@ function M.open_project(name)
 		return
 	end
 	local slots = {}
-	-- project sessions first
 	for _, s in ipairs(proj) do
 		table.insert(slots, s.name)
 		create_session(s)
 	end
-	-- default sessions at the bottom
 	for _, s in ipairs(M.default) do
 		table.insert(slots, s.name)
 		create_session(s)
@@ -414,9 +411,7 @@ function M.open_project(name)
 	vim.notify("Project loaded: " .. name, vim.log.levels.INFO)
 end
 function M.switch_project(name)
-	-- create new project sessions first so we never have zero sessions
 	M.open_project(name)
-	-- build set of sessions to keep: default + new project
 	local keep = {}
 	for _, s in ipairs(M.default) do
 		keep[s.name] = true
@@ -426,7 +421,6 @@ function M.switch_project(name)
 			keep[s.name] = true
 		end
 	end
-	-- kill everything else
 	local live = vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null")
 	for _, s in ipairs(live) do
 		if not keep[s] then
@@ -452,7 +446,6 @@ function M.pick_project()
 		return
 	end
 	local active = get_active_project()
-	-- check which sessions are already alive
 	local live_set = {}
 	local live = vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null")
 	for _, s in ipairs(live) do
@@ -470,56 +463,45 @@ function M.pick_project()
 			M.open_project(entry)
 		end,
 		on_save = function() end,
+		on_ready = function(buf, _win)
+			-- S = clean switch: kill old project sessions then load new
+			vim.keymap.set("n", "S", function()
+				local line = vim.trim(vim.api.nvim_get_current_line())
+				if line == "" then
+					return
+				end
+				vim.schedule(function()
+					if vim.api.nvim_buf_is_valid(buf) then
+						vim.api.nvim_buf_delete(buf, { force = true })
+					end
+					M.switch_project(line)
+				end)
+			end, { buffer = buf, nowait = true, noremap = true, desc = "Switch project (kill old)" })
+			-- virtual text: show session live/dead status per project
+			local ns = vim.api.nvim_create_namespace("tmux_project_preview")
+			local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+			local default_parts = {}
+			for _, s in ipairs(M.default) do
+				local icon = live_set[s.name] and "*" or "-"
+				table.insert(default_parts, icon .. " " .. s.name)
+			end
+			local default_str = #default_parts > 0 and ("  |  " .. table.concat(default_parts, "  ")) or ""
+			for i, line in ipairs(lines) do
+				local proj = M.projects[vim.trim(line)]
+				if proj then
+					local parts = {}
+					for _, s in ipairs(proj) do
+						local icon = live_set[s.name] and "*" or "-"
+						table.insert(parts, icon .. " " .. s.name)
+					end
+					vim.api.nvim_buf_set_extmark(buf, ns, i - 1, 0, {
+						virt_text = { { "  " .. table.concat(parts, "  ") .. default_str, "Comment" } },
+						virt_text_pos = "eol",
+					})
+				end
+			end
+		end,
 	})
-	-- add virtual text + extra keymaps after scratchbuf opens
-	vim.schedule(function()
-		local buf
-		for _, b in ipairs(vim.api.nvim_list_bufs()) do
-			if vim.b[b]._scratchbuf == title then
-				buf = b
-				break
-			end
-		end
-		if not buf then
-			return
-		end
-		-- S = clean switch (kill old project sessions, then load new)
-		vim.keymap.set("n", "S", function()
-			local line = vim.trim(vim.api.nvim_get_current_line())
-			if line == "" then
-				return
-			end
-			vim.schedule(function()
-				if vim.api.nvim_buf_is_valid(buf) then
-					vim.api.nvim_buf_delete(buf, { force = true })
-				end
-				M.switch_project(line)
-			end)
-		end, { buffer = buf, nowait = true, noremap = true, desc = "Switch project (kill old)" })
-		local ns = vim.api.nvim_create_namespace("tmux_project_preview")
-		local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-		-- build default session names for display
-		local default_parts = {}
-		for _, s in ipairs(M.default) do
-			local icon = live_set[s.name] and "*" or "-"
-			table.insert(default_parts, icon .. " " .. s.name)
-		end
-		local default_str = #default_parts > 0 and ("  |  " .. table.concat(default_parts, "  ")) or ""
-		for i, line in ipairs(lines) do
-			local proj = M.projects[vim.trim(line)]
-			if proj then
-				local parts = {}
-				for _, s in ipairs(proj) do
-					local icon = live_set[s.name] and "*" or "-"
-					table.insert(parts, icon .. " " .. s.name)
-				end
-				vim.api.nvim_buf_set_extmark(buf, ns, i - 1, 0, {
-					virt_text = { { "  " .. table.concat(parts, "  ") .. default_str, "Comment" } },
-					virt_text_pos = "eol",
-				})
-			end
-		end
-	end)
 end
 function M.setup(opts)
 	M.projects = opts.projects or {}

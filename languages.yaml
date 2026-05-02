@@ -11,8 +11,12 @@
 #   formatter:  string or list of conform formatter names
 #   treesitter: grammar name (string) or list of grammar names
 #   blink:      (optional) blink.cmp source overrides for this filetype
-#     sources:       fully replace default sources  [lsp, path, snippets, buffer]
+#     sources:       fully replace default sources  [lsp, path, snippets, buffer]
 #     extra_sources: prepend extra sources in front of defaults
+#   dap:        debug adapter configuration
+#     adapter:    adapter name (dlv_spawn | python | godot | pwa-chrome)
+#     python_path: path to python executable (python only)
+#     type:       browser type hint (pwa-chrome only)
 #   extras:     miscellaneous extra config
 #     filetype_register:
 #       extension:  file extension to register
@@ -31,6 +35,10 @@ languages:
       server: pyright
     formatter: black
     treesitter: python
+    dap:
+      adapter: python
+      python_path: "/home/jmeyer/miniconda3/bin/python"
+
   lua:
     mason:
       - lua-language-server
@@ -45,6 +53,7 @@ languages:
             globals: ["vim"]
     formatter: stylua
     treesitter: lua
+
   go:
     mason:
       - gopls
@@ -53,24 +62,35 @@ languages:
       server: gopls
     formatter: [goimports, gofmt]
     treesitter: go
+    dap:
+      adapter: dlv_spawn
+
   javascript:
     mason:
       - typescript-language-server
       - biome
+      - js-debug-adapter
     lsp:
       server: ts_ls
       filetypes: ["javascript", "javascriptreact"]
     formatter: biome
     treesitter: javascript
+    dap:
+      adapter: pwa-chrome
+
   typescript:
     mason:
       - typescript-language-server
       - prettierd
+      - js-debug-adapter
     lsp:
       server: ts_ls
       filetypes: ["typescript", "typescriptreact"]
     formatter: prettierd
     treesitter: typescript
+    dap:
+      adapter: pwa-chrome
+
   html:
     mason:
       - html-lsp
@@ -85,6 +105,7 @@ languages:
       additional_servers:
         - server: emmet_language_server
           filetypes: ["html", "templ"]
+
   css:
     mason:
       - css-lsp
@@ -93,21 +114,25 @@ languages:
       server: cssls
     formatter: prettierd
     treesitter: css
+
   json:
     mason:
       - prettierd
     formatter: prettierd
     treesitter: json
+
   yaml:
     mason:
       - prettierd
     formatter: prettierd
     treesitter: yaml
+
   toml:
     mason:
       - taplo
     formatter: taplo
     treesitter: toml
+
   sql:
     mason:
       - postgres-language-server
@@ -117,6 +142,7 @@ languages:
       filetypes: ["sql"]
     formatter: pg_format
     treesitter: sql
+
   hcl:
     mason:
       - terraform-ls
@@ -125,6 +151,7 @@ languages:
       filetypes: ["hcl"]
     formatter: hcl
     treesitter: hcl
+
   terraform:
     mason:
       - terraform-ls
@@ -132,6 +159,7 @@ languages:
       server: terraformls
       filetypes: ["terraform", "tf"]
     treesitter: hcl
+
   templ:
     mason:
       - templ
@@ -155,8 +183,11 @@ languages:
               experimental:
                 classRegex:
                   - "(?<=class=[\"'`])[^\"'`\\s]+"
+
   gdscript:
     mason:
       - gdtoolkit
     formatter: gdformat
     treesitter: gdscript
+    dap:
+      adapter: godot

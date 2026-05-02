@@ -20,11 +20,13 @@ require("filetypes")
 require("lazycfg")
 require("tmux_projects")
 require("air")
+require("browser")
 require("keymaps")
 require("clipboard").setup()
 
 vim.api.nvim_create_autocmd("VimEnter", {
 	callback = function()
 		require("keymaps.wq")
+		require("keymaps.forge")
 	end,
 })

@@ -68,6 +68,7 @@ function M.setup()
 	-- end
 
 	require("lang.conform").setup(langs)
+	require("lang.dap").setup(langs)
 end
 
 --- Return the blink.cmp `sources.per_filetype` table.

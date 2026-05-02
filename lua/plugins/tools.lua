@@ -1,7 +1,10 @@
 return {
 	{ "feline-nvim/feline.nvim" }, -- status bar
 	{ "gabrielpoca/replacer.nvim" },
+	{ "kevinhwang91/nvim-bqf" }, -- better quickfix list search/replace/prettier
 	{ "mbbill/undotree" },
+	{ "lucamot/chrome-remote.nvim" },
+
 	{
 		"folke/noice.nvim",
 		event = "VeryLazy",
@@ -10,6 +13,10 @@ return {
 		},
 		opts = {
 			lsp = { progress = { enabled = false } },
+			messages = {
+				enabled = true,
+				view = "mini",
+			},
 			presets = {
 				bottom_search = true,
 				command_palette = true,
@@ -33,6 +40,14 @@ return {
 				{
 					filter = { event = "notify", find = "No information available" },
 					opts = { skip = true },
+				},
+				{
+					filter = {
+						event = "msg_show",
+						kind = "",
+						find = "lines yanked",
+					},
+					view = "mini",
 				},
 			},
 		},

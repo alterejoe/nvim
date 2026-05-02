@@ -1,0 +1,19 @@
+<!-- layouts/vertical-stack.html
+     Panels stacked top to bottom, equal height.
+-->
+<div
+  style="
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 28px);
+    gap: 2px;
+    background: #1a1a1a;
+  "
+>
+  <div style="flex: 1; overflow: auto; background: #fff">
+    <devproxy-panel id="1" />
+  </div>
+  <div style="flex: 1; overflow: auto; background: #fff">
+    <devproxy-panel id="2" />
+  </div>
+</div>

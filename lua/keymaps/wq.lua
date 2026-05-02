@@ -7,59 +7,14 @@ local DELETE_BY_FT = { ["kulala://ui"] = true }
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
-
-<<<<<<< HEAD
-local function close_window()
-	-- floating window: just close it
-	if vim.api.nvim_win_get_config(0).relative ~= "" then
-		vim.api.nvim_win_close(0, true)
-		return
-	end
-
-	local non_floating = 0
-=======
--- Count non-floating windows
 local function non_floating_wins()
 	local count = 0
->>>>>>> 4c7c28b3a7e28049ab3d8909b5035d15b8ed75e1
 	for _, win in ipairs(vim.api.nvim_list_wins()) do
 		if vim.api.nvim_win_get_config(win).relative == "" then
 			count = count + 1
 		end
 	end
-<<<<<<< HEAD
-
-	if non_floating <= 1 then
-		-- last window: delete the buffer instead of quitting
-		-- this lets your dashboard or empty state take over
-		vim.cmd("bd!")
-	else
-		vim.cmd("close!")
-	end
-end
-
--- Returns one of: "terminal", "special", "normal", "other"
-local function classify_buffer()
-	local buftype = vim.bo.buftype
-	local filetype = vim.bo.filetype
-	local bufname = vim.fn.expand("%:t")
-
-	if buftype == "terminal" then
-		return "terminal"
-	end
-	if DELETE_BY_NAME[bufname] or DELETE_BY_FT[filetype] then
-		return "special"
-	end
-	if filetype == "oil" or buftype == "acwrite" then
-		return "special"
-	end
-	if buftype == "" then
-		return "normal"
-	end
-	return "other"
-=======
 	return count
->>>>>>> 4c7c28b3a7e28049ab3d8909b5035d15b8ed75e1
 end
 
 -- ---------------------------------------------------------------------------
@@ -92,7 +47,7 @@ vim.api.nvim_create_autocmd("TermOpen", {
 })
 
 -- ---------------------------------------------------------------------------
--- Q: close the current window. period.
+-- Q: smart close
 -- ---------------------------------------------------------------------------
 vim.keymap.set("n", "Q", function()
 	local buf = vim.api.nvim_get_current_buf()
@@ -100,26 +55,10 @@ vim.keymap.set("n", "Q", function()
 	local bt = vim.bo[buf].buftype
 	local bufname = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":t")
 
-<<<<<<< HEAD
-	-- floating windows: always just close the window
+	-- floating window: just close it
 	if vim.api.nvim_win_get_config(0).relative ~= "" then
 		vim.api.nvim_win_close(0, true)
 		return
-	end
-
-	if kind == "terminal" then
-		vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-c>", true, true, true), "i", false)
-		force_delete(buf)
-	elseif kind == "special" then
-		force_delete(buf)
-	else
-		close_window()
-=======
-	-- floating window: just close it
-	if vim.api.nvim_win_get_config(0).relative ~= "" then
-		vim.cmd("close!")
-		return
->>>>>>> 4c7c28b3a7e28049ab3d8909b5035d15b8ed75e1
 	end
 
 	-- oil: use its own close so it restores the parent buffer
@@ -153,50 +92,6 @@ end, { desc = "Close window" })
 -- ---------------------------------------------------------------------------
 -- W: force save (silent on success, loud on failure)
 -- ---------------------------------------------------------------------------
-<<<<<<< HEAD
-vim.keymap.set("n", "Q", function()
-	local buf = vim.api.nvim_get_current_buf()
-	local kind = classify_buffer()
-
-	-- floating windows: always just close the window
-	if vim.api.nvim_win_get_config(0).relative ~= "" then
-		vim.api.nvim_win_close(0, true)
-		return
-	end
-
-	-- count how many non-floating windows show this buffer
-	local wins_with_buf = 0
-	local non_floating = 0
-	for _, win in ipairs(vim.api.nvim_list_wins()) do
-		if vim.api.nvim_win_get_config(win).relative == "" then
-			non_floating = non_floating + 1
-			if vim.api.nvim_win_get_buf(win) == buf then
-				wins_with_buf = wins_with_buf + 1
-			end
-		end
-	end
-
-	-- multiple windows open: just close this pane regardless of buffer type
-	if non_floating > 1 then
-		vim.cmd("close!")
-		return
-	end
-
-	-- last window standing
-	if kind == "terminal" then
-		vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-c>", true, true, true), "i", false)
-		force_delete(buf)
-	elseif kind == "special" then
-		force_delete(buf)
-	else
-		if vim.fn.expand("%") == "" and not vim.bo.modified then
-			vim.cmd("qa!")
-		else
-			vim.cmd("bd!")
-		end
-	end
-end, { desc = "Smart window close" })
-=======
 vim.keymap.set("n", "W", function()
 	local buf = vim.api.nvim_get_current_buf()
 	local bt = vim.bo[buf].buftype
@@ -213,4 +108,3 @@ vim.keymap.set("n", "W", function()
 		end
 	end
 end, { desc = "Force save" })
->>>>>>> 4c7c28b3a7e28049ab3d8909b5035d15b8ed75e1
