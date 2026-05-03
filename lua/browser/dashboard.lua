@@ -32,6 +32,54 @@
 
 local M = {}
 
+-- Browser dashboard highlight groups - defined once, used in all pane windows
+vim.api.nvim_set_hl(0, "BrowserParam", { fg = "#e5a445", bold = true })
+vim.api.nvim_set_hl(0, "BrowserPartial", { fg = "#4a9eff", bold = true })
+vim.api.nvim_set_hl(0, "BrowserFull", { fg = "#4caf50" })
+vim.api.nvim_set_hl(0, "BrowserMethod", { fg = "#56b6c2", bold = true })
+vim.api.nvim_set_hl(0, "BrowserGroup", { fg = "#c678dd", bold = true })
+vim.api.nvim_set_hl(0, "BrowserTabID", { fg = "#555566" })
+-- HTTP response preview
+vim.api.nvim_set_hl(0, "BrowserHttp2xx", { fg = "#4caf50", bold = true })
+vim.api.nvim_set_hl(0, "BrowserHttp3xx", { fg = "#e5a445", bold = true })
+vim.api.nvim_set_hl(0, "BrowserHttp4xx", { fg = "#ff9800", bold = true })
+vim.api.nvim_set_hl(0, "BrowserHttp5xx", { fg = "#f44336", bold = true })
+vim.api.nvim_set_hl(0, "BrowserHdrKey", { fg = "#56b6c2" })
+vim.api.nvim_set_hl(0, "BrowserHdrVal", { fg = "#888899" })
+vim.api.nvim_set_hl(0, "BrowserJsonKey", { fg = "#c678dd" })
+vim.api.nvim_set_hl(0, "BrowserJsonStr", { fg = "#98c379" })
+
+local function browser_highlights(target_win)
+	local function ma(pat, hl, pri)
+		pcall(vim.fn.matchadd, hl, pat, pri, -1, { window = target_win })
+	end
+	ma("{[^}]\\+}", "BrowserParam", 12)
+	ma("\\[partial\\]", "BrowserPartial", 13)
+	ma("\\[full\\]", "BrowserFull", 13)
+	ma("^\\%(GET\\|POST\\|PUT\\|PATCH\\|DELETE\\) ", "BrowserMethod", 11)
+	ma("^## .*", "BrowserGroup", 11)
+	ma("\\s\\+\\[[0-9A-Fa-f]\\{8\\}\\]", "BrowserTabID", 10)
+end
+
+local function preview_highlights(target_win)
+	local function ma(pat, hl, pri)
+		pcall(vim.fn.matchadd, hl, pat, pri, -1, { window = target_win })
+	end
+	-- Status line
+	ma("^HTTP/[^ ]\\+ [12]\\d\\d", "BrowserHttp2xx", 15)
+	ma("^HTTP/[^ ]\\+ 3\\d\\d", "BrowserHttp3xx", 15)
+	ma("^HTTP/[^ ]\\+ 4\\d\\d", "BrowserHttp4xx", 15)
+	ma("^HTTP/[^ ]\\+ 5\\d\\d", "BrowserHttp5xx", 15)
+	-- Header keys (before the colon)
+	ma("^[A-Za-z0-9_-]\\+:", "BrowserHdrKey", 12)
+	-- Header values (after ": ")
+	ma(":\\s\\+\\zs.*$", "BrowserHdrVal", 11)
+	-- JSON keys "key":
+	ma('"[^"]\\+"\\ze\\s*:', "BrowserJsonKey", 13)
+	-- JSON string values
+	ma(':\\s*\\zs"[^"]*"', "BrowserJsonStr", 12)
+end
+
 -- Module-level html search patterns - global across dashboard opens, usable in any buffer
 local _html_patterns = {}
 local UUID_PATTERN = [[\v[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}]]
@@ -123,11 +171,101 @@ end
 
 -- ============================================================
 -- Inline floating path picker
+-- Modes: insert (typing) and normal (navigate/close).
+-- j/k in insert  normal mode. i/a in normal  insert.
+-- q/Q in normal  close. CR=new tab, C-j=replace.
+-- Fuzzy matching: subsequence score, rg-assisted for large lists.
 -- ============================================================
 local function path_picker(items, on_select)
 	if #items == 0 then
-		vim.notify("browser: no routes found", vim.log.levels.WARN)
+		vim.notify("browser: no items", vim.log.levels.WARN)
 		return
+	end
+
+	-- Fuzzy score: returns score > 0 if all query chars appear in order in str.
+	-- Higher score = better match (consecutive runs, start-of-segment bonuses).
+	local function fuzzy_score(str, q)
+		if q == "" then
+			return 1
+		end
+		local s = str:lower()
+		local qi = 1
+		local score = 0
+		local last = -1
+		for si = 1, #s do
+			if s:sub(si, si) == q:sub(qi, qi) then
+				if last == si - 1 then
+					score = score + 4
+				else
+					score = score + 1
+				end
+				if
+					si == 1
+					or s:sub(si - 1, si - 1) == "/"
+					or s:sub(si - 1, si - 1) == "-"
+					or s:sub(si - 1, si - 1) == "{"
+				then
+					score = score + 3
+				end
+				last = si
+				qi = qi + 1
+				if qi > #q then
+					return score
+				end
+			end
+		end
+		return 0 -- not all chars matched
+	end
+
+	-- Filter and rank items. Use rg for large lists when available.
+	local function filter_items(q)
+		if q == "" then
+			return vim.deepcopy(items)
+		end
+		-- rg path: write to tempfile, use rg -i for fast grep pre-filter
+		local use_rg = vim.fn.executable("rg") == 1 and #items > 80
+		local candidates = items
+		if use_rg then
+			local tmp = vim.fn.tempname()
+			local f = io.open(tmp, "w")
+			if f then
+				for _, it in ipairs(items) do
+					f:write(it .. "\n")
+				end
+				f:close()
+				-- rg with each char of query loosely (chars in order as pattern)
+				local pat = table.concat(vim.split(q, "", { plain = true }), ".*")
+				local out = vim.fn.system("rg -i --no-line-number " .. vim.fn.shellescape(pat) .. " " .. tmp)
+				os.remove(tmp)
+				if vim.v.shell_error == 0 and out ~= "" then
+					local set = {}
+					for _, it in ipairs(items) do
+						set[it] = true
+					end
+					candidates = {}
+					for line in out:gmatch("[^\n]+") do
+						if set[line] then
+							table.insert(candidates, line)
+						end
+					end
+				end
+			end
+		end
+		local scored = {}
+		for _, it in ipairs(candidates) do
+			local sc = fuzzy_score(it, q:lower())
+			if sc > 0 then
+				table.insert(scored, { item = it, score = sc })
+			end
+		end
+		table.sort(scored, function(a, b)
+			return a.score > b.score
+		end)
+		local result = {}
+		for _, v in ipairs(scored) do
+			table.insert(result, v.item)
+		end
+		return result
 	end
 
 	local buf = vim.api.nvim_create_buf(false, true)
@@ -135,8 +273,8 @@ local function path_picker(items, on_select)
 	vim.bo[buf].bufhidden = "wipe"
 	vim.bo[buf].modifiable = false
 
-	local width = math.min(72, vim.o.columns - 4)
-	local height = math.min(20, vim.o.lines - 6)
+	local width = math.min(76, vim.o.columns - 4)
+	local height = math.min(22, vim.o.lines - 6)
 	local win = vim.api.nvim_open_win(buf, true, {
 		relative = "editor",
 		row = math.floor((vim.o.lines - height) / 2),
@@ -145,22 +283,27 @@ local function path_picker(items, on_select)
 		height = height,
 		style = "minimal",
 		border = "rounded",
-		title = " : Navigate  CR=new tab  C-j=replace ",
+		title = " / Navigate  CR=new tab  C-j=replace ",
 		title_pos = "center",
 	})
 	vim.wo[win].cursorline = true
+	browser_highlights(win)
 
 	local query = ""
 	local filtered = {}
 	local cursor_row = 1
+	local mode = "insert" -- "insert" | "normal"
+
+	local function update_title()
+		local mode_ind = mode == "insert" and "-- INSERT -- /" or "-- NORMAL -- /"
+		vim.api.nvim_win_set_config(win, {
+			title = " " .. mode_ind .. query .. "  CR=new  C-j=replace ",
+			title_pos = "center",
+		})
+	end
 
 	local function render()
-		filtered = {}
-		for _, item in ipairs(items) do
-			if query == "" or item:lower():find(query:lower(), 1, true) then
-				table.insert(filtered, item)
-			end
-		end
+		filtered = filter_items(query)
 		if #filtered == 0 then
 			filtered = vim.deepcopy(items)
 		end
@@ -169,59 +312,118 @@ local function path_picker(items, on_select)
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, filtered)
 		vim.bo[buf].modifiable = false
 		pcall(vim.api.nvim_win_set_cursor, win, { cursor_row, 0 })
-		vim.api.nvim_win_set_config(win, {
-			title = " /" .. query .. "  CR=new  C-j=replace ",
-			title_pos = "center",
-		})
+		update_title()
 		vim.cmd("redraw")
 	end
 
 	render()
 
+	local function close()
+		pcall(vim.api.nvim_win_close, win, true)
+	end
+
+	local function select(replace)
+		local sel = filtered[cursor_row]
+		close()
+		if sel then
+			on_select(sel, replace)
+		end
+	end
+
+	local function move(delta)
+		cursor_row = math.max(1, math.min(cursor_row + delta, #filtered))
+		pcall(vim.api.nvim_win_set_cursor, win, { cursor_row, 0 })
+		vim.cmd("redraw")
+	end
+
+	local function is_backspace(ch)
+		local b = ch:byte(1)
+		return b == 8 or b == 127 or ch == "\x80kb" or ch == "\x80\xfd-"
+	end
+
 	while true do
 		local ok, ch = pcall(vim.fn.getcharstr)
-		if not ok or ch == "\27" then
-			pcall(vim.api.nvim_win_close, win, true)
+		if not ok then
+			close()
 			return
-		elseif ch == "\r" then
-			local sel = filtered[cursor_row]
-			pcall(vim.api.nvim_win_close, win, true)
-			if sel then
-				on_select(sel, false)
-			end
-			return
-		elseif ch == "\n" then
-			local sel = filtered[cursor_row]
-			pcall(vim.api.nvim_win_close, win, true)
-			if sel then
-				on_select(sel, true)
-			end
-			return
-		elseif ch == "\14" or ch == "j" then
-			cursor_row = math.min(cursor_row + 1, #filtered)
-			pcall(vim.api.nvim_win_set_cursor, win, { cursor_row, 0 })
-			vim.cmd("redraw")
-		elseif ch == "\16" or ch == "k" then
-			cursor_row = math.max(cursor_row - 1, 1)
-			pcall(vim.api.nvim_win_set_cursor, win, { cursor_row, 0 })
-			vim.cmd("redraw")
-		elseif
-			ch == "\8"
-			or ch == "\127"
-			or ch == "\x80kb"
-			or ch == "\x80\xfd-"
-			or ch:byte(1) == 8
-			or ch:byte(1) == 127
-		then
-			if #query > 0 then
-				query = query:sub(1, -2)
+		end
+
+		if mode == "insert" then
+			if ch == "\27" then -- Esc: clear query or close
+				if query ~= "" then
+					query = ""
+					cursor_row = 1
+					render()
+				else
+					close()
+					return
+				end
+			elseif ch == "\r" then
+				select(false)
+				return
+			elseif ch == "\n" then
+				select(true)
+				return
+			elseif ch == "j" or ch == "\14" then
+				mode = "normal"
+				move(1)
+				update_title()
+				vim.cmd("redraw")
+			elseif ch == "k" or ch == "\16" then
+				mode = "normal"
+				move(-1)
+				update_title()
+				vim.cmd("redraw")
+			elseif is_backspace(ch) then
+				if #query > 0 then
+					query = query:sub(1, -2)
+					cursor_row = 1
+					render()
+				end
+			elseif #ch == 1 and ch:byte() >= 32 then
+				query = query .. ch
 				cursor_row = 1
 				render()
 			end
-		elseif #ch == 1 and ch:byte() >= 32 then
-			query = query .. ch
-			cursor_row = 1
-			render()
+		else -- normal mode
+			if ch == "q" or ch == "Q" or ch == "\27" then
+				close()
+				return
+			elseif ch == "\r" then
+				select(false)
+				return
+			elseif ch == "\n" then
+				select(true)
+				return
+			elseif ch == "j" or ch == "\14" then
+				move(1)
+				vim.cmd("redraw")
+			elseif ch == "k" or ch == "\16" then
+				move(-1)
+				vim.cmd("redraw")
+			elseif ch == "i" or ch == "a" or ch == "/" then
+				mode = "insert"
+				update_title()
+				vim.cmd("redraw")
+			elseif ch == "G" then
+				cursor_row = #filtered
+				pcall(vim.api.nvim_win_set_cursor, win, { cursor_row, 0 })
+				vim.cmd("redraw")
+			elseif ch == "g" then
+				-- peek for second g
+				local ok2, ch2 = pcall(vim.fn.getcharstr)
+				if ok2 and ch2 == "g" then
+					cursor_row = 1
+					pcall(vim.api.nvim_win_set_cursor, win, { cursor_row, 0 })
+					vim.cmd("redraw")
+				end
+			elseif #ch == 1 and ch:byte() >= 32 then
+				-- any printable char: switch to insert and append
+				mode = "insert"
+				query = query .. ch
+				cursor_row = 1
+				render()
+			end
 		end
 	end
 end
@@ -240,7 +442,16 @@ local function parse_group_buf(lines)
 			current = name
 			gs[current] = gs[current] or {}
 		elseif current and vim.trim(line) ~= "" then
-			table.insert(gs[current], vim.trim(line))
+			local path = vim.trim(line)
+			-- Strip leading HTTP method (GET /path  /path) and trailing tab metadata
+			path = path:gsub("^%u+%s+", "") -- strip GET/POST/etc prefix
+			path = path:gsub("%s+%[%x+%].*$", "") -- strip  [tabid] suffix
+			path = path:gsub("%s+%[partial%].*$", "") -- strip [partial] suffix
+			path = path:gsub("%s+%[full%].*$", "") -- strip [full] suffix
+			path = vim.trim(path)
+			if path ~= "" then
+				table.insert(gs[current], path)
+			end
 		end
 	end
 	return gs
@@ -289,13 +500,15 @@ function M.open()
 	-- Split pane state (S key)
 	local _split_win = nil
 	local _primary_w = nil
-	local _split_buf = nil -- independent buffer for the split pane
-	local _split_view = "tabs" -- split's own view_mode
-	local _split_meta = {} -- split's own tab_metadata
+	local _split_buf = nil
+	local _split_view = "tabs"
+	local _split_meta = {}
+	local _split_selected_tab_id = nil -- persists across view switches, like preview_tab_id
 	local _split_html_body = nil
 	local _split_html_full = nil
 	local _split_html_show_full = false
 	local _split_html_meta = nil
+	local _registered_keymaps = {} -- all map() calls stored here for split copy
 
 	-- Infer the chi_path template for a tab whose chi_path isn't explicitly known.
 	-- Checks groups first, then all routes from the plan.
@@ -323,14 +536,18 @@ function M.open()
 
 	local function make_content(t)
 		local short_id = t.id:sub(1, 8)
-		local htmx_ann = t.htmx and "  [partial]" or ""
-		local display_path
-		if show_chi_path then
-			display_path = infer_chi_path(t) or t.path
-		else
-			display_path = t.path
+		local chi = infer_chi_path(t)
+		-- Prefer saved test file htmx preference; fall back to live tab state
+		local is_partial = t.htmx
+		if chi then
+			local saved = require("browser.views").load_test_for_path(chi)
+			if saved and saved.htmx ~= nil then
+				is_partial = saved.htmx
+			end
 		end
-		return display_path .. "  [" .. short_id .. "]" .. htmx_ann
+		local htmx_ann = is_partial and "  [partial]" or ""
+		local display_path = (show_chi_path and chi) or t.path
+		return (display_path or t.path) .. "  [" .. short_id .. "]" .. htmx_ann
 	end
 
 	local function fetch_tabs()
@@ -502,9 +719,9 @@ function M.open()
 	end
 
 	local help_lines = {
-		"CR switch   dd+W close  W save    r refresh   q/Q close",
+		"CR switch   dd+W close  W save    r refresh   q back  Q quit",
 		":  paths    P toggle    t partial  T full      \\  name",
-		"g  groups   +  +group   e  http    H  html",
+		"gz groups   +  +group   e  http    H  html",
 		"c  console  C  clr-con  n  network N  clr-net",
 		"n: v req/res  H: b head  U uuid  A +pat  ? pats",
 	}
@@ -784,14 +1001,26 @@ function M.open()
 				end
 				flush()
 				vim.notify(string.format("browser: saved %d context(s) - navigating", #written))
-				-- Navigate the tab using the active context's freshly saved params
 				if _http_tab_meta and _http_chi_path then
-					send_cmd("switch " .. _http_tab_meta.tab_id)
+					-- Don't switch browser focus - stay in e-view
 					require("browser.views").do_navigate(_http_chi_path, _http_tab_meta.htmx or false)
+					-- Show response in preview pane after request settles
+					vim.defer_fn(function()
+						if not _layout then
+							return
+						end
+						local raw = send_cmd("netlog")
+						if not raw or vim.startswith(raw, "err:") then
+							return
+						end
+						local ok, entries = pcall(vim.json.decode, raw)
+						if ok and type(entries) == "table" and #entries > 0 then
+							local last = entries[#entries]
+							local preview = build_net_preview(last, true)
+							_layout.set(PREVIEW_TITLE, preview)
+						end
+					end, 900)
 				end
-				-- Return true so scratchbuf's immediate refresh fires - the refresh
-				-- function returns current buffer content unchanged (view_mode="http"),
-				-- so the e-view stays open.
 				return true
 			end
 
@@ -850,19 +1079,28 @@ function M.open()
 				end, 400)
 			end
 
-			-- Open new tabs for GET lines not in metadata (manually typed by user)
+			-- Open new tabs for lines not in metadata (manually typed).
+			-- Handles "GET /path", bare "/path", and annotated lines.
 			for _, line in ipairs(buf_lines) do
-				if vim.startswith(line, "GET ") then
-					local content = strip_prefix(line)
-					if not tab_metadata[content] then
-						local new_path = vim.trim(content:gsub("%s+%[[%w]+%]", ""):gsub("%s+%[partial%]", ""))
-						if new_path ~= "" and new_path:sub(1, 1) == "/" then
-							send_cmd("open " .. get_base_url() .. new_path)
-							vim.notify("browser: opened tab -> " .. new_path)
-							needs_refresh = true
-						end
+				local trimmed = vim.trim(line)
+				if trimmed == "" or trimmed:sub(1, 2) == "##" then
+					goto continue
+				end
+				local content = strip_prefix(trimmed)
+				if not tab_metadata[content] then
+					local new_path = content
+						:gsub("^%u+%s+", "")
+						:gsub("%s+%[[%x]+%].*$", "")
+						:gsub("%s+%[partial%].*$", "")
+						:gsub("%s+%[full%].*$", "")
+					new_path = vim.trim(new_path)
+					if new_path ~= "" and new_path:sub(1, 1) == "/" then
+						send_cmd("open " .. get_base_url() .. new_path)
+						vim.notify("browser: opened tab -> " .. new_path)
+						needs_refresh = true
 					end
 				end
+				::continue::
 			end
 
 			return not needs_refresh
@@ -1024,6 +1262,24 @@ function M.open()
 			_layout = layout
 			_primary_buf = buf
 			_primary_win = win
+			browser_highlights(win)
+			-- Apply HTTP response highlights to the preview pane window
+			vim.schedule(function()
+				for _, w in ipairs(vim.api.nvim_list_wins()) do
+					local wbuf = vim.api.nvim_win_get_buf(w)
+					if vim.b[wbuf] and vim.b[wbuf]._scratchbuf == TITLE and w ~= win then
+						local title_ok, conf = pcall(vim.api.nvim_win_get_config, w)
+						if title_ok and conf.title then
+							local t = type(conf.title) == "string" and conf.title
+								or (type(conf.title) == "table" and conf.title[1] and conf.title[1][1])
+								or ""
+							if t:find(PREVIEW_TITLE, 1, true) then
+								preview_highlights(w)
+							end
+						end
+					end
+				end
+			end)
 
 			if _saved_state.tab_cursor > 1 then
 				local total = vim.api.nvim_buf_line_count(buf)
@@ -1053,6 +1309,7 @@ function M.open()
 					noremap = true,
 					desc = desc,
 				})
+				table.insert(_registered_keymaps, { lhs = lhs, fn = fn, desc = desc })
 			end
 
 			-- Split helpers - must be defined before any keymap closures that reference them
@@ -1071,6 +1328,20 @@ function M.open()
 				return _split_meta[strip_prefix(raw)]
 			end
 
+			-- Persists the split's selected tab across view switches (like preview_tab_id).
+			-- Updated by CursorMoved when split is in tabs view.
+			local function split_selected_meta()
+				if not _split_selected_tab_id then
+					return nil
+				end
+				for _, m in pairs(_split_meta) do
+					if m.tab_id == _split_selected_tab_id then
+						return m
+					end
+				end
+				return nil
+			end
+
 			local function split_set(lines, ft, readonly)
 				if not (vim.api.nvim_buf_is_valid(_split_buf or -1)) then
 					return
@@ -1086,6 +1357,7 @@ function M.open()
 				local tabs = fetch_tabs()
 				local lines, meta = build_tab_lines(tabs)
 				_split_meta = meta
+				_split_selected_tab_id = nil
 				split_set(lines, "scratchbuf", false)
 				_split_view = "tabs"
 			end
@@ -1126,7 +1398,110 @@ function M.open()
 			end, "Open entry / open group")
 
 			-- r / C-o: always return to tab list and refresh
-			-- r: refresh tabs (tabs/groups/http/html) or refresh log (console/network)
+			-- <leader>w: in e-view, run the request with current buffer params using curl
+			-- without navigating the browser - nvim stays focused. W saves + navigates.
+			map("<leader>w", function()
+				if view_mode ~= "http" then
+					return
+				end
+				if not (_http_tab_meta and _http_chi_path) then
+					vim.notify("browser: no active http context", vim.log.levels.WARN)
+					return
+				end
+				if _primary_buf and vim.api.nvim_buf_is_valid(_primary_buf) then
+					local all_lines = vim.api.nvim_buf_get_lines(_primary_buf, 0, -1, false)
+					local in_section = false
+					local qp, path = "", nil
+					for _, l in ipairs(all_lines) do
+						if l:match("^%-%-%- context:") then
+							in_section = true
+						elseif in_section then
+							local label, val = l:match("^([%w%.%-_]+):%s*(.*)")
+							if label then
+								local low = label:lower()
+								if low == "query" then
+									qp = vim.trim(val)
+								end
+								if low == "path" then
+									path = vim.trim(val)
+								end
+							end
+						end
+					end
+					local views = require("browser.views")
+					local base = views.get_active_base()
+					local resolved = path or _http_chi_path
+					local full_url = base .. resolved .. (qp ~= "" and ("?" .. qp) or "")
+					local method = _http_tab_meta.htmx and "GET" or "GET"
+					local hx_flag = _http_tab_meta.htmx
+							and " -H 'HX-Request: true' -H 'HX-Current-URL: " .. full_url .. "'"
+						or ""
+					vim.notify("browser: " .. method .. " " .. resolved .. (qp ~= "" and ("?" .. qp) or ""))
+					local cookie_file = require("browser.session").DEVPROXY_DIR .. "/cookies.txt"
+					local cookie_flag = vim.fn.filereadable(cookie_file) == 1
+							and (" -b " .. vim.fn.shellescape(cookie_file))
+						or ""
+					vim.fn.jobstart("curl -siL" .. hx_flag .. cookie_flag .. " " .. vim.fn.shellescape(full_url), {
+						stdout_buffered = true,
+						on_stdout = function(_, data)
+							if not data then
+								return
+							end
+							local all = {}
+							for _, l in ipairs(data) do
+								if l ~= nil then
+									local cleaned = tostring(l):gsub("\r", "")
+									table.insert(all, cleaned)
+								end
+							end
+							if #all == 0 then
+								return
+							end
+							-- Split into response blocks (each starts with HTTP/)
+							local blocks = {}
+							local current = {}
+							for _, l in ipairs(all) do
+								if l:match("^HTTP/") and #current > 0 then
+									table.insert(blocks, current)
+									current = {}
+								end
+								table.insert(current, l)
+							end
+							if #current > 0 then
+								table.insert(blocks, current)
+							end
+							-- Reverse block order so most recent response is first
+							local out = {}
+							for i = #blocks, 1, -1 do
+								local block = blocks[i]
+								-- Drop HTML bodies - stop at blank line followed by HTML
+								local in_body = false
+								for _, l in ipairs(block) do
+									if in_body then
+										-- skip HTML content
+									elseif l == "" then
+										in_body = true
+										table.insert(out, l)
+									else
+										table.insert(out, l)
+									end
+								end
+								if i > 1 then
+									table.insert(out, "")
+								end
+							end
+							vim.schedule(function()
+								if _layout then
+									_layout.set(PREVIEW_TITLE, out)
+								end
+							end)
+						end,
+					})
+				end
+			end, "Navigate without saving (<leader>w)")
+			map("q", function()
+				restore_tabs(buf)
+			end, "Return to tab list")
 			map("r", function()
 				if is_in_split() then
 					if _split_view == "console" then
@@ -1269,21 +1644,16 @@ function M.open()
 				vim.wo[_split_win].signcolumn = "no"
 				vim.wo[_split_win].wrap = false
 				vim.wo[_split_win].winhighlight = "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLine"
-				-- Copy all buffer-local keymaps from primary buf to split buf.
-				-- The closures reference is_in_split() so they route correctly.
-				for _, km in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
-					local opts = {
+				browser_highlights(_split_win)
+				-- Apply all registered keymaps to split buf - reliable since we
+				-- stored the actual Lua callbacks, not via nvim_buf_get_keymap.
+				for _, km in ipairs(_registered_keymaps) do
+					pcall(vim.keymap.set, "n", km.lhs, km.fn, {
 						buffer = _split_buf,
-						nowait = km.nowait == 1,
-						noremap = km.noremap == 1,
-						silent = km.silent == 1,
+						nowait = true,
+						noremap = true,
 						desc = km.desc,
-					}
-					if km.callback then
-						pcall(vim.keymap.set, "n", km.lhs, km.callback, opts)
-					elseif km.rhs and km.rhs ~= "" then
-						pcall(vim.keymap.set, "n", km.lhs, km.rhs, opts)
-					end
+					})
 				end
 				-- q/Q/Esc/S/C-w in split close only the split, not the whole dashboard
 				local function close_split_only()
@@ -1307,7 +1677,7 @@ function M.open()
 						vim.api.nvim_set_current_win(win)
 					end
 				end
-				for _, lhs in ipairs({ "q", "Q", "<Esc>", "S", "<C-w>" }) do
+				for _, lhs in ipairs({ "q", "<Esc>", "S", "<C-w>" }) do
 					vim.keymap.set("n", lhs, close_split_only, { buffer = _split_buf, nowait = true, noremap = true })
 				end
 				vim.api.nvim_create_autocmd("ModeChanged", {
@@ -1320,6 +1690,26 @@ function M.open()
 						vim.wo[_split_win].winhighlight = (mode == "v" or mode == "\22")
 								and "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLineV"
 							or "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLine"
+					end,
+				})
+				-- Track which tab is selected in the split (persists across view switches)
+				vim.api.nvim_create_autocmd("CursorMoved", {
+					buffer = _split_buf,
+					callback = function()
+						if _split_view ~= "tabs" then
+							return
+						end
+						if
+							not (vim.api.nvim_win_is_valid(_split_win) and vim.api.nvim_get_current_win() == _split_win)
+						then
+							return
+						end
+						local lnum = vim.api.nvim_win_get_cursor(_split_win)[1]
+						local raw = vim.api.nvim_buf_get_lines(_split_buf, lnum - 1, lnum, false)[1] or ""
+						local m = _split_meta[strip_prefix(raw)]
+						if m then
+							_split_selected_tab_id = m.tab_id
+						end
 					end,
 				})
 				-- Close split when the dashboard closes (q/Q/<Esc> etc.)
@@ -1378,6 +1768,8 @@ function M.open()
 			)
 			map("<C-w>l", _close_or_split, "Close dashboard (move right)")
 			map("<C-w>h", _close_or_split, "Close dashboard (move left)")
+			map("<C-w>j", _close_or_split, "Close dashboard (move down)")
+			map("<C-w>k", _close_or_split, "Close dashboard (move up)")
 
 			-- \: toggle between resolved URL path and chi_path template display
 			map("\\", function()
@@ -1396,10 +1788,9 @@ function M.open()
 						split_restore_tabs()
 						return
 					end
-					if _split_view ~= "tabs" then
-						return
-					end
-					local raw = send_cmd("consolelog")
+					local meta = split_selected_meta()
+					local tab_arg = meta and (" " .. meta.tab_id) or ""
+					local raw = send_cmd("consolelog" .. tab_arg)
 					if not raw or vim.startswith(raw, "err:") then
 						vim.notify("browser: " .. (raw or "no response"), vim.log.levels.WARN)
 						return
@@ -1413,18 +1804,15 @@ function M.open()
 					restore_tabs(buf)
 					return
 				end
-				if view_mode ~= "tabs" then
-					return
-				end
 				local raw = send_cmd("consolelog")
 				if not raw or vim.startswith(raw, "err:") then
 					vim.notify("browser: " .. (raw or "no response"), vim.log.levels.WARN)
 					return
 				end
 				local lines = build_console_lines(raw)
+				vim.bo[buf].filetype = "text"
 				vim.bo[buf].modifiable = true
 				vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-				vim.bo[buf].filetype = "text"
 				vim.bo[buf].modifiable = false
 				vim.bo[buf].modified = false
 				view_mode = "console"
@@ -1464,10 +1852,9 @@ function M.open()
 						split_restore_tabs()
 						return
 					end
-					if _split_view ~= "tabs" then
-						return
-					end
-					local raw = send_cmd("netlog")
+					local meta = split_selected_meta()
+					local tab_arg = meta and (" " .. meta.tab_id) or ""
+					local raw = send_cmd("netlog" .. tab_arg)
 					if not raw or vim.startswith(raw, "err:") then
 						vim.notify("browser: " .. (raw or "no response"), vim.log.levels.WARN)
 						return
@@ -1475,14 +1862,11 @@ function M.open()
 					_net_show_response = false
 					split_set(build_net_lines(raw), "text", true)
 					_split_view = "network"
-					vim.notify("browser: split network - v=req/res  N=clear  r=refresh  n/r=back")
+					vim.notify("browser: split network - R=req/res  N=clear  r=refresh  n/r=back")
 					return
 				end
 				if view_mode == "network" then
 					restore_tabs(buf)
-					return
-				end
-				if view_mode ~= "tabs" then
 					return
 				end
 				local raw = send_cmd("netlog")
@@ -1492,16 +1876,16 @@ function M.open()
 				end
 				_net_show_response = false
 				local lines = build_net_lines(raw)
+				vim.bo[buf].filetype = "text"
 				vim.bo[buf].modifiable = true
 				vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-				vim.bo[buf].filetype = "text"
 				vim.bo[buf].modifiable = false
 				vim.bo[buf].modified = false
 				if _layout then
 					_layout.set(PREVIEW_TITLE, { "-- move cursor to a request --" })
 				end
 				view_mode = "network"
-				vim.notify("browser: network log - v=req/res  N=clear  r=refresh  n/<C-o>=back")
+				vim.notify("browser: network log - R=req/res  N=clear  r=refresh  n/<C-o>=back")
 			end, "Network log")
 
 			-- N: clear network log - split-aware
@@ -1535,8 +1919,8 @@ function M.open()
 				end
 			end, "Clear network log")
 
-			-- v: toggle request / response in network preview pane
-			map("v", function()
+			-- R: toggle request / response in network preview pane
+			map("R", function()
 				if view_mode ~= "network" then
 					return
 				end
@@ -1623,12 +2007,10 @@ function M.open()
 			end, "Navigate full page")
 
 			-- gg: explicit binding so it works even with g mapped below
-			vim.keymap.set("n", "gg", function()
-				vim.api.nvim_feedkeys("gg", "n", false)
-			end, { buffer = buf, nowait = true, noremap = true, desc = "Go to first line" })
+			-- gg is native now that g has no mapping
 
-			-- g: toggle group editor - nowait=false so gg can still fire naturally
-			vim.keymap.set("n", "g", function()
+			-- <M-g>: toggle group editor
+			local _g_fn = function()
 				if view_mode == "groups" then
 					restore_tabs(buf)
 					return
@@ -1663,8 +2045,11 @@ function M.open()
 				vim.bo[buf].filetype = "scratchbuf"
 				vim.bo[buf].modified = false
 				view_mode = "groups"
-				vim.notify("browser: group editor - W=save  :=add path  CR=open  g/r=back")
-			end, { buffer = buf, nowait = false, noremap = true, desc = "Group editor" })
+				vim.notify("browser: group editor - W=save  :=add path  CR=open  gz/r=back")
+			end
+			-- gz: group editor - z is not mapped so gz completes cleanly
+			vim.keymap.set("n", "gz", _g_fn, { buffer = buf, nowait = true, noremap = true, desc = "Group editor" })
+			table.insert(_registered_keymaps, { lhs = "gz", fn = _g_fn, desc = "Group editor" })
 
 			-- +: add current tab's chi_path to a group (was G, freed for last-line motion)
 			map("+", function()
@@ -1706,21 +2091,63 @@ function M.open()
 
 			-- e: toggle HTTP multi-context editor in primary pane
 			map("e", function()
+				if is_in_split() then
+					if _split_view == "http" then
+						split_restore_tabs()
+						return
+					end
+					local meta = split_selected_meta()
+					if not meta then
+						vim.notify("browser: no tab selected", vim.log.levels.WARN)
+						return
+					end
+					local chi_path = meta.chi_path or meta.path
+					do
+						local routes = require("browser.views").get_routes()
+						for _, r in ipairs(routes) do
+							if path_matches_chi(meta.path, r.chi_path) then
+								chi_path = r.chi_path
+								break
+							end
+						end
+					end
+					local session = require("browser.session")
+					local contexts = require("browser.views").get_contexts()
+					local lines = { "# " .. chi_path }
+					for _, ctx in ipairs(contexts) do
+						local saved = require("browser.views").load_test_for_path(chi_path)
+						table.insert(lines, "--- context: " .. ctx .. " ---")
+						if saved then
+							table.insert(lines, "query: " .. (saved.qp or ""))
+							table.insert(lines, "path: " .. (saved.path or chi_path))
+						else
+							table.insert(lines, "query: ")
+							table.insert(lines, "path: " .. chi_path)
+						end
+					end
+					split_set(lines, "http", false)
+					_split_view = "http"
+					vim.notify("browser: split http - e/r=back")
+					return
+				end
 				if view_mode == "http" then
 					restore_tabs(buf)
 					return
 				end
-				if view_mode ~= "tabs" then
-					return
-				end
 				local meta = current_meta()
+				if not meta then
+					for _, m in pairs(tab_metadata) do
+						if m.tab_id == preview_tab_id then
+							meta = m
+							break
+						end
+					end
+				end
 				if not meta then
 					vim.notify("browser: no tab selected", vim.log.levels.WARN)
 					return
 				end
 				local chi_path = meta.chi_path or meta.path
-				-- Resolve to the canonical route chi_path so the test file slug matches
-				-- regardless of param ordering in the group definition.
 				do
 					local routes = require("browser.views").get_routes()
 					for _, r in ipairs(routes) do
@@ -1738,9 +2165,6 @@ function M.open()
 				_http_section_paths = {}
 				_http_tab_meta = meta
 				_http_chi_path = chi_path
-				-- Find the actual file path for a context, preferring existing files
-				-- over the canonical slug. This prevents W from creating a new file
-				-- at the canonical slug path while the real file sits at a different slug.
 				local function find_http_file(cp, ctx)
 					local function make_path(c)
 						local s = c:gsub("/$", ""):gsub("^/", ""):gsub("/", "-"):gsub("{", ""):gsub("}", "")
@@ -1754,8 +2178,6 @@ function M.open()
 					if vim.fn.filereadable(p) == 1 then
 						return p
 					end
-					-- Try routes with same structural pattern (same static segments,
-					-- same param positions, different param names/order)
 					local routes = require("browser.views").get_routes()
 					local cp_segs = {}
 					for s in cp:gmatch("[^/]+") do
@@ -1787,9 +2209,8 @@ function M.open()
 							end
 						end
 					end
-					return p -- canonical path (will be created on W if user saves)
+					return p
 				end
-
 				local sections = {}
 				for _, ctx in ipairs(contexts) do
 					local fpath = find_http_file(chi_path, ctx)
@@ -1804,9 +2225,7 @@ function M.open()
 					end
 					table.insert(sections, { context = ctx, lines = content_lines })
 				end
-
 				local new_lines = {}
-				-- Show which endpoint is being edited
 				table.insert(new_lines, "# " .. chi_path)
 				table.insert(new_lines, "")
 				for i, sec in ipairs(sections) do
@@ -1816,7 +2235,6 @@ function M.open()
 							table.insert(new_lines, l)
 						end
 					else
-						-- Template for contexts with no test file yet
 						table.insert(new_lines, "query: ")
 						table.insert(new_lines, "path: " .. chi_path)
 					end
@@ -1840,14 +2258,7 @@ function M.open()
 						split_restore_tabs()
 						return
 					end
-					if _split_view ~= "tabs" then
-						return
-					end
-					local meta = split_current_meta()
-					if not meta then
-						vim.notify("browser: no tab selected", vim.log.levels.WARN)
-						return
-					end
+					local meta = split_selected_meta()
 					local body = send_cmd("page-source-body " .. meta.tab_id)
 					if not body or vim.startswith(body, "err:") then
 						vim.notify("browser: " .. (body or "no response"), vim.log.levels.WARN)
@@ -1866,10 +2277,16 @@ function M.open()
 					restore_tabs(buf)
 					return
 				end
-				if view_mode ~= "tabs" then
-					return
-				end
+				-- When not in tabs view, cursor isn't on a tab line - use last known tab
 				local meta = current_meta()
+				if not meta then
+					for _, m in pairs(tab_metadata) do
+						if m.tab_id == preview_tab_id then
+							meta = m
+							break
+						end
+					end
+				end
 				if not meta then
 					vim.notify("browser: no tab selected", vim.log.levels.WARN)
 					return
@@ -1893,8 +2310,10 @@ function M.open()
 				vim.notify("browser: html body - b=head  U=uuid  A=+pat  ?=patterns  H/r/<C-o>=back")
 			end, "HTML source viewer")
 
-			-- b: toggle body/head - split-aware
-			map("b", function()
+			-- b: body/head toggle (html view) OR bg: group editor.
+			-- getchar(0) is non-blocking - peeks at already-pending input.
+			-- b: body/head toggle (html view only). gz for groups via g keymap.
+			local _b_fn = function()
 				if is_in_split() then
 					if _split_view ~= "html" then
 						return
@@ -1939,14 +2358,19 @@ function M.open()
 				vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 				vim.bo[buf].modifiable = false
 				vim.bo[buf].modified = false
-			end, "Toggle body / full HTML")
+			end
+			map("b", _b_fn, "Toggle body / full HTML")
 
 			-- U: jump to next UUID in html view (u is left free for native undo)
 			map("U", function()
-				if view_mode ~= "html" then
+				local in_html = view_mode == "html" or (is_in_split() and _split_view == "html")
+				if not in_html then
 					return
 				end
-				vim.fn.search(UUID_PATTERN)
+				local found = vim.fn.search(UUID_PATTERN, "w")
+				if found == 0 then
+					vim.notify("browser: no UUID found", vim.log.levels.INFO)
+				end
 			end, "Next UUID")
 
 			-- A: add a named vim-regex pattern to the global html pattern list
@@ -2088,10 +2512,7 @@ function M.open()
 				local items = {}
 				for _, r in ipairs(routes) do
 					local saved = views.load_test_for_path(r.chi_path)
-					local ann = ""
-					if saved and saved.htmx ~= nil then
-						ann = saved.htmx and "  [partial]" or "  [full]"
-					end
+					local ann = (saved and saved.htmx == true) and "  [partial]" or "  [full]"
 					table.insert(items, r.chi_path .. ann)
 				end
 				-- Strip annotation to recover the bare chi_path

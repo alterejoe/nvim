@@ -5,7 +5,7 @@
 local M = {}
 
 M.keys = {
-	close = { "q", "<Esc>", "Q" },
+	close = { "Q", "<Esc>" },
 	open = "<CR>",
 	new_below = "o",
 	new_above = "O",
