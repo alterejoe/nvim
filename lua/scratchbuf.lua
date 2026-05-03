@@ -311,11 +311,33 @@ local function open_win_at(buf, dims, title, focus)
 	})
 end
 
-local function set_win_opts(win)
+vim.api.nvim_set_hl(0, "ScratchbufVisual", { bg = "#2a6faa", fg = "#ffffff", bold = true })
+vim.api.nvim_set_hl(0, "ScratchbufCursorLine", { bg = "#1e2a3a" })
+vim.api.nvim_set_hl(0, "ScratchbufCursorLineV", { bg = "NONE" }) -- transparent in v mode
+
+local function set_win_opts(win, buf)
 	vim.wo[win].cursorline = true
 	vim.wo[win].number = true
 	vim.wo[win].signcolumn = "no"
 	vim.wo[win].wrap = false
+	vim.wo[win].winhighlight = "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLine"
+	-- In charwise visual, clear CursorLine bg so Visual isn't occluded
+	if buf then
+		vim.api.nvim_create_autocmd("ModeChanged", {
+			buffer = buf,
+			callback = function()
+				local mode = vim.api.nvim_get_mode().mode
+				local hl = (mode == "v" or mode == "\22") and "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLineV"
+					or "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLine"
+				-- Apply to every window currently showing this buffer (including splits)
+				for _, w in ipairs(vim.api.nvim_list_wins()) do
+					if vim.api.nvim_win_is_valid(w) and vim.api.nvim_win_get_buf(w) == buf then
+						vim.wo[w].winhighlight = hl
+					end
+				end
+			end,
+		})
+	end
 end
 
 local function set_readonly_win_opts(win)
@@ -508,6 +530,9 @@ local function setup_pane(pane, all_panes, layout, pane_opts)
 			return
 		end
 		pane.scratch_reg = raw
+		-- Also yank to vim's default register so p works in any buffer
+		vim.fn.setreg('"', raw)
+		vim.fn.setreg("0", raw)
 		vim.api.nvim_buf_set_lines(buf, lnum - 1, lnum, false, {})
 		vim.bo[buf].modified = true
 		local total = vim.api.nvim_buf_line_count(buf)
@@ -676,7 +701,7 @@ function M.open(opts)
 	vim.bo[primary_buf].modified = false
 
 	local primary_win = open_win_at(primary_buf, dims.primary, opts.title, true)
-	set_win_opts(primary_win)
+	set_win_opts(primary_win, primary_buf)
 
 	local primary_pane = {
 		buf = primary_buf,
@@ -710,7 +735,7 @@ function M.open(opts)
 			if role == "readonly" then
 				set_readonly_win_opts(rp_win)
 			else
-				set_win_opts(rp_win)
+				set_win_opts(rp_win, rp_buf)
 			end
 			local rp = {
 				buf = rp_buf,

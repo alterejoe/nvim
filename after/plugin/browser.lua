@@ -111,3 +111,35 @@ vim.keymap.set("n", "<leader>bI", function()
 	s.send_cmd("clear-layout")
 	vim.notify("browser: layout cleared")
 end, { desc = "Browser: clear layout" })
+
+-- ------------------------------------------------------------
+-- html pattern search  (patterns defined in H view with 'a')
+-- applies to any buffer - useful for tracking UUIDs, ids, etc.
+-- ------------------------------------------------------------
+vim.keymap.set("n", "<leader>ha", function()
+	local patterns = require("browser.dashboard").get_patterns()
+	if #patterns == 0 then
+		vim.notify("browser: no html patterns - open H view and use 'a' to add one", vim.log.levels.WARN)
+		return
+	end
+	vim.ui.select(
+		vim.tbl_map(function(p)
+			return p.name
+		end, patterns),
+		{ prompt = "Search pattern:" },
+		function(choice)
+			if not choice then
+				return
+			end
+			for _, p in ipairs(patterns) do
+				if p.name == choice then
+					vim.fn.setreg("/", p.pattern)
+					vim.opt.hlsearch = true
+					vim.cmd("normal! n")
+					vim.notify("browser: searching for '" .. p.name .. "'")
+					break
+				end
+			end
+		end
+	)
+end, { desc = "Browser: search for html pattern in current buffer" })

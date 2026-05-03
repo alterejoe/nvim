@@ -141,12 +141,12 @@ local function resolve_path(chi_path)
 		elseif params[param] and params[param] ~= "" then
 			result = result:gsub("{" .. param .. "}", params[param], 1)
 		else
-			local val = vim.fn.input("Value for {" .. param .. "}: ")
-			if val == "" then
-				return nil
-			end
-			_session_defaults[param] = val
-			result = result:gsub("{" .. param .. "}", val, 1)
+			-- local val = vim.fn.input("Value for {" .. param .. "}: ")
+			-- if val == "" then
+			-- 	return nil
+			-- end
+			-- _session_defaults[param] = val
+			-- result = result:gsub("{" .. param .. "}", val, 1)
 		end
 	end
 	return result
@@ -191,15 +191,52 @@ local function load_test_for_path(chi_path)
 
 	local path
 	if _context and _context ~= "default" and _context ~= "" then
-		-- non-default context: only look in context subdir, no fallback
 		path = session.TESTS_DIR .. "/" .. _context .. "/" .. slug .. ".http"
 	else
-		-- default context: only look in root tests dir
 		path = session.TESTS_DIR .. "/" .. slug .. ".http"
 	end
 
 	if vim.fn.filereadable(path) == 0 then
-		return nil
+		local chi_segs = {}
+		for s in (chi_path or ""):gmatch("[^/]+") do
+			table.insert(chi_segs, s)
+		end
+		for _, r in ipairs(require("browser.views").get_routes()) do
+			if r.chi_path ~= chi_path then
+				local r_segs = {}
+				for s in r.chi_path:gmatch("[^/]+") do
+					table.insert(r_segs, s)
+				end
+				if #r_segs == #chi_segs then
+					local same = true
+					for i, cs in ipairs(chi_segs) do
+						local rs = r_segs[i]
+						local c_p = cs:sub(1, 1) == "{"
+						local r_p = rs:sub(1, 1) == "{"
+						if c_p ~= r_p or (not c_p and cs ~= rs) then
+							same = false
+							break
+						end
+					end
+					if same then
+						local alt = r.chi_path:gsub("/$", ""):gsub("^/", ""):gsub("/", "-"):gsub("{", ""):gsub("}", "")
+						local alt_path
+						if _context and _context ~= "default" and _context ~= "" then
+							alt_path = session.TESTS_DIR .. "/" .. _context .. "/" .. alt .. ".http"
+						else
+							alt_path = session.TESTS_DIR .. "/" .. alt .. ".http"
+						end
+						if vim.fn.filereadable(alt_path) == 1 then
+							path = alt_path
+							break
+						end
+					end
+				end
+			end
+		end
+		if vim.fn.filereadable(path) == 0 then
+			return nil
+		end
 	end
 
 	local f = io.open(path, "r")
@@ -208,6 +245,7 @@ local function load_test_for_path(chi_path)
 	end
 	local qp = ""
 	local resolved_path = nil
+	local htmx_val = nil
 	for line in f:lines() do
 		local label, val = line:match("^([%w%.%-_]+):%s*(.*)")
 		if label then
@@ -218,10 +256,13 @@ local function load_test_for_path(chi_path)
 			if low == "path" then
 				resolved_path = vim.trim(val)
 			end
+			if low == "htmx" then
+				htmx_val = vim.trim(val) == "true"
+			end
 		end
 	end
 	f:close()
-	return { qp = qp, path = resolved_path }
+	return { qp = qp, path = resolved_path, htmx = htmx_val }
 end
 
 local function resolve_qp(chi_path)
@@ -1071,5 +1112,43 @@ function M.load_test_for_path(chi_path)
 	return load_test_for_path(chi_path)
 end
 M.get_config = get_config
+
+function M.save_htmx_for_path(chi_path, htmx)
+	ensure_context_loaded()
+	local session = require("browser.session")
+	local slug = (chi_path or "unknown"):gsub("/$", ""):gsub("^/", ""):gsub("/", "-"):gsub("{", ""):gsub("}", "")
+	local fpath
+	if _context and _context ~= "default" and _context ~= "" then
+		fpath = session.TESTS_DIR .. "/" .. _context .. "/" .. slug .. ".http"
+	else
+		fpath = session.TESTS_DIR .. "/" .. slug .. ".http"
+	end
+	local lines = {}
+	local found = false
+	local f = io.open(fpath, "r")
+	if f then
+		for line in f:lines() do
+			local label = line:match("^([%w%.%-_]+):")
+			if label and label:lower() == "htmx" then
+				table.insert(lines, "htmx: " .. tostring(htmx))
+				found = true
+			else
+				table.insert(lines, line)
+			end
+		end
+		f:close()
+	end
+	if not found then
+		table.insert(lines, "htmx: " .. tostring(htmx))
+	end
+	vim.fn.mkdir(vim.fn.fnamemodify(fpath, ":h"), "p")
+	local wf = io.open(fpath, "w")
+	if wf then
+		for _, l in ipairs(lines) do
+			wf:write(l .. "\n")
+		end
+		wf:close()
+	end
+end
 
 return M

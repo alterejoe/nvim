@@ -32,6 +32,10 @@
 
 local M = {}
 
+-- Module-level html search patterns - global across dashboard opens, usable in any buffer
+local _html_patterns = {}
+local UUID_PATTERN = [[\v[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}]]
+
 local _saved_state = {
 	tab_cursor = 1,
 }
@@ -92,6 +96,29 @@ local function path_matches_chi(tab_path, chi_path)
 		end
 	end
 	return true
+end
+
+-- ============================================================
+-- HTML formatter - tries tidy, prettier, falls back to tag-splitting.
+-- Tag-splitting puts each tag on its own line so vim's html indent
+-- can handle indentation with gg=G even without external tools.
+-- ============================================================
+local function format_html(raw)
+	if vim.fn.executable("tidy") == 1 then
+		local result = vim.fn.system("tidy -indent -quiet -utf8 --show-errors 0 --show-warnings 0 -", raw)
+		if vim.v.shell_error <= 1 and result and #result > 0 then
+			return result
+		end
+	end
+	if vim.fn.executable("prettier") == 1 then
+		local result = vim.fn.system("prettier --parser html 2>/dev/null", raw)
+		if vim.v.shell_error == 0 and result and #result > 0 then
+			return result
+		end
+	end
+	-- Fallback: split on tag boundaries so there is at least one tag per line,
+	-- then vim's html indent plugin handles the rest via gg=G.
+	return raw:gsub("><", ">\n<")
 end
 
 -- ============================================================
@@ -238,9 +265,9 @@ function M.open()
 	local _primary_buf = nil
 	local _primary_win = nil
 
-	-- "tabs" | "groups" | "http" | "html"
+	-- "tabs" | "groups" | "http" | "html" | "console" | "network"
 	local view_mode = "tabs"
-	-- Toggle between resolved URL path and chi_path template (n key)
+	-- Toggle between resolved URL path and chi_path template (\ key)
 	local show_chi_path = true
 
 	-- Populated when e is pressed; maps context name  file path
@@ -248,6 +275,27 @@ function M.open()
 	-- Meta and chi_path of the tab that was under the cursor when e was pressed
 	local _http_tab_meta = nil
 	local _http_chi_path = nil
+
+	-- HTML view state (reset on each H press)
+	local _html_body_lines = nil
+	local _html_full_lines = nil
+	local _html_show_full = false
+	local _html_source_meta = nil
+
+	-- Network view state: entries indexed by line number, response toggle
+	local _net_entries = {}
+	local _net_show_response = false
+
+	-- Split pane state (S key)
+	local _split_win = nil
+	local _primary_w = nil
+	local _split_buf = nil -- independent buffer for the split pane
+	local _split_view = "tabs" -- split's own view_mode
+	local _split_meta = {} -- split's own tab_metadata
+	local _split_html_body = nil
+	local _split_html_full = nil
+	local _split_html_show_full = false
+	local _split_html_meta = nil
 
 	-- Infer the chi_path template for a tab whose chi_path isn't explicitly known.
 	-- Checks groups first, then all routes from the plan.
@@ -455,8 +503,10 @@ function M.open()
 
 	local help_lines = {
 		"CR switch   dd+W close  W save    r refresh   q/Q close",
-		":  paths    p toggle    t partial  T full",
-		"g  groups   G  +group   e  http    H  html",
+		":  paths    P toggle    t partial  T full      \\  name",
+		"g  groups   +  +group   e  http    H  html",
+		"c  console  C  clr-con  n  network N  clr-net",
+		"n: v req/res  H: b head  U uuid  A +pat  ? pats",
 	}
 
 	local function do_buf_refresh(buf)
@@ -531,6 +581,124 @@ function M.open()
 	end
 
 	-- --------------------------------------------------------
+	-- Network / console helpers (must live outside scratchbuf.open table)
+	-- --------------------------------------------------------
+	local function build_net_preview(entry, show_response)
+		-- Strip embedded newlines from a value so nvim_buf_set_lines never errors
+		local function s(v)
+			return tostring(v):gsub("[\r\n]+", " ")
+		end
+		local lines = {}
+		if show_response then
+			table.insert(lines, "HTTP/1.1 " .. s(entry.status or "?"))
+			if entry.res_headers then
+				for k, v in pairs(entry.res_headers) do
+					table.insert(lines, s(k) .. ": " .. s(v))
+				end
+			end
+			local body = entry.res_body or ""
+			if body ~= "" then
+				table.insert(lines, "")
+				local ok, decoded = pcall(vim.json.decode, body)
+				if ok then
+					local encoded = vim.fn.json_encode(decoded)
+					for _, l in ipairs(vim.split(encoded, "\n", { plain = true })) do
+						table.insert(lines, l)
+					end
+				else
+					for _, l in ipairs(vim.split(body, "\n", { plain = true })) do
+						table.insert(lines, l)
+					end
+				end
+			end
+		else
+			local method = s(entry.method or "GET")
+			local url = s(entry.url or "")
+			local path = url:match("https?://[^/]+(/[^%s]*)") or url
+			local host = url:match("https?://([^/]+)") or ""
+			table.insert(lines, method .. " " .. path .. " HTTP/1.1")
+			if host ~= "" then
+				table.insert(lines, "Host: " .. host)
+			end
+			if entry.req_headers then
+				for k, v in pairs(entry.req_headers) do
+					if k:lower() ~= "host" then
+						table.insert(lines, s(k) .. ": " .. s(v))
+					end
+				end
+			end
+			local body = entry.req_body or ""
+			if body ~= "" then
+				table.insert(lines, "")
+				for _, l in ipairs(vim.split(body, "\n", { plain = true })) do
+					table.insert(lines, l)
+				end
+			end
+		end
+		if #lines == 0 then
+			table.insert(lines, "-- no " .. (show_response and "response" or "request") .. " data --")
+		end
+		return lines
+	end
+
+	local function build_net_lines(raw)
+		_net_entries = {}
+		local lines = {}
+		local ok, entries = pcall(vim.json.decode, raw)
+		if ok and type(entries) == "table" then
+			for _, entry in ipairs(entries) do
+				local method = entry.method or "?"
+				local url = entry.url or "?"
+				local path = url:match("https?://[^/]+(/[^%s]*)") or url
+				local status = entry.status or ""
+				local ct = ""
+				if entry.res_headers then
+					ct = entry.res_headers["Content-Type"] or entry.res_headers["content-type"] or ""
+					ct = ct:match("^([^;]+)") or ct
+				end
+				local s = status ~= "" and ("[" .. status .. "] ") or ""
+				local t = ct ~= "" and ("  " .. ct) or ""
+				table.insert(lines, string.format("%s%s %s%s", s, method, path, t))
+				_net_entries[#lines] = entry
+			end
+		else
+			for _, l in ipairs(vim.split(raw, "\n", { plain = true })) do
+				if vim.trim(l) ~= "" then
+					table.insert(lines, l)
+				end
+			end
+		end
+		if #lines == 0 then
+			lines = { "-- no network entries --" }
+		end
+		return lines
+	end
+
+	local function build_console_lines(raw)
+		local lines = {}
+		local ok, entries = pcall(vim.json.decode, raw)
+		if ok and type(entries) == "table" then
+			for _, entry in ipairs(entries) do
+				local level = (entry.level or entry.type or "log"):upper()
+				local msg = entry.message or entry.text or vim.inspect(entry):gsub("[\r\n]+", " ")
+				-- flatten any remaining embedded newlines in the message itself
+				msg = tostring(msg):gsub("[\r\n]+", " ")
+				table.insert(lines, string.format("[%s] %s", level, msg))
+			end
+		else
+			for _, l in ipairs(vim.split(raw, "\n", { plain = true })) do
+				if vim.trim(l) ~= "" then
+					table.insert(lines, l)
+				end
+			end
+		end
+		if #lines == 0 then
+			lines = { "-- no console entries --" }
+		end
+		return lines
+	end
+
+	-- --------------------------------------------------------
 	-- Open scratchbuf
 	-- --------------------------------------------------------
 	require("scratchbuf").open({
@@ -543,6 +711,11 @@ function M.open()
 		close_on_open = false,
 
 		refresh = function()
+			-- In non-tabs views (http/html/groups), return current buffer content
+			-- unchanged so on_save triggering a refresh doesn't blow away the view.
+			if view_mode ~= "tabs" and _primary_buf and vim.api.nvim_buf_is_valid(_primary_buf) then
+				return vim.api.nvim_buf_get_lines(_primary_buf, 0, -1, false)
+			end
 			local fresh_tabs = fetch_tabs()
 			local fresh_lines, fresh_meta = build_tab_lines(fresh_tabs)
 			tab_metadata = fresh_meta
@@ -616,14 +789,19 @@ function M.open()
 					send_cmd("switch " .. _http_tab_meta.tab_id)
 					require("browser.views").do_navigate(_http_chi_path, _http_tab_meta.htmx or false)
 				end
-				-- Reset view_mode before scratchbuf's deferred refresh so the
-				-- tab list is restored cleanly after navigation settles
-				view_mode = "tabs"
-				return false
+				-- Return true so scratchbuf's immediate refresh fires - the refresh
+				-- function returns current buffer content unchanged (view_mode="http"),
+				-- so the e-view stays open.
+				return true
 			end
 
 			-- html view: readonly, no-op
 			if view_mode == "html" then
+				return true
+			end
+
+			-- console/network views: readonly, no-op
+			if view_mode == "console" or view_mode == "network" then
 				return true
 			end
 
@@ -694,6 +872,17 @@ function M.open()
 			if not layout then
 				return
 			end
+			if view_mode == "network" then
+				-- Show request/response for the entry under cursor in the preview pane
+				if _primary_win and vim.api.nvim_win_is_valid(_primary_win) then
+					local lnum = vim.api.nvim_win_get_cursor(_primary_win)[1]
+					local entry = _net_entries[lnum]
+					if entry then
+						layout.set(PREVIEW_TITLE, build_net_preview(entry, _net_show_response))
+					end
+				end
+				return
+			end
 			if view_mode ~= "tabs" then
 				return
 			end
@@ -711,6 +900,7 @@ function M.open()
 				title = CTX_TITLE,
 				height = 0.20,
 				lines = ctx_lines,
+				close_on_open = false,
 				refresh = function()
 					return build_context_lines()
 				end,
@@ -765,7 +955,25 @@ function M.open()
 					if name == "" then
 						return
 					end
-					require("browser.views").switch_context(name)
+					local views = require("browser.views")
+					views.switch_context(name)
+					-- Refresh context pane to show updated * marker
+					if _layout then
+						_layout.set(CTX_TITLE, build_context_lines())
+					end
+					-- Navigate the tab under primary cursor using new context params
+					-- without switching browser focus to that tab
+					if preview_tab_id then
+						for _, m in pairs(tab_metadata) do
+							if m.tab_id == preview_tab_id then
+								local chi = m.chi_path or m.path
+								if chi then
+									views.do_navigate(chi, m.htmx or false)
+								end
+								break
+							end
+						end
+					end
 					vim.notify("browser: context -> " .. name)
 				end,
 			},
@@ -847,6 +1055,41 @@ function M.open()
 				})
 			end
 
+			-- Split helpers - must be defined before any keymap closures that reference them
+			local function is_in_split()
+				return _split_win
+					and vim.api.nvim_win_is_valid(_split_win)
+					and vim.api.nvim_get_current_win() == _split_win
+			end
+
+			local function split_current_meta()
+				if not (_split_win and vim.api.nvim_win_is_valid(_split_win)) then
+					return nil
+				end
+				local lnum = vim.api.nvim_win_get_cursor(_split_win)[1]
+				local raw = vim.api.nvim_buf_get_lines(_split_buf, lnum - 1, lnum, false)[1] or ""
+				return _split_meta[strip_prefix(raw)]
+			end
+
+			local function split_set(lines, ft, readonly)
+				if not (vim.api.nvim_buf_is_valid(_split_buf or -1)) then
+					return
+				end
+				vim.bo[_split_buf].modifiable = true
+				vim.api.nvim_buf_set_lines(_split_buf, 0, -1, false, lines)
+				vim.bo[_split_buf].filetype = ft or "scratchbuf"
+				vim.bo[_split_buf].modifiable = not readonly
+				vim.bo[_split_buf].modified = false
+			end
+
+			local function split_restore_tabs()
+				local tabs = fetch_tabs()
+				local lines, meta = build_tab_lines(tabs)
+				_split_meta = meta
+				split_set(lines, "scratchbuf", false)
+				_split_view = "tabs"
+			end
+
 			-- CR: handles all view modes
 			map("<CR>", function()
 				if view_mode == "groups" then
@@ -883,16 +1126,261 @@ function M.open()
 			end, "Open entry / open group")
 
 			-- r / C-o: always return to tab list and refresh
+			-- r: refresh tabs (tabs/groups/http/html) or refresh log (console/network)
 			map("r", function()
+				if is_in_split() then
+					if _split_view == "console" then
+						local raw = send_cmd("consolelog")
+						if raw and not vim.startswith(raw, "err:") then
+							split_set(build_console_lines(raw), "text", true)
+						end
+						vim.notify("browser: split console refreshed")
+					elseif _split_view == "network" then
+						local raw = send_cmd("netlog")
+						if raw and not vim.startswith(raw, "err:") then
+							split_set(build_net_lines(raw), "text", true)
+						end
+						vim.notify("browser: split network refreshed")
+					else
+						split_restore_tabs()
+					end
+					return
+				end
+				if view_mode == "console" then
+					local raw = send_cmd("consolelog")
+					if raw and not vim.startswith(raw, "err:") then
+						local lines = build_console_lines(raw)
+						vim.bo[buf].modifiable = true
+						vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+						vim.bo[buf].modifiable = false
+						vim.bo[buf].modified = false
+					end
+					vim.notify("browser: console refreshed")
+					return
+				end
+				if view_mode == "network" then
+					local raw = send_cmd("netlog")
+					if raw and not vim.startswith(raw, "err:") then
+						local lines = build_net_lines(raw)
+						_net_show_response = false
+						vim.bo[buf].modifiable = true
+						vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+						vim.bo[buf].modifiable = false
+						vim.bo[buf].modified = false
+						if _layout then
+							_layout.set(PREVIEW_TITLE, { "-- move cursor to a request --" })
+						end
+					end
+					vim.notify("browser: network refreshed")
+					return
+				end
 				restore_tabs(buf)
 			end, "Refresh / return to tab list")
 
 			map("<C-o>", function()
+				if is_in_split() then
+					split_restore_tabs()
+					return
+				end
 				restore_tabs(buf)
 			end, "Return to tab list")
 
-			-- n: toggle between resolved URL path and chi_path template display
-			map("n", function()
+			map("<leader>e", function()
+				if is_in_split() then
+					split_restore_tabs()
+					return
+				end
+				restore_tabs(buf)
+			end, "Return to tab list")
+
+			-- s: switch focus between primary and split pane
+			map("s", function()
+				if not (_split_win and vim.api.nvim_win_is_valid(_split_win)) then
+					return
+				end
+				local cur = vim.api.nvim_get_current_win()
+				if cur == _split_win then
+					if vim.api.nvim_win_is_valid(win) then
+						vim.api.nvim_set_current_win(win)
+					end
+				else
+					vim.api.nvim_set_current_win(_split_win)
+				end
+			end, "Switch between primary and split pane")
+			map("S", function()
+				if _split_win and vim.api.nvim_win_is_valid(_split_win) then
+					vim.api.nvim_win_close(_split_win, true)
+					_split_win = nil
+					if _split_buf and vim.api.nvim_buf_is_valid(_split_buf) then
+						vim.api.nvim_buf_delete(_split_buf, { force = true })
+					end
+					_split_buf = nil
+					_split_meta = {}
+					_split_view = "tabs"
+					_split_html_body = nil
+					_split_html_full = nil
+					if _primary_w and vim.api.nvim_win_is_valid(win) then
+						vim.api.nvim_win_set_width(win, _primary_w)
+					end
+					_primary_w = nil
+					if vim.api.nvim_win_is_valid(win) then
+						vim.api.nvim_set_current_win(win)
+					end
+					return
+				end
+				if not vim.api.nvim_win_is_valid(win) then
+					return
+				end
+				local pos = vim.api.nvim_win_get_position(win)
+				local w = vim.api.nvim_win_get_width(win)
+				local h = vim.api.nvim_win_get_height(win)
+				local half = math.floor(w / 2) - 1
+				if half < 10 then
+					vim.notify("browser: not enough space to split", vim.log.levels.WARN)
+					return
+				end
+				_primary_w = w
+				vim.api.nvim_win_set_width(win, half)
+				-- Create an independent buffer for the split (never shares content with primary)
+				_split_buf = vim.api.nvim_create_buf(false, true)
+				vim.b[_split_buf]._scratchbuf = TITLE
+				vim.bo[_split_buf].bufhidden = "wipe"
+				vim.bo[_split_buf].swapfile = false
+				local tabs = fetch_tabs()
+				local lines, smeta = build_tab_lines(tabs)
+				_split_meta = smeta
+				_split_view = "tabs"
+				vim.api.nvim_buf_set_lines(_split_buf, 0, -1, false, lines)
+				vim.bo[_split_buf].filetype = "scratchbuf"
+				vim.bo[_split_buf].modified = false
+				_split_win = vim.api.nvim_open_win(_split_buf, true, {
+					relative = "editor",
+					row = pos[1],
+					col = pos[2] + half + 2,
+					width = w - half - 2,
+					height = h,
+					style = "minimal",
+					border = "rounded",
+					title = TITLE .. " [S]",
+					title_pos = "left",
+				})
+				vim.wo[_split_win].cursorline = true
+				vim.wo[_split_win].number = true
+				vim.wo[_split_win].signcolumn = "no"
+				vim.wo[_split_win].wrap = false
+				vim.wo[_split_win].winhighlight = "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLine"
+				-- Copy all buffer-local keymaps from primary buf to split buf.
+				-- The closures reference is_in_split() so they route correctly.
+				for _, km in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+					local opts = {
+						buffer = _split_buf,
+						nowait = km.nowait == 1,
+						noremap = km.noremap == 1,
+						silent = km.silent == 1,
+						desc = km.desc,
+					}
+					if km.callback then
+						pcall(vim.keymap.set, "n", km.lhs, km.callback, opts)
+					elseif km.rhs and km.rhs ~= "" then
+						pcall(vim.keymap.set, "n", km.lhs, km.rhs, opts)
+					end
+				end
+				-- q/Q/Esc/S/C-w in split close only the split, not the whole dashboard
+				local function close_split_only()
+					if _split_win and vim.api.nvim_win_is_valid(_split_win) then
+						vim.api.nvim_win_close(_split_win, true)
+					end
+					if _split_buf and vim.api.nvim_buf_is_valid(_split_buf) then
+						vim.api.nvim_buf_delete(_split_buf, { force = true })
+					end
+					_split_win = nil
+					_split_buf = nil
+					_split_meta = {}
+					_split_view = "tabs"
+					_split_html_body = nil
+					_split_html_full = nil
+					if _primary_w and vim.api.nvim_win_is_valid(win) then
+						vim.api.nvim_win_set_width(win, _primary_w)
+					end
+					_primary_w = nil
+					if vim.api.nvim_win_is_valid(win) then
+						vim.api.nvim_set_current_win(win)
+					end
+				end
+				for _, lhs in ipairs({ "q", "Q", "<Esc>", "S", "<C-w>" }) do
+					vim.keymap.set("n", lhs, close_split_only, { buffer = _split_buf, nowait = true, noremap = true })
+				end
+				vim.api.nvim_create_autocmd("ModeChanged", {
+					buffer = _split_buf,
+					callback = function()
+						if not vim.api.nvim_win_is_valid(_split_win) then
+							return
+						end
+						local mode = vim.api.nvim_get_mode().mode
+						vim.wo[_split_win].winhighlight = (mode == "v" or mode == "\22")
+								and "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLineV"
+							or "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLine"
+					end,
+				})
+				-- Close split when the dashboard closes (q/Q/<Esc> etc.)
+				vim.api.nvim_create_autocmd("BufWipeout", {
+					buffer = buf,
+					once = true,
+					callback = function()
+						vim.schedule(function()
+							if _split_win and vim.api.nvim_win_is_valid(_split_win) then
+								vim.api.nvim_win_close(_split_win, true)
+							end
+							if _split_buf and vim.api.nvim_buf_is_valid(_split_buf) then
+								vim.api.nvim_buf_delete(_split_buf, { force = true })
+							end
+							_split_win = nil
+							_split_buf = nil
+						end)
+					end,
+				})
+			end, "Toggle split pane")
+
+			-- <C-w> / <C-w>l / <C-w>h: close split if open (when in split), else close dashboard.
+			local function _close_dashboard()
+				vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("q", true, false, true), "m", false)
+			end
+			local function _close_or_split()
+				if _split_win and vim.api.nvim_win_is_valid(_split_win) then
+					local cur = vim.api.nvim_get_current_win()
+					if cur == _split_win then
+						-- Close just the split, return focus to primary
+						vim.api.nvim_win_close(_split_win, true)
+						_split_win = nil
+						if _split_buf and vim.api.nvim_buf_is_valid(_split_buf) then
+							vim.api.nvim_buf_delete(_split_buf, { force = true })
+							_split_buf = nil
+							_split_html_body = nil
+							_split_html_full = nil
+						end
+						if _primary_w and vim.api.nvim_win_is_valid(win) then
+							vim.api.nvim_win_set_width(win, _primary_w)
+						end
+						_primary_w = nil
+						if vim.api.nvim_win_is_valid(win) then
+							vim.api.nvim_set_current_win(win)
+						end
+						return
+					end
+				end
+				_close_dashboard()
+			end
+			vim.keymap.set(
+				"n",
+				"<C-w>",
+				_close_or_split,
+				{ buffer = buf, nowait = false, noremap = true, desc = "Close split or dashboard" }
+			)
+			map("<C-w>l", _close_or_split, "Close dashboard (move right)")
+			map("<C-w>h", _close_or_split, "Close dashboard (move left)")
+
+			-- \: toggle between resolved URL path and chi_path template display
+			map("\\", function()
 				if view_mode ~= "tabs" then
 					return
 				end
@@ -900,6 +1388,168 @@ function M.open()
 				do_buf_refresh(buf)
 				vim.notify("browser: showing " .. (show_chi_path and "chi_path templates" or "resolved paths"))
 			end, "Toggle chi_path / resolved path display")
+
+			-- c: toggle console log - split-aware
+			map("c", function()
+				if is_in_split() then
+					if _split_view == "console" then
+						split_restore_tabs()
+						return
+					end
+					if _split_view ~= "tabs" then
+						return
+					end
+					local raw = send_cmd("consolelog")
+					if not raw or vim.startswith(raw, "err:") then
+						vim.notify("browser: " .. (raw or "no response"), vim.log.levels.WARN)
+						return
+					end
+					split_set(build_console_lines(raw), "text", true)
+					_split_view = "console"
+					vim.notify("browser: split console - C=clear  r=refresh  c/r=back")
+					return
+				end
+				if view_mode == "console" then
+					restore_tabs(buf)
+					return
+				end
+				if view_mode ~= "tabs" then
+					return
+				end
+				local raw = send_cmd("consolelog")
+				if not raw or vim.startswith(raw, "err:") then
+					vim.notify("browser: " .. (raw or "no response"), vim.log.levels.WARN)
+					return
+				end
+				local lines = build_console_lines(raw)
+				vim.bo[buf].modifiable = true
+				vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+				vim.bo[buf].filetype = "text"
+				vim.bo[buf].modifiable = false
+				vim.bo[buf].modified = false
+				view_mode = "console"
+				vim.notify("browser: console log - C=clear  r=refresh  c/<C-o>=back")
+			end, "Console log")
+
+			-- C: clear console log - split-aware
+			map("C", function()
+				if is_in_split() then
+					if _split_view ~= "tabs" and _split_view ~= "console" then
+						return
+					end
+					send_cmd("consoleclear")
+					vim.notify("browser: split console cleared")
+					if _split_view == "console" then
+						split_set({ "-- console cleared --" }, "text", true)
+					end
+					return
+				end
+				if view_mode ~= "tabs" and view_mode ~= "console" then
+					return
+				end
+				send_cmd("consoleclear")
+				vim.notify("browser: console log cleared")
+				if view_mode == "console" then
+					vim.bo[buf].modifiable = true
+					vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "-- console cleared --" })
+					vim.bo[buf].modifiable = false
+					vim.bo[buf].modified = false
+				end
+			end, "Clear console log")
+
+			-- n: toggle network log - split-aware
+			map("n", function()
+				if is_in_split() then
+					if _split_view == "network" then
+						split_restore_tabs()
+						return
+					end
+					if _split_view ~= "tabs" then
+						return
+					end
+					local raw = send_cmd("netlog")
+					if not raw or vim.startswith(raw, "err:") then
+						vim.notify("browser: " .. (raw or "no response"), vim.log.levels.WARN)
+						return
+					end
+					_net_show_response = false
+					split_set(build_net_lines(raw), "text", true)
+					_split_view = "network"
+					vim.notify("browser: split network - v=req/res  N=clear  r=refresh  n/r=back")
+					return
+				end
+				if view_mode == "network" then
+					restore_tabs(buf)
+					return
+				end
+				if view_mode ~= "tabs" then
+					return
+				end
+				local raw = send_cmd("netlog")
+				if not raw or vim.startswith(raw, "err:") then
+					vim.notify("browser: " .. (raw or "no response"), vim.log.levels.WARN)
+					return
+				end
+				_net_show_response = false
+				local lines = build_net_lines(raw)
+				vim.bo[buf].modifiable = true
+				vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+				vim.bo[buf].filetype = "text"
+				vim.bo[buf].modifiable = false
+				vim.bo[buf].modified = false
+				if _layout then
+					_layout.set(PREVIEW_TITLE, { "-- move cursor to a request --" })
+				end
+				view_mode = "network"
+				vim.notify("browser: network log - v=req/res  N=clear  r=refresh  n/<C-o>=back")
+			end, "Network log")
+
+			-- N: clear network log - split-aware
+			map("N", function()
+				if is_in_split() then
+					if _split_view ~= "tabs" and _split_view ~= "network" then
+						return
+					end
+					send_cmd("netclear")
+					vim.notify("browser: split network cleared")
+					if _split_view == "network" then
+						_net_entries = {}
+						split_set({ "-- network log cleared --" }, "text", true)
+					end
+					return
+				end
+				if view_mode ~= "tabs" and view_mode ~= "network" then
+					return
+				end
+				send_cmd("netclear")
+				vim.notify("browser: network log cleared")
+				if view_mode == "network" then
+					_net_entries = {}
+					vim.bo[buf].modifiable = true
+					vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "-- network log cleared --" })
+					vim.bo[buf].modifiable = false
+					vim.bo[buf].modified = false
+					if _layout then
+						_layout.set(PREVIEW_TITLE, { "-- network cleared --" })
+					end
+				end
+			end, "Clear network log")
+
+			-- v: toggle request / response in network preview pane
+			map("v", function()
+				if view_mode ~= "network" then
+					return
+				end
+				_net_show_response = not _net_show_response
+				if _primary_win and vim.api.nvim_win_is_valid(_primary_win) then
+					local lnum = vim.api.nvim_win_get_cursor(_primary_win)[1]
+					local entry = _net_entries[lnum]
+					if entry and _layout then
+						_layout.set(PREVIEW_TITLE, build_net_preview(entry, _net_show_response))
+					end
+				end
+				vim.notify("browser: " .. (_net_show_response and "response" or "request") .. " preview")
+			end, "Toggle request/response preview")
 
 			-- /: native vim incremental search in all views.
 			-- Scratchbuf maps / to its line-filter which crashes when the buffer
@@ -910,13 +1560,21 @@ function M.open()
 				vim.api.nvim_feedkeys("/", "n", false)
 			end, "Search")
 
-			map("p", function()
+			map("P", function()
+				if view_mode ~= "tabs" then
+					return
+				end
 				local meta = current_meta()
 				if not meta then
 					vim.notify("browser: tab not found", vim.log.levels.WARN)
 					return
 				end
-				navigate_tab(meta, not meta.htmx)
+				local new_htmx = not meta.htmx
+				navigate_tab(meta, new_htmx)
+				local chi = infer_chi_path(meta) or meta.chi_path or meta.path
+				if chi then
+					require("browser.views").save_htmx_for_path(chi, new_htmx)
+				end
 				vim.defer_fn(function()
 					if vim.api.nvim_buf_is_valid(buf) then
 						do_buf_refresh(buf)
@@ -925,11 +1583,18 @@ function M.open()
 			end, "Toggle partial/full")
 
 			map("t", function()
+				if view_mode ~= "tabs" then
+					return
+				end
 				local meta = current_meta()
 				if not meta then
 					return
 				end
 				navigate_tab(meta, true)
+				local chi = infer_chi_path(meta) or meta.chi_path or meta.path
+				if chi then
+					require("browser.views").save_htmx_for_path(chi, true)
+				end
 				vim.defer_fn(function()
 					if vim.api.nvim_buf_is_valid(buf) then
 						do_buf_refresh(buf)
@@ -938,11 +1603,18 @@ function M.open()
 			end, "Navigate partial (htmx)")
 
 			map("T", function()
+				if view_mode ~= "tabs" then
+					return
+				end
 				local meta = current_meta()
 				if not meta then
 					return
 				end
 				navigate_tab(meta, false)
+				local chi = infer_chi_path(meta) or meta.chi_path or meta.path
+				if chi then
+					require("browser.views").save_htmx_for_path(chi, false)
+				end
 				vim.defer_fn(function()
 					if vim.api.nvim_buf_is_valid(buf) then
 						do_buf_refresh(buf)
@@ -950,10 +1622,18 @@ function M.open()
 				end, 400)
 			end, "Navigate full page")
 
-			-- g: toggle group editor in primary pane
-			map("g", function()
+			-- gg: explicit binding so it works even with g mapped below
+			vim.keymap.set("n", "gg", function()
+				vim.api.nvim_feedkeys("gg", "n", false)
+			end, { buffer = buf, nowait = true, noremap = true, desc = "Go to first line" })
+
+			-- g: toggle group editor - nowait=false so gg can still fire naturally
+			vim.keymap.set("n", "g", function()
 				if view_mode == "groups" then
 					restore_tabs(buf)
+					return
+				end
+				if view_mode ~= "tabs" then
 					return
 				end
 				local groups_mod = require("browser.groups")
@@ -984,10 +1664,10 @@ function M.open()
 				vim.bo[buf].modified = false
 				view_mode = "groups"
 				vim.notify("browser: group editor - W=save  :=add path  CR=open  g/r=back")
-			end, "Group editor")
+			end, { buffer = buf, nowait = false, noremap = true, desc = "Group editor" })
 
-			-- G: add current tab's chi_path to a group (picker, same style as :)
-			map("G", function()
+			-- +: add current tab's chi_path to a group (was G, freed for last-line motion)
+			map("+", function()
 				if view_mode ~= "tabs" then
 					return
 				end
@@ -1030,12 +1710,26 @@ function M.open()
 					restore_tabs(buf)
 					return
 				end
+				if view_mode ~= "tabs" then
+					return
+				end
 				local meta = current_meta()
 				if not meta then
 					vim.notify("browser: no tab selected", vim.log.levels.WARN)
 					return
 				end
 				local chi_path = meta.chi_path or meta.path
+				-- Resolve to the canonical route chi_path so the test file slug matches
+				-- regardless of param ordering in the group definition.
+				do
+					local routes = require("browser.views").get_routes()
+					for _, r in ipairs(routes) do
+						if path_matches_chi(meta.path, r.chi_path) then
+							chi_path = r.chi_path
+							break
+						end
+					end
+				end
 				local session = require("browser.session")
 				local views = require("browser.views")
 				local contexts = views.get_contexts()
@@ -1044,14 +1738,61 @@ function M.open()
 				_http_section_paths = {}
 				_http_tab_meta = meta
 				_http_chi_path = chi_path
+				-- Find the actual file path for a context, preferring existing files
+				-- over the canonical slug. This prevents W from creating a new file
+				-- at the canonical slug path while the real file sits at a different slug.
+				local function find_http_file(cp, ctx)
+					local function make_path(c)
+						local s = c:gsub("/$", ""):gsub("^/", ""):gsub("/", "-"):gsub("{", ""):gsub("}", "")
+						if ctx and ctx ~= "default" and ctx ~= "" then
+							return session.TESTS_DIR .. "/" .. ctx .. "/" .. s .. ".http"
+						else
+							return session.TESTS_DIR .. "/" .. s .. ".http"
+						end
+					end
+					local p = make_path(cp)
+					if vim.fn.filereadable(p) == 1 then
+						return p
+					end
+					-- Try routes with same structural pattern (same static segments,
+					-- same param positions, different param names/order)
+					local routes = require("browser.views").get_routes()
+					local cp_segs = {}
+					for s in cp:gmatch("[^/]+") do
+						table.insert(cp_segs, s)
+					end
+					for _, r in ipairs(routes) do
+						if r.chi_path ~= cp then
+							local r_segs = {}
+							for s in r.chi_path:gmatch("[^/]+") do
+								table.insert(r_segs, s)
+							end
+							if #r_segs == #cp_segs then
+								local same = true
+								for i, cs in ipairs(cp_segs) do
+									local rs = r_segs[i]
+									local c_p = cs:sub(1, 1) == "{"
+									local r_p = rs:sub(1, 1) == "{"
+									if c_p ~= r_p or (not c_p and cs ~= rs) then
+										same = false
+										break
+									end
+								end
+								if same then
+									local alt = make_path(r.chi_path)
+									if vim.fn.filereadable(alt) == 1 then
+										return alt
+									end
+								end
+							end
+						end
+					end
+					return p -- canonical path (will be created on W if user saves)
+				end
+
 				local sections = {}
 				for _, ctx in ipairs(contexts) do
-					local fpath
-					if ctx == "default" then
-						fpath = session.TESTS_DIR .. "/" .. slug .. ".http"
-					else
-						fpath = session.TESTS_DIR .. "/" .. ctx .. "/" .. slug .. ".http"
-					end
+					local fpath = find_http_file(chi_path, ctx)
 					_http_section_paths[ctx] = fpath
 					local content_lines = {}
 					local f = io.open(fpath, "r")
@@ -1092,10 +1833,40 @@ function M.open()
 				vim.notify("browser: http editor - W=save  e/r=back")
 			end, "HTTP context editor")
 
-			-- H: toggle HTML source in primary pane
+			-- H: toggle HTML source - split-aware
 			map("H", function()
+				if is_in_split() then
+					if _split_view == "html" then
+						split_restore_tabs()
+						return
+					end
+					if _split_view ~= "tabs" then
+						return
+					end
+					local meta = split_current_meta()
+					if not meta then
+						vim.notify("browser: no tab selected", vim.log.levels.WARN)
+						return
+					end
+					local body = send_cmd("page-source-body " .. meta.tab_id)
+					if not body or vim.startswith(body, "err:") then
+						vim.notify("browser: " .. (body or "no response"), vim.log.levels.WARN)
+						return
+					end
+					_split_html_body = vim.split(format_html(body), "\n", { plain = true })
+					_split_html_full = nil
+					_split_html_show_full = false
+					_split_html_meta = meta
+					split_set(_split_html_body, "html", true)
+					_split_view = "html"
+					vim.notify("browser: split html - b=head  U=uuid  H/r=back")
+					return
+				end
 				if view_mode == "html" then
 					restore_tabs(buf)
+					return
+				end
+				if view_mode ~= "tabs" then
 					return
 				end
 				local meta = current_meta()
@@ -1103,20 +1874,122 @@ function M.open()
 					vim.notify("browser: no tab selected", vim.log.levels.WARN)
 					return
 				end
-				local html = send_cmd("page-source " .. meta.tab_id)
-				if not html or vim.startswith(html, "err:") then
-					vim.notify("browser: " .. (html or "no response"), vim.log.levels.WARN)
+				local body = send_cmd("page-source-body " .. meta.tab_id)
+				if not body or vim.startswith(body, "err:") then
+					vim.notify("browser: " .. (body or "no response"), vim.log.levels.WARN)
 					return
 				end
-				local html_lines = vim.split(html, "\n", { plain = true })
+				local html_lines = vim.split(format_html(body), "\n", { plain = true })
+				_html_body_lines = html_lines
+				_html_full_lines = nil
+				_html_show_full = false
+				_html_source_meta = meta
 				vim.bo[buf].modifiable = true
 				vim.api.nvim_buf_set_lines(buf, 0, -1, false, html_lines)
 				vim.bo[buf].filetype = "html"
 				vim.bo[buf].modifiable = false
 				vim.bo[buf].modified = false
 				view_mode = "html"
-				vim.notify("browser: html source - H/r/<C-o>=back")
+				vim.notify("browser: html body - b=head  U=uuid  A=+pat  ?=patterns  H/r/<C-o>=back")
 			end, "HTML source viewer")
+
+			-- b: toggle body/head - split-aware
+			map("b", function()
+				if is_in_split() then
+					if _split_view ~= "html" then
+						return
+					end
+					local lines
+					if _split_html_show_full then
+						_split_html_show_full = false
+						lines = _split_html_body or { "-- no body --" }
+					else
+						if not _split_html_full and _split_html_meta then
+							local full = send_cmd("page-source " .. _split_html_meta.tab_id)
+							if full and not vim.startswith(full, "err:") then
+								_split_html_full = vim.split(format_html(full), "\n", { plain = true })
+							end
+						end
+						_split_html_show_full = true
+						lines = _split_html_full or { "-- no full html --" }
+					end
+					split_set(lines, "html", true)
+					return
+				end
+				if view_mode ~= "html" then
+					return
+				end
+				local lines
+				if _html_show_full then
+					_html_show_full = false
+					lines = _html_body_lines or { "-- no body --" }
+					vim.notify("browser: html body view")
+				else
+					if not _html_full_lines and _html_source_meta then
+						local full = send_cmd("page-source " .. _html_source_meta.tab_id)
+						if full and not vim.startswith(full, "err:") then
+							_html_full_lines = vim.split(format_html(full), "\n", { plain = true })
+						end
+					end
+					_html_show_full = true
+					lines = _html_full_lines or { "-- no full html --" }
+					vim.notify("browser: html full page - b=back to body")
+				end
+				vim.bo[buf].modifiable = true
+				vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+				vim.bo[buf].modifiable = false
+				vim.bo[buf].modified = false
+			end, "Toggle body / full HTML")
+
+			-- U: jump to next UUID in html view (u is left free for native undo)
+			map("U", function()
+				if view_mode ~= "html" then
+					return
+				end
+				vim.fn.search(UUID_PATTERN)
+			end, "Next UUID")
+
+			-- A: add a named vim-regex pattern to the global html pattern list
+			map("A", function()
+				if view_mode ~= "html" then
+					return
+				end
+				vim.ui.input({ prompt = "Pattern name: " }, function(name)
+					if not name or name == "" then
+						return
+					end
+					vim.ui.input({ prompt = "Vim regex: " }, function(pat)
+						if not pat or pat == "" then
+							return
+						end
+						table.insert(_html_patterns, { name = name, pattern = pat })
+						vim.notify("browser: pattern '" .. name .. "' added - ? to search")
+					end)
+				end)
+			end, "Add html search pattern")
+
+			-- ?: inline pattern picker - same style as : picker
+			map("?", function()
+				if view_mode ~= "html" then
+					return
+				end
+				if #_html_patterns == 0 then
+					vim.notify("browser: no patterns - use A to add one", vim.log.levels.WARN)
+					return
+				end
+				local items = {}
+				for _, p in ipairs(_html_patterns) do
+					table.insert(items, p.name .. "  " .. p.pattern)
+				end
+				path_picker(items, function(sel, _)
+					for _, p in ipairs(_html_patterns) do
+						if (p.name .. "  " .. p.pattern) == sel then
+							vim.fn.search(p.pattern)
+							break
+						end
+					end
+				end)
+			end, "Pattern picker")
 
 			-- :: path picker for tab navigation (tabs view), path insertion (groups view),
 			-- or attribute insertion compiled from test files (http view)
@@ -1211,13 +2084,24 @@ function M.open()
 					vim.notify("browser: no routes found", vim.log.levels.WARN)
 					return
 				end
+				-- Annotate each route with [partial] or [full] from its saved test file
 				local items = {}
 				for _, r in ipairs(routes) do
-					table.insert(items, r.chi_path)
+					local saved = views.load_test_for_path(r.chi_path)
+					local ann = ""
+					if saved and saved.htmx ~= nil then
+						ann = saved.htmx and "  [partial]" or "  [full]"
+					end
+					table.insert(items, r.chi_path .. ann)
+				end
+				-- Strip annotation to recover the bare chi_path
+				local function strip_ann(s)
+					return s:match("^(.-)%s+%[") or s
 				end
 
 				if view_mode == "groups" then
-					path_picker(items, function(chi_path, _)
+					path_picker(items, function(sel, _)
+						local chi_path = strip_ann(sel)
 						local lnum = vim.api.nvim_win_get_cursor(win)[1]
 						vim.api.nvim_buf_set_lines(buf, lnum, lnum, false, { chi_path })
 						vim.bo[buf].modified = true
@@ -1226,7 +2110,8 @@ function M.open()
 					return
 				end
 
-				path_picker(items, function(chi_path, replace_current)
+				path_picker(items, function(sel, replace_current)
+					local chi_path = strip_ann(sel)
 					local session = require("browser.session")
 					if vim.fn.filereadable(session.SOCKET) == 0 then
 						session.start()
@@ -1236,10 +2121,13 @@ function M.open()
 						end, 7000)
 						return
 					end
+					-- Use saved htmx preference if available
+					local saved = views.load_test_for_path(chi_path)
+					local use_htmx = saved and saved.htmx ~= nil and saved.htmx or false
 					local meta = current_meta()
 					if replace_current and meta then
-						navigate_tab(meta, meta.htmx)
-						views.do_navigate(chi_path, meta.htmx)
+						navigate_tab(meta, use_htmx)
+						views.do_navigate(chi_path, use_htmx)
 						vim.defer_fn(function()
 							if vim.api.nvim_buf_is_valid(buf) then
 								do_buf_refresh(buf)
@@ -1252,6 +2140,11 @@ function M.open()
 			end, "Path picker / insert attr / insert path")
 		end,
 	})
+end
+
+-- Expose html pattern list for global <leader>ha keymap in browser.lua
+function M.get_patterns()
+	return _html_patterns
 end
 
 return M
