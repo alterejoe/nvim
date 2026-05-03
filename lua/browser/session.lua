@@ -1,12 +1,13 @@
--- lua/browser_session.lua
+-- browser/session.lua
 --
 -- Devproxy session manager. Pure module - no keymaps.
 -- All keymaps live in after/plugin/browser.lua.
 
 local M = {}
 
--- 컴 devproxy dir discovery 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
--- Walk up from cwd looking for .devproxy/ directory.
+-- ------------------------------------------------------------
+-- devproxy dir discovery
+-- ------------------------------------------------------------
 local function find_devproxy_dir()
 	local dir = vim.fn.getcwd()
 	while dir ~= "/" do
@@ -20,11 +21,12 @@ local function find_devproxy_dir()
 		end
 		dir = parent
 	end
-	-- fallback: use cwd/.devproxy (will be created on first use)
 	return vim.fn.getcwd() .. "/.devproxy"
 end
 
--- 컴 config 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+-- ------------------------------------------------------------
+-- config
+-- ------------------------------------------------------------
 M.SOCKET = "/tmp/devproxy.sock"
 M.DEVPROXY_BIN = "/usr/local/bin/devproxy"
 M.LOG_PATH = "/tmp/devproxy.log"
@@ -62,7 +64,9 @@ end
 
 M.CSS_DIR = get_css_dir()
 
--- 컴 helpers 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴�
+-- ------------------------------------------------------------
+-- helpers
+-- ------------------------------------------------------------
 local function in_tmux()
 	return vim.env.TMUX ~= nil
 end
@@ -128,7 +132,9 @@ local function kill_brave()
 	)
 end
 
--- 컴 socket command 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+-- ------------------------------------------------------------
+-- socket command
+-- ------------------------------------------------------------
 function M.send_cmd(cmd)
 	local waited = 0
 	while vim.fn.filereadable(M.SOCKET) == 0 and waited < 5000 do
@@ -145,20 +151,19 @@ function M.send_cmd(cmd)
 	return vim.trim(result)
 end
 
--- 컴 session lifecycle 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴�
+-- ------------------------------------------------------------
+-- session lifecycle
+-- ------------------------------------------------------------
 function M.start()
 	if not in_tmux() then
 		vim.notify("browser: not in tmux", vim.log.levels.WARN)
 		return
 	end
-
 	launch_brave()
 	vim.notify("browser: launching Brave on Windows...")
-
 	local dname = devproxy_session()
 	if not session_exists(dname) then
 		vim.fn.system("rm -f " .. M.SOCKET)
-		-- ensure .devproxy dir exists
 		vim.fn.mkdir(M.DEVPROXY_DIR, "p")
 		local proxy_cmd = string.format(
 			"%s -devproxy-dir %s 2>&1 | tee %s",
@@ -169,7 +174,7 @@ function M.start()
 		tmux("new-session -ds " .. vim.fn.shellescape(dname) .. " " .. vim.fn.shellescape(proxy_cmd))
 		vim.notify("browser: started devproxy [" .. dname .. "]")
 		vim.defer_fn(function()
-			require("browser").start()
+			require("browser.cdp").start()
 			vim.notify("browser: ready")
 		end, 6000)
 	else
@@ -190,7 +195,7 @@ function M.stop()
 	end
 	vim.fn.system("rm -f " .. M.SOCKET)
 	kill_brave()
-	require("browser").stop()
+	require("browser.cdp").stop()
 	vim.notify("browser: stopped")
 end
 
@@ -205,7 +210,7 @@ function M.kill()
 			tmux("kill-session -t " .. vim.fn.shellescape(name))
 		end
 	end
-	require("browser").stop()
+	require("browser.cdp").stop()
 	vim.notify("browser: killed everything")
 end
 
@@ -258,7 +263,9 @@ function M.toggle_log()
 	vim.cmd("stopinsert")
 end
 
--- 컴 navigation 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+-- ------------------------------------------------------------
+-- navigation helpers
+-- ------------------------------------------------------------
 function M.tab_picker()
 	local raw = M.send_cmd("sync-tabs")
 	if not raw or raw:sub(1, 1) ~= "[" then
@@ -270,13 +277,11 @@ function M.tab_picker()
 		vim.notify("browser: no open tabs")
 		return
 	end
-
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
 	local conf = require("telescope.config").values
 	local actions = require("telescope.actions")
 	local action_state = require("telescope.actions.state")
-
 	pickers
 		.new({}, {
 			prompt_title = "Browser Tabs",
@@ -362,6 +367,7 @@ function M.inject_css()
 		vim.notify(r)
 	end
 end
+
 function M.pick_tab_then(callback)
 	local raw = M.send_cmd("sync-tabs")
 	if not raw or raw:sub(1, 1) ~= "[" then

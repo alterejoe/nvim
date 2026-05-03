@@ -18,7 +18,7 @@
 -- <leader>bq   network picker
 -- <leader>bs   connect CDP
 -- <leader>bx   disconnect CDP
-require("browser_session")
+-- require("browser_session")
 vim.keymap.set("n", "<leader>hh", function()
 	vim.cmd("edit!")
 	print("Buffer reloaded")

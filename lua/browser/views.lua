@@ -1,4 +1,4 @@
--- lua/browser_views.lua
+-- browser/views.lua
 --
 -- View/route picker for devproxy. Pure module - no keymaps.
 -- All keymaps live in after/plugin/browser.lua.
@@ -8,15 +8,15 @@ local M = {}
 local VIEW_SERVER = "http://localhost:19878"
 
 local function send_cmd(cmd)
-	return require("browser_session").send_cmd(cmd)
+	return require("browser.session").send_cmd(cmd)
 end
 
 local function views_path()
-	return require("browser_session").VIEWS_PATH
+	return require("browser.session").VIEWS_PATH
 end
 
 local function devproxy_dir()
-	return require("browser_session").DEVPROXY_DIR
+	return require("browser.session").DEVPROXY_DIR
 end
 
 local function get_active_base()
@@ -30,10 +30,40 @@ local function get_active_base()
 	return "http://localhost:3333"
 end
 
--- 컴 devproxy project config 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴�
+-- ------------------------------------------------------------
+-- devproxy project config
+-- ------------------------------------------------------------
 local _config = nil
 local _context = "default"
+local _context_loaded = false -- lazy-load from disk once
 local _session_defaults = {}
+
+-- Persist active context to disk so it survives session restarts
+local function persist_context(name)
+	local path = devproxy_dir() .. "/active_context"
+	local f = io.open(path, "w")
+	if f then
+		f:write(name)
+		f:close()
+	end
+end
+
+-- Load active context from disk on first use
+local function ensure_context_loaded()
+	if _context_loaded then
+		return
+	end
+	_context_loaded = true
+	local path = devproxy_dir() .. "/active_context"
+	local f = io.open(path, "r")
+	if f then
+		local name = vim.trim(f:read("*a"))
+		f:close()
+		if name and name ~= "" then
+			_context = name
+		end
+	end
+end
 
 function M.clear_session_default(key)
 	_session_defaults[key] = nil
@@ -49,7 +79,7 @@ local function load_config()
 	local raw = vim.fn.system("yq -o=json . " .. vim.fn.shellescape(path) .. " 2>/dev/null")
 	local ok, data = pcall(vim.json.decode, raw)
 	if not ok or not data then
-		vim.notify("browser_views: failed to parse " .. path, vim.log.levels.WARN)
+		vim.notify("browser.views: failed to parse " .. path, vim.log.levels.WARN)
 		_config = { defaults = {}, query_params = {}, contexts = {}, exceptions = {} }
 	else
 		_config = {
@@ -81,6 +111,7 @@ local function find_project_root()
 end
 
 local function active_params()
+	ensure_context_loaded()
 	local cfg = get_config()
 	local params = {}
 	for k, v in pairs(cfg.defaults) do
@@ -96,15 +127,7 @@ local function active_params()
 	return params
 end
 
-local function skip_for_path(path)
-	-- local cfg = get_config()
-	-- for exc_path, exc in pairs(cfg.exceptions or {}) do
-	-- 	if path == exc_path or path:find("^" .. exc_path:gsub("{[^}]+}", "[^/]+"), 1) then
-	-- 		local skip = {}
-	-- 		for _, k in ipairs(exc.skip or {}) do skip[k] = true end
-	-- 		return skip
-	-- 	end
-	-- end
+local function skip_for_path(_path)
 	return {}
 end
 
@@ -155,15 +178,30 @@ local function build_query_params(path)
 	return "?" .. table.concat(qp, "&")
 end
 
--- 컴 test file param lookup 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
--- Returns: nil = no test file (use config), "" = file exists but empty query, "k=v..." = use this
+-- ------------------------------------------------------------
+-- test file param lookup
+-- Context-isolated: no fallback between contexts.
+--   default context   tests/{slug}.http only
+--   other context     tests/{context}/{slug}.http only
+-- ------------------------------------------------------------
 local function load_test_for_path(chi_path)
-	local session = require("browser_session")
+	ensure_context_loaded()
+	local session = require("browser.session")
 	local slug = (chi_path or "unknown"):gsub("/$", ""):gsub("^/", ""):gsub("/", "-"):gsub("{", ""):gsub("}", "")
-	local path = session.TESTS_DIR .. "/" .. slug .. ".http"
+
+	local path
+	if _context and _context ~= "default" and _context ~= "" then
+		-- non-default context: only look in context subdir, no fallback
+		path = session.TESTS_DIR .. "/" .. _context .. "/" .. slug .. ".http"
+	else
+		-- default context: only look in root tests dir
+		path = session.TESTS_DIR .. "/" .. slug .. ".http"
+	end
+
 	if vim.fn.filereadable(path) == 0 then
 		return nil
 	end
+
 	local f = io.open(path, "r")
 	if not f then
 		return nil
@@ -194,11 +232,85 @@ local function resolve_qp(chi_path)
 	return build_query_params(chi_path)
 end
 
--- 컴 context picker 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+-- ------------------------------------------------------------
+-- context management
+-- ------------------------------------------------------------
 function M.reload_config()
 	_config = nil
 	load_config()
-	vim.notify("browser_views: config reloaded from " .. (devproxy_dir() or "?"))
+	vim.notify("browser.views: config reloaded from " .. (devproxy_dir() or "?"))
+end
+
+function M.reload_config_silent()
+	_config = nil
+	load_config()
+end
+
+function M.switch_context(name)
+	ensure_context_loaded()
+	_context = name
+	persist_context(name)
+end
+
+function M.get_active_context()
+	ensure_context_loaded()
+	return _context
+end
+
+-- Scan TESTS_DIR subdirectories for available contexts.
+-- Always includes "default" first, then subdirs alphabetically.
+local function get_contexts()
+	local session = require("browser.session")
+	local tests = session.TESTS_DIR
+	local contexts = { "default" }
+	local handle = vim.loop.fs_scandir(tests)
+	if handle then
+		while true do
+			local name, typ = vim.loop.fs_scandir_next(handle)
+			if not name then
+				break
+			end
+			if typ == "directory" then
+				table.insert(contexts, name)
+			end
+		end
+	end
+	table.sort(contexts, function(a, b)
+		if a == "default" then
+			return true
+		end
+		if b == "default" then
+			return false
+		end
+		return a < b
+	end)
+	return contexts
+end
+
+function M.get_contexts()
+	return get_contexts()
+end
+
+-- Cycle active context forward (dir=1) or backward (dir=-1). Wraps around.
+function M.cycle_context(dir)
+	ensure_context_loaded()
+	local contexts = get_contexts()
+	if #contexts <= 1 then
+		vim.notify("browser: only one context available", vim.log.levels.INFO)
+		return _context
+	end
+	local current_idx = 1
+	for i, name in ipairs(contexts) do
+		if name == _context then
+			current_idx = i
+			break
+		end
+	end
+	local next_idx = ((current_idx - 1 + dir) % #contexts) + 1
+	_context = contexts[next_idx]
+	persist_context(_context)
+	vim.notify("browser: context -> " .. _context)
+	return _context
 end
 
 function M.context_pick()
@@ -228,7 +340,7 @@ function M.context_pick()
 		})
 	end
 	if #contexts == 0 then
-		vim.notify("browser_views: no contexts defined in .devproxy/config.yaml", vim.log.levels.WARN)
+		vim.notify("browser.views: no contexts defined in .devproxy/config.yaml", vim.log.levels.WARN)
 		return
 	end
 	local pickers = require("telescope.pickers")
@@ -238,7 +350,7 @@ function M.context_pick()
 	local action_state = require("telescope.actions.state")
 	pickers
 		.new({}, {
-			prompt_title = "Browser  [CR=last mode  p=partial  t=new tab  T=new tab partial  o=file]",
+			prompt_title = "Switch Context",
 			finder = finders.new_table({
 				results = contexts,
 				entry_maker = function(c)
@@ -254,14 +366,14 @@ function M.context_pick()
 						return
 					end
 					if sel.value.name ~= "[session]" then
-						_context = sel.value.name
-						vim.notify("browser_views: context -> " .. _context)
+						M.switch_context(sel.value.name)
+						vim.notify("browser.views: context -> " .. _context)
 					end
 				end)
 				map("n", "x", function()
 					actions.close(prompt_bufnr)
 					_session_defaults = {}
-					vim.notify("browser_views: session defaults cleared")
+					vim.notify("browser.views: session defaults cleared")
 				end)
 				return true
 			end,
@@ -270,6 +382,7 @@ function M.context_pick()
 end
 
 function M.context_show()
+	ensure_context_loaded()
 	local params = active_params()
 	local lines = { "Context: " .. _context, "Project: " .. find_project_root(), "", "Active params:" }
 	for k, v in pairs(params) do
@@ -294,7 +407,7 @@ end
 function M.server_pick()
 	local raw = send_cmd("servers")
 	if not raw or raw == "[]" or raw:sub(1, 1) ~= "[" then
-		vim.notify("browser_views: no servers configured in .devproxy/config.yaml", vim.log.levels.WARN)
+		vim.notify("browser.views: no servers configured in .devproxy/config.yaml", vim.log.levels.WARN)
 		return
 	end
 	local ok, servers = pcall(vim.json.decode, raw)
@@ -352,10 +465,14 @@ local function find_plan_path()
 	return nil
 end
 
--- 컴 picker keymap config 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+-- ------------------------------------------------------------
+-- picker keymap config
+-- ------------------------------------------------------------
 M.keys = { full = "<CR>", partial = "p", tab_full = "t", tab_partial = "T", file = "o" }
 
--- 컴 view list 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴�
+-- ------------------------------------------------------------
+-- view list
+-- ------------------------------------------------------------
 local function get_views()
 	local raw = vim.fn.system("curl -s " .. VIEW_SERVER .. "/views 2>/dev/null")
 	local ok, data = pcall(vim.json.decode, raw)
@@ -377,7 +494,9 @@ local function get_views()
 	return data
 end
 
--- 컴 route list from plan.json 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴�
+-- ------------------------------------------------------------
+-- route list from plan.json
+-- ------------------------------------------------------------
 local function get_routes()
 	local plan_path = find_plan_path()
 	if not plan_path then
@@ -415,7 +534,9 @@ local function get_routes()
 	return routes
 end
 
--- 컴 last nav tracking 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴�
+-- ------------------------------------------------------------
+-- last nav tracking
+-- ------------------------------------------------------------
 M._last_nav = nil
 
 local function do_navigate(chi_path, htmx)
@@ -453,9 +574,11 @@ local function do_navigate(chi_path, htmx)
 	vim.notify(string.format("browser: %s%s%s%s", path, qp, hx_label, src))
 end
 
--- 컴 param editor 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+-- ------------------------------------------------------------
+-- param editor
+-- ------------------------------------------------------------
 function M.edit_params()
-	local SOCKET = require("browser_session").SOCKET
+	local SOCKET = require("browser.session").SOCKET
 	local raw_net = vim.fn.filereadable(SOCKET) == 1
 			and vim.trim(vim.fn.system("echo netlog | socat -t 5 - UNIX-CONNECT:" .. SOCKET .. " 2>/dev/null"))
 		or ""
@@ -588,10 +711,7 @@ function M.edit_params()
 			return
 		end
 		local e = editable[idx]
-		vim.ui.input({
-			prompt = string.format("[%s] %s = ", e.source, e.key),
-			default = e.val,
-		}, function(val)
+		vim.ui.input({ prompt = string.format("[%s] %s = ", e.source, e.key), default = e.val }, function(val)
 			if val == nil then
 				vim.notify("browser: cancelled", vim.log.levels.INFO)
 				return
@@ -604,7 +724,9 @@ function M.edit_params()
 	prompt_next()
 end
 
--- 컴 main picker 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴�
+-- ------------------------------------------------------------
+-- main picker
+-- ------------------------------------------------------------
 function M.pick()
 	local views = get_views()
 	local routes = get_routes()
@@ -642,7 +764,6 @@ function M.pick()
 			}),
 			sorter = conf.generic_sorter({}),
 			attach_mappings = function(prompt_bufnr, map)
-				-- CR: full page
 				actions.select_default:replace(function()
 					local sel = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
@@ -659,8 +780,6 @@ function M.pick()
 						do_navigate(item.chi_path, htmx)
 					end
 				end)
-
-				-- p: partial
 				local function do_partial()
 					local sel = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
@@ -676,8 +795,6 @@ function M.pick()
 					end
 				end
 				map("n", M.keys.partial, do_partial)
-
-				-- t: new tab full
 				local function do_tab_full()
 					local sel = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
@@ -734,8 +851,6 @@ function M.pick()
 					end, 800)
 				end
 				map("n", M.keys.tab_full, do_tab_full)
-
-				-- T: new tab partial
 				local function do_tab_partial()
 					local sel = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
@@ -763,8 +878,6 @@ function M.pick()
 					end, 500)
 				end
 				map("n", M.keys.tab_partial, do_tab_partial)
-
-				-- o: open handler file
 				local function do_file()
 					local sel = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
@@ -785,18 +898,19 @@ function M.pick()
 					end
 				end
 				map("n", M.keys.file, do_file)
-
 				return true
 			end,
 		})
 		:find()
 end
 
--- 컴 views config management 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴�
+-- ------------------------------------------------------------
+-- views config management
+-- ------------------------------------------------------------
 function M.reload()
 	local r = send_cmd("views-reload")
 	if r then
-		vim.notify("browser_views: " .. r)
+		vim.notify("browser.views: " .. r)
 	end
 end
 
@@ -862,7 +976,7 @@ end
 function M._append_view(yaml_lines, name)
 	local f = io.open(views_path(), "a")
 	if not f then
-		vim.notify("browser_views: cannot write " .. views_path(), vim.log.levels.ERROR)
+		vim.notify("browser.views: cannot write " .. views_path(), vim.log.levels.ERROR)
 		return
 	end
 	f:write("\n")
@@ -871,7 +985,7 @@ function M._append_view(yaml_lines, name)
 	end
 	f:close()
 	send_cmd("views-reload")
-	vim.notify("browser_views: added view '" .. name .. "'")
+	vim.notify("browser.views: added view '" .. name .. "'")
 end
 
 function M.toggle_mode()
@@ -941,7 +1055,21 @@ function M.open_in_tab(chi_path)
 	return url
 end
 
+-- ------------------------------------------------------------
+-- dashboard exports
+-- ------------------------------------------------------------
+function M.get_routes()
+	return get_routes()
+end
+function M.get_active_base()
+	return get_active_base()
+end
+function M.do_navigate(chi_path, htmx)
+	do_navigate(chi_path, htmx)
+end
+function M.load_test_for_path(chi_path)
+	return load_test_for_path(chi_path)
+end
 M.get_config = get_config
-M.load_test_for_path = load_test_for_path
 
 return M

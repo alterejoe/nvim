@@ -5,7 +5,7 @@
 local M = {}
 
 M.keys = {
-	close = { "q", "<Esc>" },
+	close = { "q", "<Esc>", "Q" },
 	open = "<CR>",
 	new_below = "o",
 	new_above = "O",
@@ -16,6 +16,7 @@ M.keys = {
 	save = "W",
 	focus_next = "<Tab>",
 	focus_prev = "<S-Tab>",
+	refresh = "r",
 }
 
 function M.register_which_key(buf)
@@ -33,6 +34,7 @@ function M.register_which_key(buf)
 		{ k.paste_below, buffer = buf, desc = "Paste below" },
 		{ k.paste_above, buffer = buf, desc = "Paste above" },
 		{ k.filter, buffer = buf, desc = "Fuzzy filter" },
+		{ k.refresh, buffer = buf, desc = "Refresh" },
 		{ k.close[1], buffer = buf, desc = "Close" },
 		{ k.close[2], buffer = buf, desc = "Close" },
 		{ k.focus_next, buffer = buf, desc = "Focus next pane" },

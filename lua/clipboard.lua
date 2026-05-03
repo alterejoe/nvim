@@ -934,7 +934,7 @@ local function viewer_open()
 		})
 		vim.wo[rwin].wrap = true
 
-		for _, k in ipairs({ "q", "<Esc>", "R" }) do
+		for _, k in ipairs({ "Q", "<Esc>", "R" }) do
 			vim.keymap.set("n", k, function()
 				vim.api.nvim_win_close(rwin, true)
 				if viewer_state.win and vim.api.nvim_win_is_valid(viewer_state.win) then

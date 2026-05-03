@@ -158,11 +158,6 @@ local function typed_diff(orig_parsed, curr_parsed, metadata)
 	return { renamed = renamed, deleted = deleted, created = created, reordered = reordered, order = curr_parsed }
 end
 
-local function is_backspace(ch)
-	local b = ch:byte(1)
-	return ch == "\8" or ch == "\127" or ch == "\x80kb" or ch == "\x80\xfd-" or b == 8 or b == 127
-end
-
 local function fuzzy_filter(buf, win, lines)
 	local ns = vim.api.nvim_create_namespace("scratchbuf_filter")
 	local query = ""
@@ -179,7 +174,7 @@ local function fuzzy_filter(buf, win, lines)
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, filtered)
 		vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 		vim.api.nvim_buf_set_extmark(buf, ns, 0, 0, {
-			virt_text = { { "  /" .. q .. "¿", "Comment" } },
+			virt_text = { { "  /" .. q .. "Û", "Comment" } },
 			virt_text_pos = "eol",
 		})
 		vim.api.nvim_win_set_cursor(win, { 1, 0 })
@@ -202,7 +197,7 @@ local function fuzzy_filter(buf, win, lines)
 				vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 				vim.cmd("redraw")
 				break
-			elseif is_backspace(ch) then
+			elseif ch == "\8" or ch == "\127" or ch == "\x80\xfd-" or ch == "\x80kb" then
 				if #query > 0 then
 					query = query:sub(1, -2)
 					apply(query)

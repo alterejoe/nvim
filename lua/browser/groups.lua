@@ -1,4 +1,4 @@
--- lua/browser_groups.lua
+-- browser/groups.lua
 -- Group management for devproxy. Groups are named lists of chi_paths.
 -- Saved to .devproxy/groups.yaml
 
@@ -8,11 +8,11 @@ M._active_group = nil
 M._active_tab_ids = {}
 
 local function send_cmd(cmd)
-	return require("browser_session").send_cmd(cmd)
+	return require("browser.session").send_cmd(cmd)
 end
 
 local function groups_path()
-	return require("browser_session").DEVPROXY_DIR .. "/groups.yaml"
+	return require("browser.session").DEVPROXY_DIR .. "/groups.yaml"
 end
 
 local function load_groups()
@@ -30,7 +30,6 @@ end
 
 local function save_groups(groups)
 	local path = groups_path()
-	-- build yaml manually
 	local lines = { "groups:" }
 	for name, paths in pairs(groups) do
 		table.insert(lines, "  " .. name .. ":")
@@ -40,7 +39,7 @@ local function save_groups(groups)
 	end
 	local f = io.open(path, "w")
 	if not f then
-		vim.notify("browser_groups: cannot write " .. path, vim.log.levels.ERROR)
+		vim.notify("browser.groups: cannot write " .. path, vim.log.levels.ERROR)
 		return
 	end
 	f:write(table.concat(lines, "\n") .. "\n")
@@ -76,19 +75,14 @@ end
 
 local function open_group(name, paths)
 	close_active_group_tabs()
-
-	local views = require("browser_views")
 	local before_ids = get_current_tab_ids()
 	local before_set = {}
 	for _, id in ipairs(before_ids) do
 		before_set[id] = true
 	end
-
 	for _, chi_path in ipairs(paths) do
-		require("browser_views").open_in_tab(chi_path)
+		require("browser.views").open_in_tab(chi_path)
 	end
-
-	-- collect newly opened tab IDs
 	vim.defer_fn(function()
 		local after_ids = get_current_tab_ids()
 		local new_ids = {}
@@ -99,26 +93,21 @@ local function open_group(name, paths)
 		end
 		M._active_tab_ids = new_ids
 		M._active_group = name
-
-		-- record each path so _last_nav is populated per tab
 		for i, id in ipairs(new_ids) do
 			local chi_path = paths[i]
 			if chi_path then
-				require("browser_session")._tab_paths[id] = chi_path
+				require("browser.session")._tab_paths[id] = chi_path
 			end
 		end
-
 		if #new_ids > 0 then
 			send_cmd("switch " .. new_ids[1])
-			-- set _last_nav to first path so commands work immediately
-			local views = require("browser_views")
+			local views = require("browser.views")
 			for i, id in ipairs(new_ids) do
 				local chi_path = paths[i]
 				if chi_path then
-					require("browser_session")._tab_paths[id] = chi_path
+					require("browser.session")._tab_paths[id] = chi_path
 				end
 			end
-			-- set _last_nav to first group path
 			if paths[1] then
 				local saved = views.load_test_for_path(paths[1])
 				views._last_nav = {
@@ -135,6 +124,21 @@ local function open_group(name, paths)
 	end, 1000)
 end
 
+-- ------------------------------------------------------------
+-- Exports for dashboard group editor
+-- ------------------------------------------------------------
+function M.load_groups()
+	return load_groups()
+end
+
+function M.save_groups(groups)
+	save_groups(groups)
+end
+
+function M.open_group(name, paths)
+	open_group(name, paths)
+end
+
 function M.pick()
 	local groups = load_groups()
 	local names = {}
@@ -142,18 +146,15 @@ function M.pick()
 		table.insert(names, name)
 	end
 	table.sort(names)
-
 	if #names == 0 then
-		vim.notify("browser_groups: no groups defined - use <leader>bG to create one", vim.log.levels.WARN)
+		vim.notify("browser.groups: no groups defined - use <leader>bG to create one", vim.log.levels.WARN)
 		return
 	end
-
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
 	local conf = require("telescope.config").values
 	local actions = require("telescope.actions")
 	local action_state = require("telescope.actions.state")
-
 	local items = {}
 	for _, name in ipairs(names) do
 		local paths = groups[name] or {}
@@ -164,7 +165,6 @@ function M.pick()
 			display = string.format("%-20s  %d paths%s", name, #paths, active),
 		})
 	end
-
 	pickers
 		.new({}, {
 			prompt_title = "Browser Groups  [CR=open  d=delete group]",
@@ -193,7 +193,7 @@ function M.pick()
 					local gs = load_groups()
 					gs[sel.value.name] = nil
 					save_groups(gs)
-					vim.notify("browser_groups: deleted group '" .. sel.value.name .. "'")
+					vim.notify("browser.groups: deleted group '" .. sel.value.name .. "'")
 				end)
 				return true
 			end,
@@ -202,9 +202,9 @@ function M.pick()
 end
 
 function M.manage()
-	local nav = require("browser_views")._last_nav
+	local nav = require("browser.views")._last_nav
 	if not nav then
-		vim.notify("browser_groups: no navigation recorded", vim.log.levels.WARN)
+		vim.notify("browser.groups: no navigation recorded", vim.log.levels.WARN)
 		return
 	end
 	local chi_path = nav.chi_path
@@ -214,8 +214,6 @@ function M.manage()
 		table.insert(names, name)
 	end
 	table.sort(names)
-
-	-- check membership
 	local member_of = {}
 	for name, paths in pairs(groups) do
 		for _, p in ipairs(paths) do
@@ -224,14 +222,11 @@ function M.manage()
 			end
 		end
 	end
-
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
 	local conf = require("telescope.config").values
 	local actions = require("telescope.actions")
 	local action_state = require("telescope.actions.state")
-
-	-- build items: existing groups + "new group" option
 	local items = {}
 	for _, name in ipairs(names) do
 		local in_group = member_of[name] and " [in group]" or ""
@@ -243,7 +238,6 @@ function M.manage()
 		})
 	end
 	table.insert(items, { name = "[new group]", is_new = true, display = "[+ new group]" })
-
 	pickers
 		.new({}, {
 			prompt_title = string.format("Groups for %s  [CR=toggle  n=new]", chi_path),
@@ -254,7 +248,7 @@ function M.manage()
 				end,
 			}),
 			sorter = conf.generic_sorter({}),
-			attach_mappings = function(prompt_bufnr, map)
+			attach_mappings = function(prompt_bufnr, _map)
 				local function toggle_or_new(sel)
 					if not sel then
 						return
@@ -269,10 +263,9 @@ function M.manage()
 							gs[name] = gs[name] or {}
 							table.insert(gs[name], chi_path)
 							save_groups(gs)
-							vim.notify("browser_groups: created group '" .. name .. "' with " .. chi_path)
+							vim.notify("browser.groups: created group '" .. name .. "' with " .. chi_path)
 						end)
 					elseif sel.value.in_group then
-						-- remove
 						local new_paths = {}
 						for _, p in ipairs(gs[sel.value.name] or {}) do
 							if p ~= chi_path then
@@ -281,13 +274,12 @@ function M.manage()
 						end
 						gs[sel.value.name] = new_paths
 						save_groups(gs)
-						vim.notify("browser_groups: removed " .. chi_path .. " from '" .. sel.value.name .. "'")
+						vim.notify("browser.groups: removed " .. chi_path .. " from '" .. sel.value.name .. "'")
 					else
-						-- add
 						gs[sel.value.name] = gs[sel.value.name] or {}
 						table.insert(gs[sel.value.name], chi_path)
 						save_groups(gs)
-						vim.notify("browser_groups: added " .. chi_path .. " to '" .. sel.value.name .. "'")
+						vim.notify("browser.groups: added " .. chi_path .. " to '" .. sel.value.name .. "'")
 					end
 				end
 				actions.select_default:replace(function()
@@ -301,10 +293,9 @@ end
 
 function M.cycle_next()
 	if #M._active_tab_ids == 0 then
-		vim.notify("browser_groups: no active group", vim.log.levels.WARN)
+		vim.notify("browser.groups: no active group", vim.log.levels.WARN)
 		return
 	end
-	-- find current active tab
 	local raw = send_cmd("tabs")
 	if not raw or raw:sub(1, 1) ~= "[" then
 		return
@@ -320,7 +311,6 @@ function M.cycle_next()
 			break
 		end
 	end
-	-- find next in group
 	local idx = 1
 	for i, id in ipairs(M._active_tab_ids) do
 		if id == active_id then
@@ -334,7 +324,7 @@ end
 
 function M.cycle_prev()
 	if #M._active_tab_ids == 0 then
-		vim.notify("browser_groups: no active group", vim.log.levels.WARN)
+		vim.notify("browser.groups: no active group", vim.log.levels.WARN)
 		return
 	end
 	local raw = send_cmd("tabs")
@@ -365,12 +355,12 @@ end
 
 function M.close_active()
 	if not M._active_group then
-		vim.notify("browser_groups: no active group", vim.log.levels.WARN)
+		vim.notify("browser.groups: no active group", vim.log.levels.WARN)
 		return
 	end
 	local name = M._active_group
 	close_active_group_tabs()
-	vim.notify("browser_groups: closed group '" .. name .. "'")
+	vim.notify("browser.groups: closed group '" .. name .. "'")
 end
 
 return M
