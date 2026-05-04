@@ -109,20 +109,32 @@ function M.register(buf, win, layout, state, opts)
 	map("<CR>", function()
 		if state.view_mode == "groups" then
 			local line = vim.api.nvim_get_current_line()
-			local name = line:match("^#%s*(.+)")
-			if name then
-				name = vim.trim(name)
-				local all_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-				local gs = util.parse_group_buf(all_lines)
-				local paths = gs[name] or {}
+			local tag_name = line:match("^###%s*(.+)")
+			local grp_name = not tag_name and line:match("^##?%s*(.+)")
+			if tag_name then
+				-- Tag header: open all tagged endpoints
+				tag_name = vim.trim(tag_name)
+				local tags = tabops.load_tags()
+				local paths = type(tags[tag_name]) == "table" and tags[tag_name] or {}
 				if #paths == 0 then
-					vim.notify("browser.groups: group '" .. name .. "' has no paths", vim.log.levels.WARN)
+					vim.notify("browser: tag '" .. tag_name .. "' has no paths", vim.log.levels.WARN)
 					return
 				end
 				restore_tabs(buf)
-				require("browser.groups").open_group(name, paths)
+				require("browser.groups").open_group(tag_name, paths)
+			elseif grp_name then
+				grp_name = vim.trim(grp_name)
+				local all_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+				local gs, _ = util.parse_group_buf(all_lines)
+				local paths = type(gs[grp_name]) == "table" and gs[grp_name] or {}
+				if #paths == 0 then
+					vim.notify("browser.groups: group '" .. grp_name .. "' has no paths", vim.log.levels.WARN)
+					return
+				end
+				restore_tabs(buf)
+				require("browser.groups").open_group(grp_name, paths)
 			else
-				-- Path line: open a new tab rather than replacing the active one.
+				-- Path line: open a new tab
 				local p = vim.trim(line)
 				if p ~= "" and p:sub(1, 1) == "/" then
 					tabops.open_path(p, buf, state.tab_metadata, do_buf_refresh)
@@ -458,6 +470,12 @@ function M.register(buf, win, layout, state, opts)
 			table.insert(names, name)
 		end
 		table.sort(names)
+		local tags = tabops.load_tags()
+		local tag_names = {}
+		for name in pairs(tags) do
+			table.insert(tag_names, name)
+		end
+		table.sort(tag_names)
 		local new_lines = {}
 		for _, name in ipairs(names) do
 			table.insert(new_lines, "# " .. name)
@@ -466,7 +484,14 @@ function M.register(buf, win, layout, state, opts)
 			end
 			table.insert(new_lines, "")
 		end
-		if #names == 0 then
+		for _, name in ipairs(tag_names) do
+			table.insert(new_lines, "### " .. name)
+			for _, p in ipairs(type(tags[name]) == "table" and tags[name] or {}) do
+				table.insert(new_lines, p)
+			end
+			table.insert(new_lines, "")
+		end
+		if #names == 0 and #tag_names == 0 then
 			table.insert(new_lines, "# new-group")
 			table.insert(new_lines, "")
 		end
@@ -478,7 +503,7 @@ function M.register(buf, win, layout, state, opts)
 		vim.bo[buf].filetype = "scratchbuf"
 		vim.bo[buf].modified = false
 		state.view_mode = "groups"
-		vim.notify("browser: group editor - W=save  :=add path  CR=open  gz/r=back")
+		vim.notify("browser: group editor - W=save  :=add path  CR=open  gz/r=back  #=group  ###=tag")
 	end
 	vim.keymap.set("n", "gz", open_group_editor, { buffer = buf, nowait = true, noremap = true, desc = "Group editor" })
 	table.insert(state.registered_keymaps, { lhs = "gz", fn = open_group_editor, desc = "Group editor" })

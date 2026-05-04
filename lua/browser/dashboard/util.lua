@@ -28,6 +28,7 @@ vim.api.nvim_set_hl(0, "BrowserHttp4xx", { fg = "#ff9800", bold = true })
 vim.api.nvim_set_hl(0, "BrowserHttp5xx", { fg = "#f44336", bold = true })
 vim.api.nvim_set_hl(0, "BrowserHdrKey", { fg = "#56b6c2" })
 vim.api.nvim_set_hl(0, "BrowserHdrVal", { fg = "#888899" })
+vim.api.nvim_set_hl(0, "BrowserTag", { fg = "#e06c75", italic = true })
 vim.api.nvim_set_hl(0, "BrowserJsonKey", { fg = "#c678dd" })
 vim.api.nvim_set_hl(0, "BrowserJsonStr", { fg = "#98c379" })
 
@@ -41,6 +42,7 @@ function M.browser_highlights(target_win)
 	ma("^\\%(GET\\|POST\\|PUT\\|PATCH\\|DELETE\\) ", "BrowserMethod", 11)
 	ma("^## .*", "BrowserGroup", 11)
 	ma("\\s\\+\\[[0-9A-Fa-f]\\{8\\}\\]", "BrowserTabID", 10)
+	ma("\\s\\+\\[\\a\\w*\\]", "BrowserTag", 11)
 end
 
 function M.preview_highlights(target_win)
@@ -141,27 +143,43 @@ end
 -- are chi_path entries for the current group.
 -- ============================================================
 function M.parse_group_buf(lines)
-	local gs = {}
+	local groups = {}
+	local tags = {}
 	local current = nil
+	local is_tag = false
+	local function strip_path(line)
+		local p = vim.trim(line)
+		p = p:gsub("^%u+%s+", "")
+		p = p:gsub("%s+%[%x+%].*$", "")
+		p = p:gsub("%s+%[partial%].*$", "")
+		p = p:gsub("%s+%[full%].*$", "")
+		p = p:gsub("%s+%[%a%w*%]", "") -- strip inline tag annotations
+		return vim.trim(p)
+	end
 	for _, line in ipairs(lines) do
-		local name = line:match("^#%s*(.+)")
-		if name then
-			name = vim.trim(name)
-			current = name
-			gs[current] = gs[current] or {}
+		-- Check ### (tag) before ## (group) before # (group)
+		local tag_name = line:match("^###%s*(.+)")
+		local grp_name = not tag_name and line:match("^##?%s*(.+)")
+		if tag_name then
+			current = vim.trim(tag_name)
+			is_tag = true
+			tags[current] = tags[current] or {}
+		elseif grp_name then
+			current = vim.trim(grp_name)
+			is_tag = false
+			groups[current] = groups[current] or {}
 		elseif current and vim.trim(line) ~= "" then
-			local path = vim.trim(line)
-			path = path:gsub("^%u+%s+", "") -- strip HTTP method prefix
-			path = path:gsub("%s+%[%x+%].*$", "") -- strip [tabid] annotation
-			path = path:gsub("%s+%[partial%].*$", "")
-			path = path:gsub("%s+%[full%].*$", "")
-			path = vim.trim(path)
+			local path = strip_path(line)
 			if path ~= "" then
-				table.insert(gs[current], path)
+				if is_tag then
+					table.insert(tags[current], path)
+				else
+					table.insert(groups[current], path)
+				end
 			end
 		end
 	end
-	return gs
+	return groups, tags
 end
 
 -- ============================================================

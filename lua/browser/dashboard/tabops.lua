@@ -10,6 +10,48 @@ local function send_cmd(cmd)
 	return require("browser.session").send_cmd(cmd)
 end
 
+local function tags_path()
+	return require("browser.session").DEVPROXY_DIR .. "/tags.yaml"
+end
+
+function M.load_tags()
+	local path = tags_path()
+	if vim.fn.filereadable(path) == 0 then
+		return {}
+	end
+	local raw = vim.fn.system("yq -o=json . " .. vim.fn.shellescape(path) .. " 2>/dev/null")
+	local ok, data = pcall(vim.json.decode, raw)
+	if not ok or not data or not data.tags or type(data.tags) ~= "table" then
+		return {}
+	end
+	local result = {}
+	for name, paths in pairs(data.tags) do
+		result[name] = type(paths) == "table" and paths or {}
+	end
+	return result
+end
+
+function M.save_tags(tags)
+	local path = tags_path()
+	local names = {}
+	for name in pairs(tags) do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	local lines = { "tags:" }
+	for _, name in ipairs(names) do
+		table.insert(lines, "  " .. name .. ":")
+		for _, p in ipairs(tags[name] or {}) do
+			table.insert(lines, "    - " .. p)
+		end
+	end
+	local f = io.open(path, "w")
+	if f then
+		f:write(table.concat(lines, "\n") .. "\n")
+		f:close()
+	end
+end
+
 local function get_base_url()
 	local raw = send_cmd("active-server")
 	if raw then
@@ -19,6 +61,26 @@ local function get_base_url()
 		end
 	end
 	return "http://localhost:3333"
+end
+
+-- ============================================================
+-- groups_chi_list
+-- Returns a flat list of all chi_path templates from groups.yaml.
+-- Used as fallback when plan.json routes don't cover a path.
+-- ============================================================
+local function groups_chi_list()
+	local result = {}
+	local grps = require("browser.groups").load_groups()
+	for _, paths in pairs(grps) do
+		if type(paths) == "table" then
+			for _, cp in ipairs(paths) do
+				if cp and cp ~= "" then
+					table.insert(result, cp)
+				end
+			end
+		end
+	end
+	return result
 end
 
 -- ============================================================
@@ -32,15 +94,17 @@ function M.infer_chi_path(t)
 	end
 	local groups = require("browser.groups").load_groups()
 	for _, paths in pairs(groups) do
-		for _, cp in ipairs(paths) do
-			if util.path_matches_chi(t.path, cp) then
-				return cp
+		if type(paths) == "table" then
+			for _, cp in ipairs(paths) do
+				if util.path_matches_chi(t.path, cp) then
+					return cp
+				end
 			end
 		end
 	end
 	local routes = require("browser.views").get_routes()
 	for _, r in ipairs(routes) do
-		if util.path_matches_chi(t.path, r.chi_path) then
+		if r.chi_path and util.path_matches_chi(t.path, r.chi_path) then
 			return r.chi_path
 		end
 	end
@@ -52,7 +116,7 @@ end
 -- Builds the display string for a tab line (without GET prefix).
 -- htmx preference comes from the saved test file when available.
 -- ============================================================
-function M.make_content(t, show_chi_path)
+function M.make_content(t, show_chi_path, tag_names)
 	local short_id = t.id:sub(1, 8)
 	local chi = M.infer_chi_path(t)
 	local is_partial = t.htmx
@@ -65,7 +129,18 @@ function M.make_content(t, show_chi_path)
 	local htmx_ann = is_partial and "  [partial]" or ""
 	local raw_path = t.path:gsub("%%7B", "{"):gsub("%%7D", "}")
 	local display_path = (show_chi_path and chi) or raw_path
-	return (display_path or raw_path) .. "  [" .. short_id .. "]" .. htmx_ann
+	local tag_ann = ""
+	if tag_names then
+		local sorted = {}
+		for _, tn in ipairs(tag_names) do
+			table.insert(sorted, tn)
+		end
+		table.sort(sorted)
+		for _, tn in ipairs(sorted) do
+			tag_ann = tag_ann .. "  [" .. tn .. "]"
+		end
+	end
+	return (display_path or raw_path) .. "  [" .. short_id .. "]" .. htmx_ann .. tag_ann
 end
 
 -- ============================================================
@@ -84,21 +159,28 @@ function M.fetch_tabs(tab_htmx)
 	end
 	local session = require("browser.session")
 	local routes = require("browser.views").get_routes()
+	local gchi = groups_chi_list()
 
 	-- Always re-infer chi_path from the current tab URL on every sync.
-	-- This keeps session._tab_paths current after navigations that change
-	-- the tab's actual path (e.g. W with a direct path edit, or t toggle).
-	-- Without this, CR/t would resolve using a stale chi_path and revert
-	-- to the previous URL.
+	-- Checks routes (plan.json) first, then groups.yaml as fallback.
+	-- Groups are the user's explicit source of truth and cover paths that
+	-- plan.json may omit or name differently.
 	for _, t in ipairs(tabs) do
 		local path = t.path or t.id
-		-- url-decode so %7BgroupID%7D compares against {groupID} templates
 		local decoded = path:gsub("%%7B", "{"):gsub("%%7D", "}")
 		local found = nil
 		for _, r in ipairs(routes) do
 			if r.chi_path and util.path_matches_chi(decoded, r.chi_path) then
 				found = r.chi_path
 				break
+			end
+		end
+		if not found then
+			for _, cp in ipairs(gchi) do
+				if util.path_matches_chi(decoded, cp) then
+					found = cp
+					break
+				end
 			end
 		end
 		session._tab_paths[t.id] = found
@@ -108,8 +190,8 @@ function M.fetch_tabs(tab_htmx)
 	local result = {}
 	for _, t in ipairs(tabs) do
 		local chi = session._tab_paths[t.id]
-		-- On first load tab_htmx is empty. Seed it from the saved test file
-		-- so that CR and t use the correct partial/full preference immediately.
+		-- On first load tab_htmx is empty. Seed from the saved test file so
+		-- that CR and t use the correct partial/full preference immediately.
 		if tab_htmx[t.id] == nil and chi then
 			local saved = views.load_test_for_path(chi)
 			if saved and saved.htmx ~= nil then
@@ -130,6 +212,8 @@ end
 -- ============================================================
 -- build_tab_lines
 -- Builds display lines sorted under group headers.
+-- A tab can appear under multiple group headers simultaneously.
+-- Tags are shown as annotations [tagname] on each line.
 -- Returns: lines (list), metadata (content_key -> meta).
 -- ============================================================
 function M.build_tab_lines(tabs, show_chi_path)
@@ -140,38 +224,89 @@ function M.build_tab_lines(tabs, show_chi_path)
 	end
 	table.sort(group_names)
 
-	-- Map each tab to its group by chi_path exact match, then URL pattern match
-	local tab_to_group = {}
+	-- Map each tab to ALL groups it belongs to.
+	local tab_to_groups = {}
 	for _, name in ipairs(group_names) do
 		local chi_paths = type(groups[name]) == "table" and groups[name] or {}
 		for _, t in ipairs(tabs) do
-			if not tab_to_group[t.id] then
+			local matched = false
+			if t.chi_path then
+				for _, cp in ipairs(chi_paths) do
+					if t.chi_path == cp then
+						matched = true
+						break
+					end
+				end
+			end
+			if not matched then
+				local decoded = t.path:gsub("%%7B", "{"):gsub("%%7D", "}")
+				for _, cp in ipairs(chi_paths) do
+					if util.path_matches_chi(decoded, cp) then
+						matched = true
+						break
+					end
+				end
+			end
+			if matched then
+				tab_to_groups[t.id] = tab_to_groups[t.id] or {}
+				tab_to_groups[t.id][name] = true
+			end
+		end
+	end
+
+	-- Load tags: shown as [tagname] annotations but do NOT create extra group headers.
+	local all_tags = M.load_tags()
+	local tab_to_tags = {}
+	for tag_name, chi_paths in pairs(all_tags) do
+		if type(chi_paths) == "table" then
+			for _, t in ipairs(tabs) do
+				local matched = false
 				if t.chi_path then
 					for _, cp in ipairs(chi_paths) do
 						if t.chi_path == cp then
-							tab_to_group[t.id] = name
+							matched = true
 							break
 						end
 					end
 				end
-				if not tab_to_group[t.id] then
+				if not matched then
+					local decoded = t.path:gsub("%%7B", "{"):gsub("%%7D", "}")
 					for _, cp in ipairs(chi_paths) do
-						if util.path_matches_chi(t.path, cp) then
-							tab_to_group[t.id] = name
+						if util.path_matches_chi(decoded, cp) then
+							matched = true
 							break
 						end
 					end
+				end
+				if matched then
+					tab_to_tags[t.id] = tab_to_tags[t.id] or {}
+					tab_to_tags[t.id][tag_name] = true
 				end
 			end
 		end
 	end
 
+	local function get_tag_names(tab_id)
+		local ts = tab_to_tags[tab_id]
+		if not ts then
+			return nil
+		end
+		local result = {}
+		for tn in pairs(ts) do
+			table.insert(result, tn)
+		end
+		table.sort(result)
+		return result
+	end
+
 	local grouped, ungrouped = {}, {}
 	for _, t in ipairs(tabs) do
-		local g = tab_to_group[t.id]
-		if g then
-			grouped[g] = grouped[g] or {}
-			table.insert(grouped[g], t)
+		local gs = tab_to_groups[t.id]
+		if gs and next(gs) then
+			for name in pairs(gs) do
+				grouped[name] = grouped[name] or {}
+				table.insert(grouped[name], t)
+			end
 		else
 			table.insert(ungrouped, t)
 		end
@@ -181,7 +316,8 @@ function M.build_tab_lines(tabs, show_chi_path)
 	local meta = {}
 
 	local function emit(t)
-		local content = M.make_content(t, show_chi_path)
+		local tag_names = get_tag_names(t.id)
+		local content = M.make_content(t, show_chi_path, tag_names)
 		table.insert(lines, "GET " .. content)
 		meta[content] = {
 			tab_id = t.id,
@@ -224,12 +360,6 @@ end
 -- ============================================================
 -- navigate_tab
 -- Switches to a tab and navigates it using the active context params.
--- Uses infer_chi_path as a fallback when meta.chi_path is nil (which is
--- the case for any tab not opened via the groups system, since
--- session._tab_paths is only populated by groups.lua).
--- Resolves the path directly from active_params() rather than going
--- through do_navigate, so the _context key mismatch in views.lua
--- can never silently produce a stale URL.
 -- ============================================================
 function M.navigate_tab(meta, htmx, tab_htmx)
 	if not meta then
@@ -240,8 +370,6 @@ function M.navigate_tab(meta, htmx, tab_htmx)
 
 	local chi = meta.chi_path or M.infer_chi_path(meta)
 	if chi then
-		-- Resolve directly: substitute active params into the template.
-		-- Any param without a value is left as {token} and navigation is skipped.
 		local views = require("browser.views")
 		local params = views.params_for_context(views.get_active_context())
 		local resolved = chi
@@ -262,7 +390,6 @@ function M.navigate_tab(meta, htmx, tab_htmx)
 		send_cmd(cmd .. " " .. base .. resolved .. qp)
 		vim.notify(string.format("browser: %s%s%s", resolved, qp, htmx and " [partial]" or " [full]"))
 	else
-		-- No chi_path available: navigate directly to the raw tab URL.
 		local cmd = htmx and "navigate" or "navigate-full"
 		send_cmd(cmd .. " " .. get_base_url() .. meta.path)
 		vim.notify("browser: " .. (htmx and "[partial]" or "[full]") .. " " .. meta.path)
@@ -271,8 +398,7 @@ end
 
 -- ============================================================
 -- open_path
--- Opens a new tab for chi_path. If a tab already exists for that
--- chi_path, switches to it instead of opening a duplicate.
+-- Always opens a new tab. Tab management is manual via dd+W.
 -- ============================================================
 function M.open_path(chi_path, buf, tab_metadata, do_buf_refresh_fn)
 	local views = require("browser.views")
@@ -291,50 +417,24 @@ end
 
 -- ============================================================
 -- on_save_tabs
--- Handles W in tabs view.
---
--- Flow:
---   1. Scan buffer lines: identify present, edited, and new entries by tab ID.
---   2. Close tabs whose lines were deleted.
---   3. For edited paths: diff against chi_path template to extract changed params.
---   4. Write changed params to config.yaml central store via yq.
---   5. Write htmx preference to test file for each edited chi_path.
---   6. Re-navigate all open tabs that share any updated param (via vim.schedule).
---   7. Open genuinely new lines (no tab ID annotation) as new tabs.
---
--- Returns false when params were changed so scratchbuf defers its buffer
--- refresh by 500ms, giving vim.schedule re-navigation time to fire first.
 -- ============================================================
 function M.on_save_tabs(state)
 	local buf = state.primary_buf
 	local buf_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 	local routes_ref = require("browser.views").get_routes()
-	local groups_chi_ref = {}
-	do
-		local _g = require("browser.groups").load_groups()
-		for _, paths in pairs(_g) do
-			if type(paths) == "table" then
-				for _, cp in ipairs(paths) do
-					if cp and cp ~= "" then
-						table.insert(groups_chi_ref, cp)
-					end
-				end
-			end
-		end
-	end
+	local groups_chi_ref = groups_chi_list()
 
 	local function extract_tab_short(line)
 		return line:match("%[(%x%x%x%x%x%x%x%x)%]")
 	end
 
-	-- short_id (8 hex chars, uppercase) -> meta
 	local short_to_meta = {}
 	for _, m in pairs(state.tab_metadata) do
 		short_to_meta[m.tab_id:sub(1, 8):upper()] = m
 	end
 
 	local present_ids = {}
-	local edited_tabs = {} -- tab_id -> { path, chi_path }
+	local edited_tabs = {}
 
 	for _, line in ipairs(buf_lines) do
 		local trimmed = vim.trim(line)
@@ -348,18 +448,15 @@ function M.on_save_tabs(state)
 			if m then
 				present_ids[m.tab_id] = true
 				local content = util.strip_prefix(trimmed)
-				-- If content doesn't match the original key, the path was edited
 				if not state.tab_metadata[content] then
 					local p = content
 						:gsub("^%u+%s+", "")
 						:gsub("%s+%[[%x]+%].*$", "")
 						:gsub("%s+%[partial%].*$", "")
 						:gsub("%s+%[full%].*$", "")
+						:gsub("%s+%[%a[%a%d%-_]*%].*$", "") -- strip tag annotations
 					p = vim.trim(p)
 					if p ~= "" and p:sub(1, 1) == "/" then
-						-- Always record the edit. chi_path is used for param extraction
-						-- but is not required - a plain path edit (e.g. / -> /admin)
-						-- navigates directly even when no params are involved.
 						local chi = m.chi_path
 						if not chi then
 							for _, r in ipairs(routes_ref) do
@@ -382,7 +479,6 @@ function M.on_save_tabs(state)
 				end
 			end
 		else
-			-- No tab ID: check exact content match for unchanged lines
 			local meta = state.tab_metadata[util.strip_prefix(trimmed)]
 			if meta then
 				present_ids[meta.tab_id] = true
@@ -396,7 +492,6 @@ function M.on_save_tabs(state)
 	local closed_count = 0
 	local total_count = 0
 
-	-- Close tabs whose lines were removed from the buffer
 	for _, meta in pairs(state.tab_metadata) do
 		total_count = total_count + 1
 		if not present_ids[meta.tab_id] then
@@ -415,7 +510,6 @@ function M.on_save_tabs(state)
 		end, 400)
 	end
 
-	-- Extract changed params from edited tabs, write to central store, re-navigate
 	if next(edited_tabs) then
 		local views = require("browser.views")
 		local session = require("browser.session")
@@ -425,7 +519,6 @@ function M.on_save_tabs(state)
 		local params_changed = {}
 
 		for _, info in pairs(edited_tabs) do
-			-- chi_path may be nil for direct path edits (e.g. / -> /admin)
 			if not info.chi_path then
 				goto skip_params
 			end
@@ -436,7 +529,6 @@ function M.on_save_tabs(state)
 					if c:sub(1, 1) == "{" then
 						local pname = c:match("{(.+)}")
 						local val = res_s[i]
-						-- Skip segments still containing template tokens or URL-encoded braces
 						if pname and val and val ~= "" and not val:find("{") and not val:match("%%7[Bb]") then
 							params_changed[pname] = val
 						end
@@ -468,7 +560,6 @@ function M.on_save_tabs(state)
 				vim.notify("browser: config.yaml not found - params not saved", vim.log.levels.WARN)
 			end
 
-			-- Write htmx preference to test file for each edited chi_path
 			local written = {}
 			for _, m in pairs(state.tab_metadata) do
 				local info = edited_tabs[m.tab_id]
@@ -484,9 +575,6 @@ function M.on_save_tabs(state)
 				end
 			end
 
-			-- Re-navigate all open tabs sharing any updated param.
-			-- Resolve paths directly from params_changed + active_params so we
-			-- never depend on config reload timing or the _context key matching.
 			local base = views.get_active_base()
 			local existing = views.params_for_context(views.get_active_context())
 			local function resolve_direct(cp)
@@ -502,8 +590,7 @@ function M.on_save_tabs(state)
 				end
 				return result
 			end
-			-- Snapshot metadata now so vim.schedule closure sees stable data
-			-- even if update_metadata fires before the callback runs.
+
 			local meta_snapshot = {}
 			for k, v in pairs(state.tab_metadata) do
 				meta_snapshot[k] = v
@@ -511,7 +598,6 @@ function M.on_save_tabs(state)
 
 			vim.schedule(function()
 				for _, m in pairs(meta_snapshot) do
-					-- Skip tabs that were directly edited; they navigate last via edited_nav
 					if edited_tabs[m.tab_id] then
 						goto nav_next
 					end
@@ -564,10 +650,6 @@ function M.on_save_tabs(state)
 			)
 		end
 
-		-- Navigate each edited tab last so it ends up focused after all
-		-- other affected tabs have been re-navigated.  Runs inside
-		-- vim.schedule so the params block's scheduled re-navigation fires
-		-- first (it was scheduled earlier in the same tick).
 		local base = require("browser.views").get_active_base()
 		local edited_nav = {}
 		for tab_id, info in pairs(edited_tabs) do
@@ -588,7 +670,6 @@ function M.on_save_tabs(state)
 		end
 	end
 
-	-- Open genuinely new lines (typed by user, no tab ID annotation)
 	for _, line in ipairs(buf_lines) do
 		local trimmed = vim.trim(line)
 		if trimmed == "" or trimmed:sub(1, 2) == "##" then
@@ -610,9 +691,6 @@ function M.on_save_tabs(state)
 		::continue::
 	end
 
-	-- Bug 1 fix: return false when params changed so scratchbuf uses deferred
-	-- refresh (500ms), giving vim.schedule re-navigation time to fire first.
-	-- Returning true would trigger an immediate buffer overwrite, reverting edits.
 	return not needs_refresh and not had_param_changes
 end
 

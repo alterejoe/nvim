@@ -240,7 +240,9 @@ function M.open()
 					return true
 				end
 				local all_lines = vim.api.nvim_buf_get_lines(state.primary_buf, 0, -1, false)
-				require("browser.groups").save_groups(util.parse_group_buf(all_lines))
+				local groups, tags = util.parse_group_buf(all_lines)
+				require("browser.groups").save_groups(groups)
+				tabops.save_tags(tags)
 				vim.notify("browser.groups: saved")
 				return true
 			end
