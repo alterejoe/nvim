@@ -240,8 +240,8 @@ local function get_lines(buf, raw)
 end
 
 local function compute_dims(opts)
-	local total_w = math.floor(vim.o.columns * 0.96)
-	local total_h = math.min(math.floor(vim.o.lines * 0.88), 56)
+	local total_w = math.floor(vim.o.columns * 0.88)
+	local total_h = math.min(math.floor(vim.o.lines * 0.78), 48)
 	if not opts.right then
 		local w = math.floor(vim.o.columns * 0.5)
 		local h = math.min(math.max(#opts.lines + 2, 5), math.floor(vim.o.lines * 0.6))

@@ -720,7 +720,7 @@ function M.open()
 
 	local help_lines = {
 		"CR switch   dd+W close  W save    r refresh   q back  Q quit",
-		":  paths    P toggle    t partial  T full      \\  name",
+		":  paths    t toggle    T full      \\  name",
 		"gz groups   +  +group   e  http    H  html",
 		"c  console  C  clr-con  n  network N  clr-net",
 		"n: v req/res  H: b head  U uuid  A +pat  ? pats",
@@ -956,74 +956,164 @@ function M.open()
 				return true
 			end
 
-			-- http view: write context sections back to disk
+			-- http view: extract params -> central store, save query/htmx to test file, re-navigate
 			if view_mode == "http" then
 				if not _primary_buf or not vim.api.nvim_buf_is_valid(_primary_buf) then
 					return true
 				end
 				local all_lines = vim.api.nvim_buf_get_lines(_primary_buf, 0, -1, false)
-				local current_ctx = nil
-				local current_lines = {}
-				local written = {}
-				local function flush()
-					if not current_ctx then
-						return
-					end
-					local fpath = _http_section_paths[current_ctx]
-					if not fpath then
-						return
-					end
-					while #current_lines > 0 and vim.trim(current_lines[#current_lines]) == "" do
-						table.remove(current_lines)
-					end
-					local dir = vim.fn.fnamemodify(fpath, ":h")
-					vim.fn.mkdir(dir, "p")
-					local f = io.open(fpath, "w")
-					if f then
-						for _, l in ipairs(current_lines) do
-							f:write(l .. "\n")
-						end
-						f:close()
-						table.insert(written, current_ctx)
-					else
-						vim.notify("browser: cannot write " .. fpath, vim.log.levels.WARN)
-					end
-				end
+				local views = require("browser.views")
+				local session = require("browser.session")
+				local yaml_path = session.DEVPROXY_DIR .. "/config.yaml"
+				local active_ctx = views.get_active_context()
+
+				-- Parse buffer into context sections
+				local sections = {}
+				local cur = nil
 				for _, l in ipairs(all_lines) do
-					local ctx = l:match("^%-%-%- context: (.+) %-%-%-%s*$")
-					if ctx then
-						flush()
-						current_ctx = ctx
-						current_lines = {}
-					elseif current_ctx then
-						table.insert(current_lines, l)
+					local ctx_name = l:match("^%-%-%- context: (.+) %-%-%-%s*$")
+					if ctx_name then
+						if cur then
+							table.insert(sections, cur)
+						end
+						cur = { ctx = ctx_name, path = nil, query = "", htmx = nil }
+					elseif cur then
+						local label, val = l:match("^([%w%.%-_]+):%s*(.*)")
+						if label then
+							local low = label:lower()
+							if low == "path" then
+								cur.path = vim.trim(val)
+							elseif low == "query" then
+								cur.query = vim.trim(val)
+							elseif low == "htmx" then
+								cur.htmx = vim.trim(val) == "true"
+							end
+						end
 					end
 				end
-				flush()
-				vim.notify(string.format("browser: saved %d context(s) - navigating", #written))
+				if cur then
+					table.insert(sections, cur)
+				end
+
+				-- Helper: split path into segments
+				local function segs(s)
+					local t = {}
+					for seg in s:gsub("?.*$", ""):gmatch("[^/]+") do
+						table.insert(t, seg)
+					end
+					return t
+				end
+
+				local active_params_changed = {}
+
+				for _, sec in ipairs(sections) do
+					-- Extract chi path params from the displayed (injected) path
+					local sec_params = {}
+					if sec.path and sec.path ~= "" and not sec.path:find("{") then
+						local chi_s = segs(_http_chi_path)
+						local res_s = segs(sec.path)
+						if #chi_s == #res_s then
+							for i, c in ipairs(chi_s) do
+								if c:sub(1, 1) == "{" then
+									local name = c:match("{(.+)}")
+									if name and res_s[i] and res_s[i] ~= "" then
+										sec_params[name] = res_s[i]
+									end
+								end
+							end
+						end
+					end
+
+					-- Write changed params to contexts.<sec.ctx> in config.yaml
+					if vim.fn.filereadable(yaml_path) == 1 then
+						local ctx_key = sec.ctx == "" and "default" or sec.ctx
+						for k, v in pairs(sec_params) do
+							vim.fn.system(
+								string.format(
+									"yq -i '.contexts.%s.%s = " % s("' %s 2>/dev/null"),
+									ctx_key,
+									k,
+									v:gsub('"', '\\"'),
+									vim.fn.shellescape(yaml_path)
+								)
+							)
+						end
+					end
+
+					-- Write ONLY query and htmx to test file (no path - resolved at navigate time)
+					local fpath = views.test_file_path(_http_chi_path, sec.ctx)
+					vim.fn.mkdir(vim.fn.fnamemodify(fpath, ":h"), "p")
+					local wf = io.open(fpath, "w")
+					if wf then
+						if sec.query and sec.query ~= "" then
+							wf:write("query: " .. sec.query .. "\n")
+						end
+						if sec.htmx ~= nil then
+							wf:write("htmx: " .. tostring(sec.htmx) .. "\n")
+						end
+						wf:close()
+					end
+
+					-- Track params changed in the active context for re-navigation
+					if sec.ctx == active_ctx then
+						active_params_changed = sec_params
+					end
+				end
+
+				-- Reload config with new values
+				views.reload_config_silent()
+
+				-- Navigate the current endpoint
 				if _http_tab_meta and _http_chi_path then
-					-- Don't switch browser focus - stay in e-view
-					require("browser.views").do_navigate(_http_chi_path, _http_tab_meta.htmx or false)
-					-- Show response in preview pane after request settles
-					vim.defer_fn(function()
-						if not _layout then
-							return
+					views.do_navigate(_http_chi_path, _http_tab_meta.htmx or false)
+				end
+
+				-- Re-navigate all other open tabs whose chi_path shares an updated param
+				if next(active_params_changed) then
+					local routes = views.get_routes()
+					vim.schedule(function()
+						for _, m in pairs(tab_metadata) do
+							if m.tab_id == (_http_tab_meta and _http_tab_meta.tab_id) then
+								goto next_tab
+							end
+							local chi = m.chi_path
+							if not chi then
+								for _, r in ipairs(routes) do
+									if path_matches_chi(m.path, r.chi_path) then
+										chi = r.chi_path
+										break
+									end
+								end
+							end
+							if not chi then
+								goto next_tab
+							end
+							local should_nav = false
+							for param in chi:gmatch("{([^}]+)}") do
+								if active_params_changed[param] then
+									should_nav = true
+									break
+								end
+							end
+							if should_nav then
+								send_cmd("switch " .. m.tab_id)
+								views.do_navigate(chi, m.htmx or false)
+							end
+							::next_tab::
 						end
-						local raw = send_cmd("netlog")
-						if not raw or vim.startswith(raw, "err:") then
-							return
-						end
-						local ok, entries = pcall(vim.json.decode, raw)
-						if ok and type(entries) == "table" and #entries > 0 then
-							local last = entries[#entries]
-							local preview = build_net_preview(last, true)
-							_layout.set(PREVIEW_TITLE, preview)
-						end
-					end, 900)
+					end)
+					vim.notify(
+						string.format(
+							"browser: saved - updated %d param(s) in [%s], re-navigating affected tabs",
+							vim.tbl_count(active_params_changed),
+							active_ctx
+						)
+					)
+				else
+					vim.notify("browser: saved")
 				end
 				return true
 			end
-
 			-- html view: readonly, no-op
 			if view_mode == "html" then
 				return true
@@ -1043,18 +1133,71 @@ function M.open()
 				return true
 			end
 			local buf_lines = vim.api.nvim_buf_get_lines(_primary_buf, 0, -1, false)
+			local routes_ref = require("browser.views").get_routes()
 
-			-- Build set of tab IDs still visible in the buffer
+			-- Extract tab short ID from a line annotation [XXXXXXXX]
+			local function extract_tab_short(line)
+				return line:match("%[(%x%x%x%x%x%x%x%x)%]")
+			end
+
+			-- Build short_id -> meta map
+			local short_to_meta = {}
+			for _, m in pairs(tab_metadata) do
+				short_to_meta[m.tab_id:sub(1, 8):upper()] = m
+			end
+
+			-- Scan buffer: match each line to its tab by ID annotation
 			local present_ids = {}
+			local edited_tabs = {} -- tab_id -> { path, chi_path }
+
 			for _, line in ipairs(buf_lines) do
-				local content = strip_prefix(line)
-				local meta = tab_metadata[content]
-				if meta then
-					present_ids[meta.tab_id] = true
+				local trimmed = vim.trim(line)
+				if trimmed == "" or trimmed:sub(1, 2) == "##" then
+					goto scan_next
 				end
+				local short = extract_tab_short(trimmed)
+				if short then
+					local m = short_to_meta[short:upper()]
+					if m then
+						present_ids[m.tab_id] = true
+						-- Check if path was edited (content key changed)
+						local content = strip_prefix(trimmed)
+						if not tab_metadata[content] then
+							local p = content
+								:gsub("^%u+%s+", "")
+								:gsub("%s+%[[%x]+%].*$", "")
+								:gsub("%s+%[partial%].*$", "")
+								:gsub("%s+%[full%].*$", "")
+							p = vim.trim(p)
+							if p ~= "" and p:sub(1, 1) == "/" then
+								local chi = m.chi_path
+								if not chi then
+									for _, r in ipairs(routes_ref) do
+										if path_matches_chi(p, r.chi_path) then
+											chi = r.chi_path
+											break
+										end
+									end
+								end
+								if chi then
+									edited_tabs[m.tab_id] = { path = p, chi_path = chi }
+								end
+							end
+						end
+					end
+				else
+					-- Line with no tab ID - check exact match (new line typed by user)
+					local content = strip_prefix(trimmed)
+					local meta = tab_metadata[content]
+					if meta then
+						present_ids[meta.tab_id] = true
+					end
+				end
+				::scan_next::
 			end
 
 			local needs_refresh = false
+			local had_param_changes = false
 			local closed_count = 0
 			local total_count = 0
 
@@ -1079,16 +1222,121 @@ function M.open()
 				end, 400)
 			end
 
-			-- Open new tabs for lines not in metadata (manually typed).
-			-- Handles "GET /path", bare "/path", and annotated lines.
+			-- Extract params from edited tabs, write to central store + test files, re-navigate all
+			if next(edited_tabs) then
+				local views = require("browser.views")
+				local session2 = require("browser.session")
+				local ctx = views.get_active_context()
+				local ctx_key = ctx == "" and "default" or ctx
+				local yaml_path = session2.DEVPROXY_DIR .. "/config.yaml"
+				local params_changed = {}
+
+				local function segs2(s)
+					local t = {}
+					for seg in s:gsub("?.*$", ""):gmatch("[^/]+") do
+						table.insert(t, seg)
+					end
+					return t
+				end
+
+				for _, info in pairs(edited_tabs) do
+					local chi_s = segs2(info.chi_path)
+					local res_s = segs2(info.path)
+					if #chi_s == #res_s then
+						for i, c in ipairs(chi_s) do
+							if c:sub(1, 1) == "{" then
+								local pname = c:match("{(.+)}")
+								local val = res_s[i]
+								if pname and val and val ~= "" and not val:find("{") and not val:match("%%7[Bb]") then
+									params_changed[pname] = val
+								end
+							end
+						end
+					end
+				end
+
+				-- Write params to central store
+				if next(params_changed) and vim.fn.filereadable(yaml_path) == 1 then
+					for k, v in pairs(params_changed) do
+						vim.fn.system(
+							string.format(
+								"yq -i '.contexts.%s.%s = \"%s\"' %s 2>/dev/null",
+								ctx_key,
+								k,
+								v:gsub('"', '\\"'),
+								vim.fn.shellescape(yaml_path)
+							)
+						)
+					end
+					views.reload_config_silent()
+					had_param_changes = true
+				end
+
+				-- Write template test file for each edited chi_path (htmx only)
+				local written = {}
+				for _, m in pairs(tab_metadata) do
+					local info = edited_tabs[m.tab_id]
+					if info and not written[info.chi_path] then
+						written[info.chi_path] = true
+						local fpath = views.test_file_path(info.chi_path, ctx)
+						vim.fn.mkdir(vim.fn.fnamemodify(fpath, ":h"), "p")
+						local wf = io.open(fpath, "w")
+						if wf then
+							wf:write("htmx: " .. tostring(m.htmx or false) .. "\n")
+							wf:close()
+						end
+					end
+				end
+
+				-- Re-navigate ALL open tabs whose chi_path uses any updated param
+				if next(params_changed) then
+					vim.schedule(function()
+						for _, m in pairs(tab_metadata) do
+							local chi = m.chi_path
+							if not chi then
+								for _, r in ipairs(routes_ref) do
+									if path_matches_chi(m.path, r.chi_path) then
+										chi = r.chi_path
+										break
+									end
+								end
+							end
+							if not chi then
+								goto nav_next
+							end
+							local should_nav = false
+							for param in chi:gmatch("{([^}]+)}") do
+								if params_changed[param] then
+									should_nav = true
+									break
+								end
+							end
+							if should_nav then
+								send_cmd("switch " .. m.tab_id)
+								views.do_navigate(chi, m.htmx or false)
+							end
+							::nav_next::
+						end
+					end)
+					vim.notify(
+						string.format(
+							"browser: [%s] groupID=%s - re-navigating affected tabs",
+							ctx,
+							vim.inspect(params_changed):gsub('[{} "\n]', "")
+						)
+					)
+				end
+			end
+
+			-- Open genuinely new lines (no tab ID annotation)
 			for _, line in ipairs(buf_lines) do
 				local trimmed = vim.trim(line)
 				if trimmed == "" or trimmed:sub(1, 2) == "##" then
 					goto continue
 				end
-				local content = strip_prefix(trimmed)
-				if not tab_metadata[content] then
-					local new_path = content
+				local short = trimmed:match("%[(%x%x%x%x%x%x%x%x)%]")
+				if not short then
+					local new_path = strip_prefix(trimmed)
 						:gsub("^%u+%s+", "")
 						:gsub("%s+%[[%x]+%].*$", "")
 						:gsub("%s+%[partial%].*$", "")
@@ -1102,8 +1350,7 @@ function M.open()
 				end
 				::continue::
 			end
-
-			return not needs_refresh
+			return not needs_refresh and not had_param_changes
 		end,
 
 		on_cursor = function(line, parsed, layout)
@@ -1430,9 +1677,9 @@ function M.open()
 					end
 					local views = require("browser.views")
 					local base = views.get_active_base()
-					local resolved = path or _http_chi_path
+					-- Use the path shown in buffer (injected); fall back to resolve from context
+					local resolved = (path and path ~= "") and path or views.resolve_path(_http_chi_path)
 					local full_url = base .. resolved .. (qp ~= "" and ("?" .. qp) or "")
-					local method = _http_tab_meta.htmx and "GET" or "GET"
 					local hx_flag = _http_tab_meta.htmx
 							and " -H 'HX-Request: true' -H 'HX-Current-URL: " .. full_url .. "'"
 						or ""
@@ -1773,11 +2020,14 @@ function M.open()
 
 			-- \: toggle between resolved URL path and chi_path template display
 			map("\\", function()
-				if view_mode ~= "tabs" then
+				if view_mode ~= "tabs" and not (is_in_split() and _split_view == "tabs") then
 					return
 				end
 				show_chi_path = not show_chi_path
 				do_buf_refresh(buf)
+				if _split_buf and vim.api.nvim_buf_is_valid(_split_buf) and _split_view == "tabs" then
+					split_restore_tabs()
+				end
 				vim.notify("browser: showing " .. (show_chi_path and "chi_path templates" or "resolved paths"))
 			end, "Toggle chi_path / resolved path display")
 
@@ -1944,13 +2194,12 @@ function M.open()
 				vim.api.nvim_feedkeys("/", "n", false)
 			end, "Search")
 
-			map("P", function()
+			map("t", function()
 				if view_mode ~= "tabs" then
 					return
 				end
 				local meta = current_meta()
 				if not meta then
-					vim.notify("browser: tab not found", vim.log.levels.WARN)
 					return
 				end
 				local new_htmx = not meta.htmx
@@ -1965,26 +2214,6 @@ function M.open()
 					end
 				end, 400)
 			end, "Toggle partial/full")
-
-			map("t", function()
-				if view_mode ~= "tabs" then
-					return
-				end
-				local meta = current_meta()
-				if not meta then
-					return
-				end
-				navigate_tab(meta, true)
-				local chi = infer_chi_path(meta) or meta.chi_path or meta.path
-				if chi then
-					require("browser.views").save_htmx_for_path(chi, true)
-				end
-				vim.defer_fn(function()
-					if vim.api.nvim_buf_is_valid(buf) then
-						do_buf_refresh(buf)
-					end
-				end, 400)
-			end, "Navigate partial (htmx)")
 
 			map("T", function()
 				if view_mode ~= "tabs" then
@@ -2230,13 +2459,19 @@ function M.open()
 				table.insert(new_lines, "")
 				for i, sec in ipairs(sections) do
 					table.insert(new_lines, "--- context: " .. sec.context .. " ---")
-					if #sec.lines > 0 then
-						for _, l in ipairs(sec.lines) do
+					-- Always show path: injected with this context's current param values
+					-- so user sees real values to edit, not {param} templates
+					local injected = require("browser.views").resolve_path_for_context(chi_path, sec.context)
+					table.insert(new_lines, "path: " .. injected)
+					-- Show query and htmx from test file (filter out any stale path: lines)
+					for _, l in ipairs(sec.lines) do
+						local label = l:match("^([%w%.%-_]+):")
+						if not label or label:lower() ~= "path" then
 							table.insert(new_lines, l)
 						end
-					else
+					end
+					if #sec.lines == 0 then
 						table.insert(new_lines, "query: ")
-						table.insert(new_lines, "path: " .. chi_path)
 					end
 					if i < #sections then
 						table.insert(new_lines, "")
