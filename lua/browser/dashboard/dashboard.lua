@@ -101,7 +101,7 @@ function M.open()
 	local state = {
 		-- tab data
 		tab_htmx = {},
-		tab_metadata = {}, -- IMPORTANT: never replace this table; always mutate in-place
+		tab_metadata = {},
 		preview_tab_id = nil,
 		-- window handles (set in on_ready)
 		layout = nil,
@@ -146,25 +146,8 @@ function M.open()
 		return
 	end
 
-	-- update_metadata mutates state.tab_metadata IN PLACE so that scratchbuf's
-	-- pane_opts.metadata reference (which points to the same table) stays live.
-	--
-	-- If we did `state.tab_metadata = fresh_meta` we would create a new table and
-	-- scratchbuf would keep the reference to the OLD empty table. typed_diff would
-	-- then find no metadata for any entry, renamed.meta would always be nil, and
-	-- on_save_tabs would see every line as matching an empty key (nil lookup) so
-	-- nothing would ever be detected as edited and nothing would navigate.
-	local function update_metadata(fresh_meta)
-		for k in pairs(state.tab_metadata) do
-			state.tab_metadata[k] = nil
-		end
-		for k, v in pairs(fresh_meta) do
-			state.tab_metadata[k] = v
-		end
-	end
-
 	local tab_lines, meta_init = tabops.build_tab_lines(tabs, state.show_chi_path)
-	update_metadata(meta_init)
+	state.tab_metadata = meta_init
 
 	-- Find the active tab line so scratchbuf can position the cursor on it
 	local active_line
@@ -184,7 +167,7 @@ function M.open()
 	local function restore_tabs(buf)
 		local fresh_tabs = tabops.fetch_tabs(state.tab_htmx)
 		local fresh_lines, fresh_meta = tabops.build_tab_lines(fresh_tabs, state.show_chi_path)
-		update_metadata(fresh_meta)
+		state.tab_metadata = fresh_meta
 		vim.bo[buf].modifiable = true
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, fresh_lines)
 		vim.bo[buf].filetype = "scratchbuf"
@@ -200,7 +183,7 @@ function M.open()
 		end
 		local fresh_tabs = tabops.fetch_tabs(state.tab_htmx)
 		local fresh_lines, fresh_meta = tabops.build_tab_lines(fresh_tabs, state.show_chi_path)
-		update_metadata(fresh_meta)
+		state.tab_metadata = fresh_meta
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, fresh_lines)
 		vim.bo[buf].modified = false
 	end
@@ -220,14 +203,13 @@ function M.open()
 		-- refresh: called by scratchbuf after on_save and on its auto-refresh
 		-- timer. Returns current lines unchanged when not in tabs view so the
 		-- active panel (html, console, etc.) is not silently overwritten.
-		-- Must use update_metadata (in-place) not reassignment.
 		refresh = function()
 			if state.view_mode ~= "tabs" and state.primary_buf and vim.api.nvim_buf_is_valid(state.primary_buf) then
 				return vim.api.nvim_buf_get_lines(state.primary_buf, 0, -1, false)
 			end
 			local fresh_tabs = tabops.fetch_tabs(state.tab_htmx)
 			local fresh_lines, fresh_meta = tabops.build_tab_lines(fresh_tabs, state.show_chi_path)
-			update_metadata(fresh_meta)
+			state.tab_metadata = fresh_meta
 			return fresh_lines
 		end,
 
