@@ -104,12 +104,22 @@ function M.fetch_tabs(tab_htmx)
 		session._tab_paths[t.id] = found
 	end
 
+	local views = require("browser.views")
 	local result = {}
 	for _, t in ipairs(tabs) do
+		local chi = session._tab_paths[t.id]
+		-- On first load tab_htmx is empty. Seed it from the saved test file
+		-- so that CR and t use the correct partial/full preference immediately.
+		if tab_htmx[t.id] == nil and chi then
+			local saved = views.load_test_for_path(chi)
+			if saved and saved.htmx ~= nil then
+				tab_htmx[t.id] = saved.htmx
+			end
+		end
 		table.insert(result, {
 			id = t.id,
 			path = t.path or t.id,
-			chi_path = session._tab_paths[t.id],
+			chi_path = chi,
 			active = t.active,
 			htmx = tab_htmx[t.id] or false,
 		})
@@ -265,13 +275,6 @@ end
 -- chi_path, switches to it instead of opening a duplicate.
 -- ============================================================
 function M.open_path(chi_path, buf, tab_metadata, do_buf_refresh_fn)
-	for _, meta in pairs(tab_metadata) do
-		if meta.chi_path == chi_path or util.path_matches_chi(meta.path, chi_path) then
-			send_cmd("switch " .. meta.tab_id)
-			vim.notify("browser: switched to existing tab -> " .. (meta.path or chi_path))
-			return
-		end
-	end
 	local views = require("browser.views")
 	local base = views.get_active_base()
 	local saved = views.load_test_for_path(chi_path)

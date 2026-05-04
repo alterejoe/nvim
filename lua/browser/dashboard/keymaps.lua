@@ -132,9 +132,21 @@ function M.register(buf, win, layout, state, opts)
 		end
 		if state.view_mode == "tabs" then
 			local meta = current_meta()
-			if meta then
-				tabops.navigate_tab(meta, meta.htmx or false, state.tab_htmx)
+			if not meta then
+				return
 			end
+			-- Read htmx from the test file as the authoritative source.
+			-- meta.htmx may not reflect the saved preference on first load
+			-- since tab_htmx starts empty each session.
+			local chi = meta.chi_path or tabops.infer_chi_path(meta)
+			local htmx = meta.htmx or false
+			if chi then
+				local saved = require("browser.views").load_test_for_path(chi)
+				if saved and saved.htmx ~= nil then
+					htmx = saved.htmx
+				end
+			end
+			tabops.navigate_tab(meta, htmx, state.tab_htmx)
 		end
 	end, "Open entry / open group")
 
