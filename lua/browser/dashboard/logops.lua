@@ -10,6 +10,15 @@ local function send_cmd(cmd)
 	return require("browser.session").send_cmd(cmd)
 end
 
+-- vim.json.decode turns JSON null into vim.NIL (userdata), which is truthy.
+-- Use this to safely test fields that may be null.
+local function nz(v)
+	if v == nil or v == vim.NIL then
+		return nil
+	end
+	return v
+end
+
 -- ============================================================
 -- build_console_lines
 -- Parses raw consolelog JSON into display lines.
@@ -19,8 +28,8 @@ function M.build_console_lines(raw)
 	local ok, entries = pcall(vim.json.decode, raw)
 	if ok and type(entries) == "table" then
 		for _, entry in ipairs(entries) do
-			local level = (entry.level or entry.type or "log"):upper()
-			local msg = entry.message or entry.text or vim.inspect(entry):gsub("[\r\n]+", " ")
+			local level = (nz(entry.level) or nz(entry.type) or "log"):upper()
+			local msg = nz(entry.message) or nz(entry.text) or vim.inspect(entry):gsub("[\r\n]+", " ")
 			msg = tostring(msg):gsub("[\r\n]+", " ")
 			table.insert(lines, string.format("[%s] %s", level, msg))
 		end
@@ -49,13 +58,14 @@ function M.build_net_lines(raw, state)
 	local ok, entries = pcall(vim.json.decode, raw)
 	if ok and type(entries) == "table" then
 		for _, entry in ipairs(entries) do
-			local method = entry.method or "?"
-			local url = entry.url or "?"
+			local method = nz(entry.method) or "?"
+			local url = nz(entry.url) or "?"
 			local path = url:match("https?://[^/]+(/[^%s]*)") or url
-			local status = entry.status or ""
+			local status = nz(entry.status) or ""
 			local ct = ""
-			if entry.res_headers then
-				ct = entry.res_headers["Content-Type"] or entry.res_headers["content-type"] or ""
+			local rh = nz(entry.res_headers)
+			if rh then
+				ct = rh["Content-Type"] or rh["content-type"] or ""
 				ct = ct:match("^([^;]+)") or ct
 			end
 			local s = status ~= "" and ("[" .. status .. "] ") or ""
@@ -88,11 +98,14 @@ function M.build_net_preview(entry, show_response)
 	local lines = {}
 
 	if show_response then
-		table.insert(lines, "HTTP/1.1 " .. s(entry.status or "?"))
-		for k, v in pairs(entry.res_headers or {}) do
-			table.insert(lines, s(k) .. ": " .. s(v))
+		table.insert(lines, "HTTP/1.1 " .. s(nz(entry.status) or "?"))
+		local rh = nz(entry.res_headers)
+		if rh then
+			for k, v in pairs(rh) do
+				table.insert(lines, s(k) .. ": " .. s(v))
+			end
 		end
-		local body = entry.res_body or ""
+		local body = nz(entry.res_body) or ""
 		if body ~= "" then
 			table.insert(lines, "")
 			local ok, decoded = pcall(vim.json.decode, body)
@@ -103,20 +116,23 @@ function M.build_net_preview(entry, show_response)
 			end
 		end
 	else
-		local method = s(entry.method or "GET")
-		local url = s(entry.url or "")
+		local method = s(nz(entry.method) or "GET")
+		local url = s(nz(entry.url) or "")
 		local path = url:match("https?://[^/]+(/[^%s]*)") or url
 		local host = url:match("https?://([^/]+)") or ""
 		table.insert(lines, method .. " " .. path .. " HTTP/1.1")
 		if host ~= "" then
 			table.insert(lines, "Host: " .. host)
 		end
-		for k, v in pairs(entry.req_headers or {}) do
-			if k:lower() ~= "host" then
-				table.insert(lines, s(k) .. ": " .. s(v))
+		local qh = nz(entry.req_headers)
+		if qh then
+			for k, v in pairs(qh) do
+				if k:lower() ~= "host" then
+					table.insert(lines, s(k) .. ": " .. s(v))
+				end
 			end
 		end
-		local body = entry.req_body or ""
+		local body = nz(entry.req_body) or ""
 		if body ~= "" then
 			table.insert(lines, "")
 			for _, l in ipairs(vim.split(body, "\n", { plain = true })) do

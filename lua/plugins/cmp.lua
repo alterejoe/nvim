@@ -44,7 +44,16 @@ return {
 					["<C-f>"] = cmp.mapping.scroll_docs(4),
 					["<C-space>"] = cmp.mapping.complete(),
 					["<Esc>"] = cmp.mapping.abort(),
-					["<Tab>"] = cmp.mapping.confirm({ select = true }),
+					["<Tab>"] = cmp.mapping(function(fallback)
+						local visible = cmp.visible()
+						local entry = cmp.get_selected_entry()
+						vim.notify(string.format("Tab: visible=%s entry=%s", tostring(visible), tostring(entry ~= nil)))
+						if visible and entry then
+							cmp.confirm({ select = false })
+						else
+							fallback()
+						end
+					end, { "i", "s" }),
 					["<C-n>"] = cmp.mapping.select_next_item({ behavior = cmp.SelectBehavior.Insert }),
 					["<C-p>"] = cmp.mapping.select_prev_item({ behavior = cmp.SelectBehavior.Insert }),
 				}),

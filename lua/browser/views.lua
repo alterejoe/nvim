@@ -95,17 +95,32 @@ local function find_project_root()
 	return vim.fn.getcwd()
 end
 
+-- vim.json.decode produces vim.NIL for null. Strip vim.NIL values from a map
+-- and skip the "query" sub-table since it isn't a path param.
+local function clean_param_map(t)
+	if type(t) ~= "table" then
+		return {}
+	end
+	local out = {}
+	for k, v in pairs(t) do
+		if k ~= "query" and v ~= nil and v ~= vim.NIL then
+			out[k] = tostring(v)
+		end
+	end
+	return out
+end
+
 -- Returns merged params for the active context: defaults < contexts.<ctx>
 local function active_params()
 	ensure_context_loaded()
 	local cfg = get_config()
 	local params = {}
-	for k, v in pairs(cfg.defaults) do
-		params[k] = tostring(v)
+	for k, v in pairs(clean_param_map(cfg.defaults)) do
+		params[k] = v
 	end
 	local ctx = cfg.contexts[_context] or {}
-	for k, v in pairs(ctx) do
-		params[k] = tostring(v)
+	for k, v in pairs(clean_param_map(ctx)) do
+		params[k] = v
 	end
 	return params
 end
@@ -114,14 +129,95 @@ end
 local function params_for_context(ctx_name)
 	local cfg = get_config()
 	local params = {}
-	for k, v in pairs(cfg.defaults) do
-		params[k] = tostring(v)
+	for k, v in pairs(clean_param_map(cfg.defaults)) do
+		params[k] = v
 	end
 	local ctx = cfg.contexts[ctx_name] or {}
-	for k, v in pairs(ctx) do
-		params[k] = tostring(v)
+	for k, v in pairs(clean_param_map(ctx)) do
+		params[k] = v
 	end
 	return params
+end
+
+-- ------------------------------------------------------------
+-- Centralized query params (per-context, per-route)
+-- Storage: contexts.<ctx>.query.<chi_path> = { key = val, ... }
+-- ------------------------------------------------------------
+
+-- Returns map of query params for a chi_path under a named context.
+-- Returns {} when none configured.
+local function query_for_route(ctx_name, chi_path)
+	if not chi_path or chi_path == "" then
+		return {}
+	end
+	local cfg = get_config()
+	local ctx = cfg.contexts[ctx_name]
+	if type(ctx) ~= "table" then
+		return {}
+	end
+	local q = ctx.query
+	if type(q) ~= "table" or q == vim.NIL then
+		return {}
+	end
+	local route_q = q[chi_path]
+	if type(route_q) ~= "table" or route_q == vim.NIL then
+		return {}
+	end
+	local out = {}
+	for k, v in pairs(route_q) do
+		if v ~= nil and v ~= vim.NIL then
+			out[tostring(k)] = tostring(v)
+		end
+	end
+	return out
+end
+
+-- Builds "?k=v&k=v" from a params map. Keys sorted for stability.
+-- Returns "" when empty. Values are not URL-encoded; they are passed through
+-- as the user wrote them (matches existing behavior of saved.qp).
+local function build_query_string(params)
+	if type(params) ~= "table" then
+		return ""
+	end
+	local keys = {}
+	for k in pairs(params) do
+		table.insert(keys, k)
+	end
+	if #keys == 0 then
+		return ""
+	end
+	table.sort(keys)
+	local parts = {}
+	for _, k in ipairs(keys) do
+		local v = params[k]
+		if v ~= nil and v ~= "" then
+			table.insert(parts, k .. "=" .. tostring(v))
+		end
+	end
+	if #parts == 0 then
+		return ""
+	end
+	return "?" .. table.concat(parts, "&")
+end
+
+-- Returns a "?k={k}&k={k}" string for templated-mode display.
+local function build_query_template(params)
+	if type(params) ~= "table" then
+		return ""
+	end
+	local keys = {}
+	for k in pairs(params) do
+		table.insert(keys, k)
+	end
+	if #keys == 0 then
+		return ""
+	end
+	table.sort(keys)
+	local parts = {}
+	for _, k in ipairs(keys) do
+		table.insert(parts, k .. "={" .. k .. "}")
+	end
+	return "?" .. table.concat(parts, "&")
 end
 
 -- Resolve a chi_path template using the active context params.
@@ -247,8 +343,9 @@ end
 
 -- ------------------------------------------------------------
 -- Test file lookup
--- Test files store ONLY endpoint-specific data: query: and htmx:
--- Path is ALWAYS resolved from chi_path + active context at navigate time.
+-- Test files store ONLY htmx:.
+-- Path is resolved from chi_path + active context at navigate time.
+-- Query params come from contexts.<ctx>.query.<chi_path> in config.yaml.
 -- ------------------------------------------------------------
 local function test_file_path(chi_path, ctx_name)
 	chi_path = normalize_chi_path(chi_path)
@@ -263,37 +360,35 @@ end
 
 local function load_test_for_path(chi_path)
 	ensure_context_loaded()
+	chi_path = normalize_chi_path(chi_path)
 	local fpath = test_file_path(chi_path, _context)
-	if vim.fn.filereadable(fpath) == 0 then
-		return nil
-	end
-	local f = io.open(fpath, "r")
-	if not f then
-		return nil
-	end
-	local qp = ""
 	local htmx_val = nil
-	for line in f:lines() do
-		local label, val = line:match("^([%w%.%-_]+):%s*(.*)")
-		if label then
-			local low = label:lower()
-			if low == "query" then
-				qp = vim.trim(val)
+	local f = io.open(fpath, "r")
+	if f then
+		for line in f:lines() do
+			local label, val = line:match("^([%w%.%-_]+):%s*(.*)")
+			if label then
+				local low = label:lower()
+				if low == "htmx" then
+					htmx_val = vim.trim(val) == "true"
+				end
+				-- "path" and "query" are intentionally ignored.
 			end
-			if low == "htmx" then
-				htmx_val = vim.trim(val) == "true"
-			end
-			-- "path" intentionally ignored - always resolved from chi_path + context
 		end
+		f:close()
 	end
-	f:close()
+	-- qp now comes from config, not the test file.
+	-- Strip the leading "?" so existing callers that prefix "?" themselves
+	-- still produce a single "?" - matches the previous saved.qp shape.
+	local qp_str = build_query_string(query_for_route(_context, chi_path))
+	local qp = qp_str:gsub("^%?", "")
 	return { qp = qp, htmx = htmx_val }
 end
 
 -- ------------------------------------------------------------
 -- Navigation
 -- Always resolves path from chi_path + active context.
--- Test file provides query params and htmx preference only.
+-- Test file provides htmx preference. Query params come from config.
 -- ------------------------------------------------------------
 M._last_nav = nil
 
@@ -304,8 +399,8 @@ local function do_navigate(chi_path, htmx)
 		vim.notify("browser: unresolved params in " .. chi_path, vim.log.levels.WARN)
 		return
 	end
-	local saved = load_test_for_path(chi_path)
-	local qp = (saved and saved.qp ~= "" and ("?" .. saved.qp)) or ""
+	ensure_context_loaded()
+	local qp = build_query_string(query_for_route(_context, chi_path))
 	M._last_nav = {
 		chi_path = chi_path,
 		resolved = path,
@@ -493,27 +588,21 @@ function M.pick()
 	local routes = get_routes()
 	local items = {}
 	for _, v in ipairs(views) do
-		table.insert(
-			items,
-			{
-				display = string.format("[view]  %-30s  %s", v.name, v.layout or ""),
-				ordinal = v.name,
-				kind = "view",
-				name = v.name,
-			}
-		)
+		table.insert(items, {
+			display = string.format("[view]  %-30s  %s", v.name, v.layout or ""),
+			ordinal = v.name,
+			kind = "view",
+			name = v.name,
+		})
 	end
 	for _, r in ipairs(routes) do
-		table.insert(
-			items,
-			{
-				display = string.format("[route] %-30s  %s", r.chi_path, r.handler or ""),
-				ordinal = r.chi_path,
-				kind = "route",
-				chi_path = r.chi_path,
-				output = r.output,
-			}
-		)
+		table.insert(items, {
+			display = string.format("[route] %-30s  %s", r.chi_path, r.handler or ""),
+			ordinal = r.chi_path,
+			kind = "route",
+			chi_path = r.chi_path,
+			output = r.output,
+		})
 	end
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
@@ -569,8 +658,8 @@ function M.pick()
 					local item = sel.value
 					if item.kind == "route" then
 						local path = resolve_path(item.chi_path)
-						local saved = load_test_for_path(item.chi_path)
-						local qp = saved and (saved.qp ~= "" and ("?" .. saved.qp)) or ""
+						ensure_context_loaded()
+						local qp = build_query_string(query_for_route(_context, item.chi_path))
 						local url = get_active_base() .. path .. qp
 						send_cmd("open " .. url)
 						vim.notify("browser: new tab (full) -> " .. url)
@@ -585,8 +674,8 @@ function M.pick()
 					local item = sel.value
 					if item.kind == "route" then
 						local path = resolve_path(item.chi_path)
-						local saved = load_test_for_path(item.chi_path)
-						local qp = saved and (saved.qp ~= "" and ("?" .. saved.qp)) or ""
+						ensure_context_loaded()
+						local qp = build_query_string(query_for_route(_context, item.chi_path))
 						local url = get_active_base() .. path .. qp
 						send_cmd("open " .. url)
 						vim.defer_fn(function()
@@ -754,7 +843,9 @@ function M.context_pick()
 		local active = name == _context and " [active]" or ""
 		local preview = {}
 		for k, v in pairs(vals) do
-			table.insert(preview, k .. "=" .. tostring(v))
+			if k ~= "query" and v ~= vim.NIL then
+				table.insert(preview, k .. "=" .. tostring(v))
+			end
 		end
 		table.insert(contexts, {
 			name = name,
@@ -812,8 +903,9 @@ function M.open_in_tab(chi_path)
 	if not path then
 		return nil
 	end
+	ensure_context_loaded()
+	local qp = build_query_string(query_for_route(_context, chi_path))
 	local saved = load_test_for_path(chi_path)
-	local qp = saved and (saved.qp ~= "" and ("?" .. saved.qp)) or ""
 	local port = (send_cmd("active-server") or ""):match("port (%d+)") or "3333"
 	local url = "http://localhost:" .. port .. path .. qp
 	send_cmd("open " .. url)
@@ -855,6 +947,15 @@ function M.params_for_context(ctx_name)
 end
 function M.normalize_chi_path(chi_path)
 	return normalize_chi_path(chi_path)
+end
+function M.query_for_route(ctx_name, chi_path)
+	return query_for_route(ctx_name, chi_path)
+end
+function M.build_query_string(params)
+	return build_query_string(params)
+end
+function M.build_query_template(params)
+	return build_query_template(params)
 end
 M.get_config = get_config
 

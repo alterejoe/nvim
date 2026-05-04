@@ -1,6 +1,11 @@
 -- browser/dashboard/tabops.lua
 -- Tab list operations: fetch, build, navigate, on_save.
 -- All functions that require per-open state accept a `state` table.
+--
+-- Query params are central: contexts.<ctx>.query.<chi_path>.<key> in config.yaml.
+-- Inline editing of "?key=val&..." on a tab line writes those keys into config
+-- for that route. Resolved-mode display shows "?key=value&..." from config.
+-- Templated-mode display shows "?key={key}&..." for the same keys.
 
 local M = {}
 
@@ -31,15 +36,16 @@ function M.load_tags()
 	return result
 end
 
-function M.save_tags(tags)
+function M.save_tags(tags, order)
 	local path = tags_path()
-	local names = {}
-	for name in pairs(tags) do
-		table.insert(names, name)
-	end
-	table.sort(names)
+	require("browser.groups_history").snapshot(path)
+
+	local yaml_order = require("browser.yaml_order")
+	local existing = yaml_order.read_top_level_order(path, "tags")
+	local final_order = yaml_order.resolve_order(order, tags, existing)
+
 	local lines = { "tags:" }
-	for _, name in ipairs(names) do
+	for _, name in ipairs(final_order) do
 		table.insert(lines, "  " .. name .. ":")
 		for _, p in ipairs(tags[name] or {}) do
 			table.insert(lines, "    - " .. p)
@@ -108,6 +114,7 @@ end
 function M.save_headings(headings)
 	-- headings: { order=[names], patterns={name=[globs]} }
 	local path = headings_path()
+	require("browser.groups_history").snapshot(path)
 	local lines = { "headings:" }
 	for _, name in ipairs(headings.order) do
 		table.insert(lines, "  - name: " .. name)
@@ -189,6 +196,9 @@ end
 -- make_content
 -- Builds the display string for a tab line (without GET prefix).
 -- htmx preference comes from the saved test file when available.
+-- Includes a query string suffix derived from contexts.<ctx>.query.<chi>:
+--   * resolved view  -> ?key=value&...
+--   * templated view -> ?key={key}&...
 -- ============================================================
 function M.make_content(t, show_chi_path, tag_names)
 	local short_id = t.id:sub(1, 8)
@@ -202,7 +212,30 @@ function M.make_content(t, show_chi_path, tag_names)
 	end
 	local htmx_ann = is_partial and "  [partial]" or ""
 	local raw_path = t.path:gsub("%%7B", "{"):gsub("%%7D", "}")
-	local display_path = (show_chi_path and chi) or raw_path
+
+	-- Build query suffix from config (per-route, per-context).
+	local q_suffix = ""
+	if chi then
+		local views = require("browser.views")
+		local q_map = views.query_for_route(views.get_active_context(), chi)
+		if next(q_map) then
+			if show_chi_path then
+				q_suffix = views.build_query_template(q_map)
+			else
+				q_suffix = views.build_query_string(q_map)
+			end
+		end
+	end
+
+	-- Strip any query string already on raw_path so we don't duplicate.
+	local raw_path_no_q = raw_path:match("^([^?]+)") or raw_path
+	local display_path
+	if show_chi_path and chi then
+		display_path = chi .. q_suffix
+	else
+		display_path = raw_path_no_q .. q_suffix
+	end
+
 	local tag_ann = ""
 	if tag_names then
 		local sorted = {}
@@ -214,7 +247,7 @@ function M.make_content(t, show_chi_path, tag_names)
 			tag_ann = tag_ann .. "  [" .. tn .. "]"
 		end
 	end
-	return (display_path or raw_path) .. "  [" .. short_id .. "]" .. htmx_ann .. tag_ann
+	return display_path .. "  [" .. short_id .. "]" .. htmx_ann .. tag_ann
 end
 
 -- ============================================================
@@ -235,10 +268,6 @@ function M.fetch_tabs(tab_htmx)
 	local routes = require("browser.views").get_routes()
 	local gchi = groups_chi_list()
 
-	-- Always re-infer chi_path from the current tab URL on every sync.
-	-- Checks routes (plan.json) first, then groups.yaml as fallback.
-	-- Groups are the user's explicit source of truth and cover paths that
-	-- plan.json may omit or name differently.
 	for _, t in ipairs(tabs) do
 		local path = t.path or t.id
 		local decoded = path:gsub("%%7B", "{"):gsub("%%7D", "}")
@@ -264,8 +293,6 @@ function M.fetch_tabs(tab_htmx)
 	local result = {}
 	for _, t in ipairs(tabs) do
 		local chi = session._tab_paths[t.id]
-		-- On first load tab_htmx is empty. Seed from the saved test file so
-		-- that CR and t use the correct partial/full preference immediately.
 		if tab_htmx[t.id] == nil and chi then
 			local saved = views.load_test_for_path(chi)
 			if saved and saved.htmx ~= nil then
@@ -285,10 +312,7 @@ end
 
 -- ============================================================
 -- build_tab_lines
--- Builds display lines sorted under group headers.
--- A tab can appear under multiple group headers simultaneously.
--- Tags are shown as annotations [tagname] on each line.
--- Returns: lines (list), metadata (content_key -> meta).
+-- (unchanged behavior - emits via make_content which now appends qs)
 -- ============================================================
 function M.build_tab_lines(tabs, show_chi_path)
 	local groups = require("browser.groups").load_groups()
@@ -300,7 +324,6 @@ function M.build_tab_lines(tabs, show_chi_path)
 	end
 	table.sort(group_names)
 
-	-- Map each tab to ALL groups it belongs to (by chi_path or URL pattern match)
 	local tab_to_groups = {}
 	for _, name in ipairs(group_names) do
 		local chi_paths = type(groups[name]) == "table" and groups[name] or {}
@@ -330,7 +353,6 @@ function M.build_tab_lines(tabs, show_chi_path)
 		end
 	end
 
-	-- Load tags for annotations
 	local all_tags = M.load_tags()
 	local tab_to_tags = {}
 	for tag_name, chi_paths in pairs(all_tags) do
@@ -377,6 +399,7 @@ function M.build_tab_lines(tabs, show_chi_path)
 
 	local lines = {}
 	local meta = {}
+	local counts = {}
 
 	local function emit(t)
 		local tag_names = get_tag_names(t.id)
@@ -389,10 +412,9 @@ function M.build_tab_lines(tabs, show_chi_path)
 			htmx = t.htmx,
 			active = t.active,
 		}
+		counts[t.id] = (counts[t.id] or 0) + 1
 	end
 
-	-- Emit tabs for a set of tabs under the current heading scope.
-	-- Organises them by group, then any ungrouped ones at the end.
 	local function emit_under_heading(heading_tabs)
 		local seen_in_heading = {}
 		for _, name in ipairs(group_names) do
@@ -413,7 +435,6 @@ function M.build_tab_lines(tabs, show_chi_path)
 				end
 			end
 		end
-		-- Ungrouped tabs under this heading
 		local ungrouped_h = {}
 		for _, t in ipairs(heading_tabs) do
 			if not seen_in_heading[t.id] then
@@ -431,8 +452,6 @@ function M.build_tab_lines(tabs, show_chi_path)
 		end
 	end
 
-	-- Process headings: each tab appears under the FIRST heading whose
-	-- glob patterns match its path.
 	local seen_tab_ids = {}
 	for _, hname in ipairs(headings.order) do
 		local pats = headings.patterns[hname] or {}
@@ -451,7 +470,6 @@ function M.build_tab_lines(tabs, show_chi_path)
 		end
 	end
 
-	-- Tabs not matching any heading appear under ### Other
 	local remaining = {}
 	for _, t in ipairs(tabs) do
 		if not seen_tab_ids[t.id] then
@@ -501,12 +519,13 @@ function M.build_tab_lines(tabs, show_chi_path)
 		end
 	end
 
-	return lines, meta
+	return lines, meta, counts
 end
 
 -- ============================================================
 -- navigate_tab
--- Switches to a tab and navigates it using the active context params.
+-- Switches to a tab and navigates it using the active context params
+-- and the per-route central query params.
 -- ============================================================
 function M.navigate_tab(meta, htmx, tab_htmx)
 	if not meta then
@@ -530,8 +549,7 @@ function M.navigate_tab(meta, htmx, tab_htmx)
 			vim.notify("browser: unresolved params in " .. chi, vim.log.levels.WARN)
 			return
 		end
-		local saved = views.load_test_for_path(chi)
-		local qp = (saved and saved.qp ~= "" and ("?" .. saved.qp)) or ""
+		local qp = views.build_query_string(views.query_for_route(views.get_active_context(), chi))
 		local base = views.get_active_base()
 		local cmd = htmx and "navigate" or "navigate-full"
 		send_cmd(cmd .. " " .. base .. resolved .. qp)
@@ -545,14 +563,13 @@ end
 
 -- ============================================================
 -- open_path
--- Always opens a new tab. Tab management is manual via dd+W.
+-- Always opens a new tab.
 -- ============================================================
 function M.open_path(chi_path, buf, tab_metadata, do_buf_refresh_fn)
 	local views = require("browser.views")
 	local base = views.get_active_base()
-	local saved = views.load_test_for_path(chi_path)
 	local path = views.resolve_path(chi_path)
-	local qp = (saved and saved.qp ~= "" and ("?" .. saved.qp)) or ""
+	local qp = views.build_query_string(views.query_for_route(views.get_active_context(), chi_path))
 	send_cmd("open " .. base .. path .. qp)
 	vim.notify("browser: opened tab -> " .. path)
 	vim.defer_fn(function()
@@ -560,6 +577,45 @@ function M.open_path(chi_path, buf, tab_metadata, do_buf_refresh_fn)
 			do_buf_refresh_fn(buf)
 		end
 	end, 600)
+end
+
+-- ============================================================
+-- yq helpers (local to on_save_tabs)
+-- ============================================================
+local function yq_quote_path(s)
+	return '"' .. s:gsub('"', '\\"') .. '"'
+end
+
+local function yq_set_string(yaml_path, dotted_path, value)
+	local v = tostring(value):gsub('"', '\\"')
+	vim.fn.system(
+		string.format(
+			"yq -i '%s = \"%s\"' %s 2>/dev/null",
+			dotted_path,
+			v,
+			vim.fn.shellescape(yaml_path)
+		)
+	)
+	return vim.v.shell_error == 0
+end
+
+-- ============================================================
+-- Parse "?k=v&k=v" into a map. Returns {} on empty.
+-- ============================================================
+local function parse_query_string(qs)
+	local out = {}
+	if not qs or qs == "" then
+		return out
+	end
+	-- strip leading "?"
+	qs = qs:gsub("^%?", "")
+	for pair in qs:gmatch("[^&]+") do
+		local k, v = pair:match("^([^=]+)=(.*)$")
+		if k and k ~= "" then
+			out[k] = v or ""
+		end
+	end
+	return out
 end
 
 -- ============================================================
@@ -580,7 +636,16 @@ function M.on_save_tabs(state)
 		short_to_meta[m.tab_id:sub(1, 8):upper()] = m
 	end
 
-	local present_ids = {}
+	-- before_counts comes from state.tab_counts which is populated by
+	-- build_tab_lines at render time. It accurately reflects how many display
+	-- lines each tab_id had before the user edited the buffer, including
+	-- duplicates from multi-group tabs (where state.tab_metadata collapses
+	-- duplicates because it's keyed by content string).
+	-- after_counts is built below from the edited buffer.
+	local before_counts = state.tab_counts or {}
+	local after_counts = {}
+
+	-- edited_tabs[tab_id] = { path = "...", query = "k=v&...", chi_path = "...", htmx = bool }
 	local edited_tabs = {}
 
 	for _, line in ipairs(buf_lines) do
@@ -593,21 +658,26 @@ function M.on_save_tabs(state)
 		if short then
 			local m = short_to_meta[short:upper()]
 			if m then
-				present_ids[m.tab_id] = true
+				after_counts[m.tab_id] = (after_counts[m.tab_id] or 0) + 1
 				local content = util.strip_prefix(trimmed)
 				if not state.tab_metadata[content] then
+					-- Strip trailing annotations to isolate path-with-optional-query.
 					local p = content
 						:gsub("^%u+%s+", "")
 						:gsub("%s+%[[%x]+%].*$", "")
 						:gsub("%s+%[partial%].*$", "")
 						:gsub("%s+%[full%].*$", "")
-						:gsub("%s+%[%a[%a%d%-_]*%].*$", "") -- strip tag annotations
+						:gsub("%s+%[%a[%a%d%-_]*%].*$", "")
 					p = vim.trim(p)
 					if p ~= "" and p:sub(1, 1) == "/" then
+						-- Split path and query.
+						local path_only = p:match("^([^?]+)") or p
+						local query_str = p:match("%?(.*)$") or ""
+
 						local chi = m.chi_path
 						if not chi then
 							for _, r in ipairs(routes_ref) do
-								if r.chi_path and util.path_matches_chi(p, r.chi_path) then
+								if r.chi_path and util.path_matches_chi(path_only, r.chi_path) then
 									chi = r.chi_path
 									break
 								end
@@ -615,20 +685,25 @@ function M.on_save_tabs(state)
 						end
 						if not chi then
 							for _, cp in ipairs(groups_chi_ref) do
-								if util.path_matches_chi(p, cp) then
+								if util.path_matches_chi(path_only, cp) then
 									chi = cp
 									break
 								end
 							end
 						end
-						edited_tabs[m.tab_id] = { path = p, chi_path = chi, htmx = m.htmx or false }
+						edited_tabs[m.tab_id] = {
+							path = path_only,
+							query = query_str,
+							chi_path = chi,
+							htmx = m.htmx or false,
+						}
 					end
 				end
 			end
 		else
 			local meta = state.tab_metadata[util.strip_prefix(trimmed)]
 			if meta then
-				present_ids[meta.tab_id] = true
+				after_counts[meta.tab_id] = (after_counts[meta.tab_id] or 0) + 1
 			end
 		end
 		::scan_next::
@@ -638,16 +713,26 @@ function M.on_save_tabs(state)
 	local had_param_changes = false
 	local closed_count = 0
 	local total_count = 0
+	-- Track which tab_ids we've already closed so duplicate metadata entries
+	-- don't fire close-tab twice for the same id.
+	local closed_ids = {}
 
 	for _, meta in pairs(state.tab_metadata) do
 		total_count = total_count + 1
-		if not present_ids[meta.tab_id] then
+		if closed_ids[meta.tab_id] then
+			goto next_close
+		end
+		-- Delete-one-deletes-all: if the edited buffer has fewer (or zero)
+		-- references to this tab than before, close it.
+		if (after_counts[meta.tab_id] or 0) < (before_counts[meta.tab_id] or 0) then
 			send_cmd("close-tab " .. meta.tab_id)
 			state.tab_htmx[meta.tab_id] = nil
 			vim.notify("browser: closed " .. meta.path)
 			needs_refresh = true
 			closed_count = closed_count + 1
+			closed_ids[meta.tab_id] = true
 		end
+		::next_close::
 	end
 
 	if closed_count > 0 and closed_count >= total_count then
@@ -663,12 +748,15 @@ function M.on_save_tabs(state)
 		local ctx = views.get_active_context()
 		local ctx_key = ctx == "" and "default" or ctx
 		local yaml_path = session.DEVPROXY_DIR .. "/config.yaml"
-		local params_changed = {}
+		local yaml_ok = vim.fn.filereadable(yaml_path) == 1
+		local path_params_changed = {}
+		local query_params_by_chi = {} -- chi_path -> { key = val }
 
 		for _, info in pairs(edited_tabs) do
 			if not info.chi_path then
 				goto skip_params
 			end
+			-- Path params from the path-portion only.
 			local chi_s = util.segs(info.chi_path)
 			local res_s = util.segs(info.path)
 			if #chi_s == #res_s then
@@ -677,72 +765,115 @@ function M.on_save_tabs(state)
 						local pname = c:match("{(.+)}")
 						local val = res_s[i]
 						if pname and val and val ~= "" and not val:find("{") and not val:match("%%7[Bb]") then
-							params_changed[pname] = val
+							path_params_changed[pname] = val
 						end
 					end
 				end
 			end
+			-- Query params for this route. Treat the edited query string as the
+			-- full new value for this route - missing keys mean "remove".
+			query_params_by_chi[info.chi_path] = parse_query_string(info.query)
 			::skip_params::
 		end
 
-		if next(params_changed) then
-			if vim.fn.filereadable(yaml_path) == 1 then
-				for k, v in pairs(params_changed) do
-					vim.fn.system(
-						string.format(
-							"yq -i '.contexts.%s.%s = \"%s\"' %s 2>/dev/null",
-							ctx_key,
-							k,
-							v:gsub('"', '\\"'),
-							vim.fn.shellescape(yaml_path)
-						)
+		if not yaml_ok then
+			vim.notify("browser: config.yaml not found - params not saved", vim.log.levels.WARN)
+		end
+
+		-- Write path params.
+		if yaml_ok and next(path_params_changed) then
+			for k, v in pairs(path_params_changed) do
+				local dotted = string.format(".contexts.%s.%s", ctx_key, k)
+				if not yq_set_string(yaml_path, dotted, v) then
+					vim.notify("browser: yq write failed for " .. k, vim.log.levels.WARN)
+				end
+			end
+			had_param_changes = true
+		end
+
+		-- Write query params per route. Replace the route's query block whole
+		-- so that removing "?contestID=..." from a tab line removes it from config.
+		-- We can't naively `del` then write because users may edit several tabs
+		-- on the same chi_path; merge them first (last write wins per duplicate).
+		if yaml_ok then
+			local merged_query_by_chi = {}
+			for chi_path, qmap in pairs(query_params_by_chi) do
+				merged_query_by_chi[chi_path] = merged_query_by_chi[chi_path] or {}
+				for k, v in pairs(qmap) do
+					merged_query_by_chi[chi_path][k] = v
+				end
+			end
+			for chi_path, qmap in pairs(merged_query_by_chi) do
+				local route_path = string.format(
+					".contexts.%s.query[%s]",
+					ctx_key,
+					yq_quote_path(chi_path)
+				)
+				vim.fn.system(
+					string.format(
+						"yq -i 'del(%s)' %s 2>/dev/null",
+						route_path,
+						vim.fn.shellescape(yaml_path)
 					)
-					if vim.v.shell_error ~= 0 then
-						vim.notify("browser: yq write failed for " .. k, vim.log.levels.WARN)
+				)
+				for k, v in pairs(qmap) do
+					local dotted = string.format(
+						".contexts.%s.query[%s].%s",
+						ctx_key,
+						yq_quote_path(chi_path),
+						k
+					)
+					if not yq_set_string(yaml_path, dotted, v) then
+						vim.notify("browser: yq query write failed for " .. k, vim.log.levels.WARN)
 					end
 				end
-				views.reload_config_silent()
 				had_param_changes = true
-			else
-				vim.notify("browser: config.yaml not found - params not saved", vim.log.levels.WARN)
 			end
+		end
 
-			local written = {}
-			for _, m in pairs(state.tab_metadata) do
-				local info = edited_tabs[m.tab_id]
-				if info and not written[info.chi_path] then
-					written[info.chi_path] = true
-					local fpath = views.test_file_path(info.chi_path, ctx)
-					vim.fn.mkdir(vim.fn.fnamemodify(fpath, ":h"), "p")
-					local wf = io.open(fpath, "w")
-					if wf then
-						wf:write("htmx: " .. tostring(m.htmx or false) .. "\n")
-						wf:close()
-					end
+		if had_param_changes then
+			views.reload_config_silent()
+		end
+
+		-- Persist htmx to test files for each edited tab's chi_path.
+		local written = {}
+		for _, m in pairs(state.tab_metadata) do
+			local info = edited_tabs[m.tab_id]
+			if info and info.chi_path and not written[info.chi_path] then
+				written[info.chi_path] = true
+				local fpath = views.test_file_path(info.chi_path, ctx)
+				vim.fn.mkdir(vim.fn.fnamemodify(fpath, ":h"), "p")
+				local wf = io.open(fpath, "w")
+				if wf then
+					wf:write("htmx: " .. tostring(m.htmx or false) .. "\n")
+					wf:close()
 				end
 			end
+		end
 
-			local base = views.get_active_base()
-			local existing = views.params_for_context(views.get_active_context())
-			local function resolve_direct(cp)
-				local result = cp
-				for param in cp:gmatch("{([^}]+)}") do
-					local v = params_changed[param]
-					if not v or v == "" or v:find("{") or v:match("%%7[Bb]") then
-						v = existing[param] or ""
-					end
-					if v ~= "" and not v:find("{") and not v:match("%%7[Bb]") then
-						result = result:gsub("{" .. vim.pesc(param) .. "}", v, 1)
-					end
+		-- Re-navigate other tabs that share any of the changed PATH params.
+		-- Query params are per-route; they don't fan out.
+		local base = views.get_active_base()
+		local existing = views.params_for_context(views.get_active_context())
+		local function resolve_direct(cp)
+			local result = cp
+			for param in cp:gmatch("{([^}]+)}") do
+				local v = path_params_changed[param]
+				if not v or v == "" or v:find("{") or v:match("%%7[Bb]") then
+					v = existing[param] or ""
 				end
-				return result
+				if v ~= "" and not v:find("{") and not v:match("%%7[Bb]") then
+					result = result:gsub("{" .. vim.pesc(param) .. "}", v, 1)
+				end
 			end
+			return result
+		end
 
+		if next(path_params_changed) then
 			local meta_snapshot = {}
 			for k, v in pairs(state.tab_metadata) do
 				meta_snapshot[k] = v
 			end
-
 			vim.schedule(function()
 				for _, m in pairs(meta_snapshot) do
 					if edited_tabs[m.tab_id] then
@@ -771,7 +902,7 @@ function M.on_save_tabs(state)
 					end
 					local should_nav = false
 					for param in chi:gmatch("{([^}]+)}") do
-						if params_changed[param] then
+						if path_params_changed[param] then
 							should_nav = true
 							break
 						end
@@ -781,7 +912,8 @@ function M.on_save_tabs(state)
 						if not nav:find("{") then
 							send_cmd("switch " .. m.tab_id)
 							local cmd = (m.htmx or false) and "navigate" or "navigate-full"
-							send_cmd(cmd .. " " .. base .. nav)
+							local q = views.build_query_string(views.query_for_route(ctx_key, chi))
+							send_cmd(cmd .. " " .. base .. nav .. q)
 						end
 					end
 					::nav_next::
@@ -792,12 +924,13 @@ function M.on_save_tabs(state)
 				string.format(
 					"browser: [%s] updated %s - re-navigating affected tabs",
 					ctx,
-					vim.inspect(params_changed):gsub('[{} "\n]', "")
+					vim.inspect(path_params_changed):gsub('[{} "\n]', "")
 				)
 			)
 		end
 
-		local base = require("browser.views").get_active_base()
+		-- Navigate the directly-edited tabs themselves (these may have changed
+		-- only their query, only path, or both).
 		local edited_nav = {}
 		for tab_id, info in pairs(edited_tabs) do
 			if not info.path:find("{") and not info.path:match("%%7[Bb]") then
@@ -810,13 +943,18 @@ function M.on_save_tabs(state)
 				for _, en in ipairs(edited_nav) do
 					send_cmd("switch " .. en.tab_id)
 					local cmd = en.info.htmx and "navigate" or "navigate-full"
-					send_cmd(cmd .. " " .. base .. en.info.path)
-					vim.notify("browser: " .. (en.info.htmx and "[partial]" or "[full]") .. " " .. en.info.path)
+					local q = ""
+					if en.info.chi_path then
+						q = views.build_query_string(views.query_for_route(ctx_key, en.info.chi_path))
+					end
+					send_cmd(cmd .. " " .. base .. en.info.path .. q)
+					vim.notify("browser: " .. (en.info.htmx and "[partial]" or "[full]") .. " " .. en.info.path .. q)
 				end
 			end)
 		end
 	end
 
+	-- Open new tabs from path-only lines (no [tabid]).
 	for _, line in ipairs(buf_lines) do
 		local trimmed = vim.trim(line)
 		if trimmed == "" or trimmed:sub(1, 2) == "##" then

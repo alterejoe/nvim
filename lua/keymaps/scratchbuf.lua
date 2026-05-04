@@ -3,7 +3,6 @@
 -- Edit lhs strings here to remap. scratchbuf.lua reads this at open time.
 -- which-key descriptions are registered buffer-locally when a scratchbuf opens.
 local M = {}
-
 M.keys = {
 	close = { "Q", "<Esc>" },
 	open = "<CR>",
@@ -14,11 +13,10 @@ M.keys = {
 	paste_above = "gP",
 	filter = "/",
 	save = "W",
-	focus_next = "<Tab>",
-	focus_prev = "<S-Tab>",
+	focus_next = "<C-Tab>",
+	focus_prev = "<C-S-Tab>",
 	refresh = "r",
 }
-
 function M.register_which_key(buf)
 	local ok, wk = pcall(require, "which-key")
 	if not ok then
@@ -41,5 +39,4 @@ function M.register_which_key(buf)
 		{ k.focus_prev, buffer = buf, desc = "Focus prev pane" },
 	})
 end
-
 return M

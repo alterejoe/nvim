@@ -527,6 +527,34 @@ function M.register(buf, win, layout, state, opts)
 	vim.keymap.set("n", "gz", open_group_editor, { buffer = buf, nowait = true, noremap = true, desc = "Group editor" })
 	table.insert(state.registered_keymaps, { lhs = "gz", fn = open_group_editor, desc = "Group editor" })
 
+	-- ============================================================
+	-- ADD THIS TO ~/.config/nvim/lua/browser/dashboard/keymaps.lua
+	-- Insert AFTER line 528 (the table.insert for the "gz" keymap)
+	-- and BEFORE the "+" map block (line 533)
+	-- ============================================================
+
+	-- --------------------------------------------------------
+	-- <leader>u: groups/headings/tags history picker (groups view only)
+	-- Outside groups mode, falls through to UndotreeToggle so the
+	-- global undotree binding still works everywhere else.
+	-- --------------------------------------------------------
+	local function leader_u()
+		if state.view_mode ~= "groups" then
+			vim.cmd.UndotreeToggle()
+			return
+		end
+		require("browser.groups_history").pick(function()
+			-- Re-open the group editor so the restored yaml is reflected.
+			open_group_editor()
+		end)
+	end
+	vim.keymap.set("n", "<leader>u", leader_u, {
+		buffer = buf,
+		nowait = true,
+		noremap = true,
+		desc = "Groups history (or undotree)",
+	})
+	table.insert(state.registered_keymaps, { lhs = "<leader>u", fn = leader_u, desc = "Groups history (or undotree)" })
 	-- --------------------------------------------------------
 	-- +: add current tab to a group
 	-- --------------------------------------------------------

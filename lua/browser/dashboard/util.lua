@@ -139,22 +139,27 @@ function M.format_html(raw)
 end
 
 -- ============================================================
--- parse_group_buf
--- Parses group editor buffer format into a groups table.
--- Lines starting with # begin a new group. Other non-empty lines
--- are chi_path entries for the current group.
+-- REPLACE function M.parse_group_buf in
+--   ~/.config/nvim/lua/browser/dashboard/util.lua
+-- (lines ~147-209) with this version. Adds group_order and
+-- tag_order to the returns. Headings already has its own order.
 -- ============================================================
+
 function M.parse_group_buf(lines)
-	-- ## heading   glob patterns below it define which tabs appear under it in the panel
-	-- #  group     chi_path templates for grouping tabs
-	-- ### tag      chi_path templates for tab annotations
-	-- Returns: groups, tags, headings
-	--   groups   = { name = [chi_paths] }
-	--   tags     = { name = [chi_paths] }
-	--   headings = { order = [names], patterns = { name = [globs] } }
+	-- ## heading   glob patterns below it define which tabs appear under it in the panel
+	-- #  group     chi_path templates for grouping tabs
+	-- ### tag      chi_path templates for tab annotations
+	-- Returns: groups, tags, headings, group_order, tag_order
+	--   groups      = { name = [chi_paths] }
+	--   tags        = { name = [chi_paths] }
+	--   headings    = { order = [names], patterns = { name = [globs] } }
+	--   group_order = [names]   -- buffer order of group definitions
+	--   tag_order   = [names]   -- buffer order of tag definitions
 	local groups = {}
 	local tags = {}
 	local headings = { order = {}, patterns = {} }
+	local group_order = {}
+	local tag_order = {}
 	local current = nil
 	local current_type = nil -- "group" | "tag" | "heading"
 
@@ -176,7 +181,10 @@ function M.parse_group_buf(lines)
 		if tag_name then
 			current = vim.trim(tag_name)
 			current_type = "tag"
-			tags[current] = tags[current] or {}
+			if not tags[current] then
+				tags[current] = {}
+				table.insert(tag_order, current)
+			end
 		elseif hdg_name then
 			hdg_name = vim.trim(hdg_name)
 			if hdg_name == "" then
@@ -191,7 +199,10 @@ function M.parse_group_buf(lines)
 		elseif grp_name then
 			current = vim.trim(grp_name)
 			current_type = "group"
-			groups[current] = groups[current] or {}
+			if not groups[current] then
+				groups[current] = {}
+				table.insert(group_order, current)
+			end
 		elseif current and vim.trim(line) ~= "" then
 			local path = strip_path(line)
 			if path ~= "" then
@@ -205,7 +216,7 @@ function M.parse_group_buf(lines)
 			end
 		end
 	end
-	return groups, tags, headings
+	return groups, tags, headings, group_order, tag_order
 end
 
 -- ============================================================

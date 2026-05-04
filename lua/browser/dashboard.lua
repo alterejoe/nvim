@@ -102,6 +102,12 @@ function M.open()
 		-- tab data
 		tab_htmx = {},
 		tab_metadata = {}, -- IMPORTANT: never replace this table; always mutate in-place
+		-- tab_counts: tab_id -> number of display lines emitted for that tab.
+		-- Mirrors tab_metadata's lifecycle but is keyed by tab_id (not content
+		-- string) so it accurately tracks duplicates across multi-group display.
+		-- Mutated in-place by update_metadata; on_save_tabs reads it as the
+		-- authoritative "before" count when deciding whether to close tabs.
+		tab_counts = {},
 		preview_tab_id = nil,
 		-- window handles (set in on_ready)
 		layout = nil,
@@ -154,17 +160,28 @@ function M.open()
 	-- then find no metadata for any entry, renamed.meta would always be nil, and
 	-- on_save_tabs would see every line as matching an empty key (nil lookup) so
 	-- nothing would ever be detected as edited and nothing would navigate.
-	local function update_metadata(fresh_meta)
+	--
+	-- Counts are mutated in place for the same reason: on_save_tabs holds a
+	-- reference to state.tab_counts and reads from it without re-fetching.
+	local function update_metadata(fresh_meta, fresh_counts)
 		for k in pairs(state.tab_metadata) do
 			state.tab_metadata[k] = nil
 		end
 		for k, v in pairs(fresh_meta) do
 			state.tab_metadata[k] = v
 		end
+		for k in pairs(state.tab_counts) do
+			state.tab_counts[k] = nil
+		end
+		if fresh_counts then
+			for k, v in pairs(fresh_counts) do
+				state.tab_counts[k] = v
+			end
+		end
 	end
 
-	local tab_lines, meta_init = tabops.build_tab_lines(tabs, state.show_chi_path)
-	update_metadata(meta_init)
+	local tab_lines, meta_init, counts_init = tabops.build_tab_lines(tabs, state.show_chi_path)
+	update_metadata(meta_init, counts_init)
 
 	-- Find the active tab line so scratchbuf can position the cursor on it
 	local active_line
@@ -183,8 +200,8 @@ function M.open()
 	-- restore_tabs: re-fetches tabs and resets the primary buffer to tabs view.
 	local function restore_tabs(buf)
 		local fresh_tabs = tabops.fetch_tabs(state.tab_htmx)
-		local fresh_lines, fresh_meta = tabops.build_tab_lines(fresh_tabs, state.show_chi_path)
-		update_metadata(fresh_meta)
+		local fresh_lines, fresh_meta, fresh_counts = tabops.build_tab_lines(fresh_tabs, state.show_chi_path)
+		update_metadata(fresh_meta, fresh_counts)
 		vim.bo[buf].modifiable = true
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, fresh_lines)
 		vim.bo[buf].filetype = "scratchbuf"
@@ -199,8 +216,8 @@ function M.open()
 			return
 		end
 		local fresh_tabs = tabops.fetch_tabs(state.tab_htmx)
-		local fresh_lines, fresh_meta = tabops.build_tab_lines(fresh_tabs, state.show_chi_path)
-		update_metadata(fresh_meta)
+		local fresh_lines, fresh_meta, fresh_counts = tabops.build_tab_lines(fresh_tabs, state.show_chi_path)
+		update_metadata(fresh_meta, fresh_counts)
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, fresh_lines)
 		vim.bo[buf].modified = false
 	end
@@ -226,8 +243,8 @@ function M.open()
 				return vim.api.nvim_buf_get_lines(state.primary_buf, 0, -1, false)
 			end
 			local fresh_tabs = tabops.fetch_tabs(state.tab_htmx)
-			local fresh_lines, fresh_meta = tabops.build_tab_lines(fresh_tabs, state.show_chi_path)
-			update_metadata(fresh_meta)
+			local fresh_lines, fresh_meta, fresh_counts = tabops.build_tab_lines(fresh_tabs, state.show_chi_path)
+			update_metadata(fresh_meta, fresh_counts)
 			return fresh_lines
 		end,
 
@@ -240,9 +257,9 @@ function M.open()
 					return true
 				end
 				local all_lines = vim.api.nvim_buf_get_lines(state.primary_buf, 0, -1, false)
-				local groups, tags, headings = util.parse_group_buf(all_lines)
-				require("browser.groups").save_groups(groups)
-				tabops.save_tags(tags)
+				local groups, tags, headings, group_order, tag_order = util.parse_group_buf(all_lines)
+				require("browser.groups").save_groups(groups, group_order)
+				tabops.save_tags(tags, tag_order)
 				tabops.save_headings(headings)
 				vim.notify("browser.groups: saved")
 				return true

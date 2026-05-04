@@ -22,18 +22,28 @@ local function load_groups()
 	end
 	local raw = vim.fn.system("yq -o=json . " .. vim.fn.shellescape(path) .. " 2>/dev/null")
 	local ok, data = pcall(vim.json.decode, raw)
-	if not ok or not data or not data.groups then
+	if not ok or not data or not data.groups or data.groups == vim.NIL or type(data.groups) ~= "table" then
 		return {}
 	end
 	return data.groups
 end
 
-local function save_groups(groups)
+local function save_groups(groups, order)
 	local path = groups_path()
+	-- Snapshot the existing file before overwriting so accidental deletes
+	-- can be recovered via the history picker.
+	require("browser.groups_history").snapshot(path)
+
+	-- Resolve write order: explicit buffer order if given, otherwise read
+	-- the existing file's order and append new keys alphabetically.
+	local yaml_order = require("browser.yaml_order")
+	local existing = yaml_order.read_top_level_order(path, "groups")
+	local final_order = yaml_order.resolve_order(order, groups, existing)
+
 	local lines = { "groups:" }
-	for name, paths in pairs(groups) do
+	for _, name in ipairs(final_order) do
 		table.insert(lines, "  " .. name .. ":")
-		for _, p in ipairs(paths) do
+		for _, p in ipairs(groups[name] or {}) do
 			table.insert(lines, "    - " .. p)
 		end
 	end
@@ -74,53 +84,80 @@ local function get_current_tab_ids()
 end
 
 local function open_group(name, paths)
-	close_active_group_tabs()
-	local before_ids = get_current_tab_ids()
-	local before_set = {}
-	for _, id in ipairs(before_ids) do
-		before_set[id] = true
+	local tabops = require("browser.dashboard.tabops")
+	local views = require("browser.views")
+	local session = require("browser.session")
+
+	-- Snapshot existing tabs with their inferred chi_paths.
+	-- fetch_tabs assigns each tab's chi_path via plan.json/groups inference.
+	local existing = tabops.fetch_tabs(session._tab_htmx or {})
+
+	-- Index existing tabs by exact chi_path. First-seen wins on duplicates;
+	-- we never reuse the same existing tab for two different group entries.
+	local by_chi = {}
+	for _, t in ipairs(existing) do
+		if t.chi_path and not by_chi[t.chi_path] then
+			by_chi[t.chi_path] = t
+		end
 	end
+
+	local ctx = views.get_active_context()
+	local base = views.get_active_base()
+	local active_ids = {}
+	local consumed = {} -- existing tab ids already used by this open_group call
+	local need_new = {} -- chi_paths that did not match an existing tab
+
 	for _, chi_path in ipairs(paths) do
-		require("browser.views").open_in_tab(chi_path)
+		local match = by_chi[chi_path]
+		if match and not consumed[match.id] then
+			consumed[match.id] = true
+			local resolved = views.resolve_path(chi_path)
+			local qp = views.build_query_string(views.query_for_route(ctx, chi_path))
+			local saved = views.load_test_for_path(chi_path)
+			local htmx = saved and saved.htmx or false
+			send_cmd("switch " .. match.id)
+			send_cmd((htmx and "navigate" or "navigate-full") .. " " .. base .. resolved .. qp)
+			table.insert(active_ids, match.id)
+		else
+			views.open_in_tab(chi_path)
+			table.insert(need_new, chi_path)
+		end
 	end
+
 	vim.defer_fn(function()
-		local after_ids = get_current_tab_ids()
-		local new_ids = {}
-		for _, id in ipairs(after_ids) do
-			if not before_set[id] then
-				table.insert(new_ids, id)
-			end
+		-- After opens, refetch and claim newly-appeared tabs whose chi_path
+		-- matches one of need_new and isn't already in active_ids.
+		local after = tabops.fetch_tabs(session._tab_htmx or {})
+		local already = {}
+		for _, id in ipairs(active_ids) do
+			already[id] = true
 		end
-		M._active_tab_ids = new_ids
-		M._active_group = name
-		for i, id in ipairs(new_ids) do
-			local chi_path = paths[i]
-			if chi_path then
-				require("browser.session")._tab_paths[id] = chi_path
-			end
-		end
-		if #new_ids > 0 then
-			send_cmd("switch " .. new_ids[1])
-			local views = require("browser.views")
-			for i, id in ipairs(new_ids) do
-				local chi_path = paths[i]
-				if chi_path then
-					require("browser.session")._tab_paths[id] = chi_path
+		for _, chi_path in ipairs(need_new) do
+			for _, t in ipairs(after) do
+				if not already[t.id] and t.chi_path == chi_path then
+					table.insert(active_ids, t.id)
+					already[t.id] = true
+					break
 				end
 			end
-			if paths[1] then
-				local saved = views.load_test_for_path(paths[1])
-				views._last_nav = {
-					chi_path = paths[1],
-					resolved = saved and saved.path or paths[1],
-					qp = saved and (saved.qp ~= "" and ("?" .. saved.qp) or "") or "",
-					htmx = true,
-					params_used = {},
-					skip = {},
-				}
+		end
+		M._active_tab_ids = active_ids
+		M._active_group = name
+		for _, id in ipairs(active_ids) do
+			-- record chi_path on session for downstream lookups
+			for _, t in ipairs(after) do
+				if t.id == id and t.chi_path then
+					session._tab_paths[id] = t.chi_path
+				end
 			end
 		end
-		vim.notify(string.format("browser: group '%s' opened (%d tabs)", name, #new_ids))
+		if #active_ids > 0 then
+			send_cmd("switch " .. active_ids[1])
+		end
+		local reused = #active_ids - #need_new
+		vim.notify(
+			string.format("browser: group '%s' (%d tabs: %d reused, %d new)", name, #active_ids, reused, #need_new)
+		)
 	end, 1000)
 end
 
@@ -131,8 +168,8 @@ function M.load_groups()
 	return load_groups()
 end
 
-function M.save_groups(groups)
-	save_groups(groups)
+function M.save_groups(groups, order)
+	save_groups(groups, order)
 end
 
 function M.open_group(name, paths)
