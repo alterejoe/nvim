@@ -110,7 +110,8 @@ function M.register(buf, win, layout, state, opts)
 		if state.view_mode == "groups" then
 			local line = vim.api.nvim_get_current_line()
 			local tag_name = line:match("^###%s*(.+)")
-			local grp_name = not tag_name and line:match("^##?%s*(.+)")
+			local hdg_name = not tag_name and line:match("^##([^#].*)") -- ## heading (skip)
+			local grp_name = not tag_name and not hdg_name and line:match("^#([^#].*)")
 			if tag_name then
 				-- Tag header: open all tagged endpoints
 				tag_name = vim.trim(tag_name)
@@ -122,10 +123,13 @@ function M.register(buf, win, layout, state, opts)
 				end
 				restore_tabs(buf)
 				require("browser.groups").open_group(tag_name, paths)
+			elseif hdg_name then
+				-- ## heading: no action (purely visual organizer)
+				return
 			elseif grp_name then
 				grp_name = vim.trim(grp_name)
 				local all_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-				local gs, _ = util.parse_group_buf(all_lines)
+				local gs, _, _ = util.parse_group_buf(all_lines)
 				local paths = type(gs[grp_name]) == "table" and gs[grp_name] or {}
 				if #paths == 0 then
 					vim.notify("browser.groups: group '" .. grp_name .. "' has no paths", vim.log.levels.WARN)
@@ -465,25 +469,39 @@ function M.register(buf, win, layout, state, opts)
 			return
 		end
 		local groups = require("browser.groups").load_groups()
-		local names = {}
-		for name in pairs(groups) do
-			table.insert(names, name)
-		end
-		table.sort(names)
+		local headings = tabops.load_headings()
 		local tags = tabops.load_tags()
-		local tag_names = {}
-		for name in pairs(tags) do
-			table.insert(tag_names, name)
-		end
-		table.sort(tag_names)
 		local new_lines = {}
-		for _, name in ipairs(names) do
+
+		-- # groups (chi_path templates)
+		local group_names = {}
+		for name in pairs(groups) do
+			table.insert(group_names, name)
+		end
+		table.sort(group_names)
+		for _, name in ipairs(group_names) do
 			table.insert(new_lines, "# " .. name)
 			for _, p in ipairs(type(groups[name]) == "table" and groups[name] or {}) do
 				table.insert(new_lines, p)
 			end
 			table.insert(new_lines, "")
 		end
+
+		-- ## headings (glob patterns)
+		for _, hname in ipairs(headings.order) do
+			table.insert(new_lines, "## " .. hname)
+			for _, p in ipairs(headings.patterns[hname] or {}) do
+				table.insert(new_lines, p)
+			end
+			table.insert(new_lines, "")
+		end
+
+		-- ### tags (chi_path templates)
+		local tag_names = {}
+		for name in pairs(tags) do
+			table.insert(tag_names, name)
+		end
+		table.sort(tag_names)
 		for _, name in ipairs(tag_names) do
 			table.insert(new_lines, "### " .. name)
 			for _, p in ipairs(type(tags[name]) == "table" and tags[name] or {}) do
@@ -491,7 +509,8 @@ function M.register(buf, win, layout, state, opts)
 			end
 			table.insert(new_lines, "")
 		end
-		if #names == 0 and #tag_names == 0 then
+
+		if #group_names == 0 and #headings.order == 0 and #tag_names == 0 then
 			table.insert(new_lines, "# new-group")
 			table.insert(new_lines, "")
 		end

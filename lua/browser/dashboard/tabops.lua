@@ -52,6 +52,80 @@ function M.save_tags(tags)
 	end
 end
 
+local function headings_path()
+	return require("browser.session").DEVPROXY_DIR .. "/headings.yaml"
+end
+
+-- matches_glob: checks if path matches a glob pattern.
+-- Supports:
+--   /admin/*     trailing * matches any single suffix (no slashes)
+--   /admin/**    trailing ** matches any suffix including slashes
+--   /**/edit/*   ** in the middle matches any path segments
+--   /exact/path  exact match
+local function matches_glob(path, pattern)
+	path = (path:match("^([^?#]+)") or path):gsub("%%7B", "{"):gsub("%%7D", "}")
+	-- Convert glob to a Lua pattern
+	-- Escape magic chars except * which we handle specially
+	local lua_pat = pattern
+		:gsub("([%.%+%-%^%$%(%)%[%]%%])", "%%%1") -- escape lua magic chars
+		:gsub("%*%*", "DOUBLESTAR") -- protect **
+		:gsub("%*", "[^/]*") -- * = any non-slash chars
+		:gsub("DOUBLESTAR", ".*") -- ** = anything including slashes
+	lua_pat = "^" .. lua_pat .. "$"
+	return path:match(lua_pat) ~= nil
+end
+
+local function tab_matches_heading(tab_path, patterns)
+	for _, pat in ipairs(patterns) do
+		if matches_glob(tab_path, pat) then
+			return true
+		end
+	end
+	return false
+end
+
+function M.load_headings()
+	-- Returns { order=[names], patterns={name=[globs]} }
+	local path = headings_path()
+	if vim.fn.filereadable(path) == 0 then
+		return { order = {}, patterns = {} }
+	end
+	local raw = vim.fn.system("yq -o=json . " .. vim.fn.shellescape(path) .. " 2>/dev/null")
+	local ok, data = pcall(vim.json.decode, raw)
+	if not ok or not data or type(data.headings) ~= "table" then
+		return { order = {}, patterns = {} }
+	end
+	local result = { order = {}, patterns = {} }
+	for _, entry in ipairs(data.headings) do
+		if type(entry) == "table" and type(entry.name) == "string" then
+			table.insert(result.order, entry.name)
+			result.patterns[entry.name] = type(entry.patterns) == "table" and entry.patterns or {}
+		end
+	end
+	return result
+end
+
+function M.save_headings(headings)
+	-- headings: { order=[names], patterns={name=[globs]} }
+	local path = headings_path()
+	local lines = { "headings:" }
+	for _, name in ipairs(headings.order) do
+		table.insert(lines, "  - name: " .. name)
+		local pats = headings.patterns[name] or {}
+		if #pats > 0 then
+			table.insert(lines, "    patterns:")
+			for _, p in ipairs(pats) do
+				table.insert(lines, "      - " .. p)
+			end
+		end
+	end
+	local f = io.open(path, "w")
+	if f then
+		f:write(table.concat(lines, "\n") .. "\n")
+		f:close()
+	end
+end
+
 local function get_base_url()
 	local raw = send_cmd("active-server")
 	if raw then
@@ -218,13 +292,15 @@ end
 -- ============================================================
 function M.build_tab_lines(tabs, show_chi_path)
 	local groups = require("browser.groups").load_groups()
+	local headings = M.load_headings()
+
 	local group_names = {}
 	for name in pairs(groups) do
 		table.insert(group_names, name)
 	end
 	table.sort(group_names)
 
-	-- Map each tab to ALL groups it belongs to.
+	-- Map each tab to ALL groups it belongs to (by chi_path or URL pattern match)
 	local tab_to_groups = {}
 	for _, name in ipairs(group_names) do
 		local chi_paths = type(groups[name]) == "table" and groups[name] or {}
@@ -254,7 +330,7 @@ function M.build_tab_lines(tabs, show_chi_path)
 		end
 	end
 
-	-- Load tags: shown as [tagname] annotations but do NOT create extra group headers.
+	-- Load tags for annotations
 	local all_tags = M.load_tags()
 	local tab_to_tags = {}
 	for tag_name, chi_paths in pairs(all_tags) do
@@ -299,19 +375,6 @@ function M.build_tab_lines(tabs, show_chi_path)
 		return result
 	end
 
-	local grouped, ungrouped = {}, {}
-	for _, t in ipairs(tabs) do
-		local gs = tab_to_groups[t.id]
-		if gs and next(gs) then
-			for name in pairs(gs) do
-				grouped[name] = grouped[name] or {}
-				table.insert(grouped[name], t)
-			end
-		else
-			table.insert(ungrouped, t)
-		end
-	end
-
 	local lines = {}
 	local meta = {}
 
@@ -328,29 +391,113 @@ function M.build_tab_lines(tabs, show_chi_path)
 		}
 	end
 
-	local any_groups = false
-	for _, name in ipairs(group_names) do
-		if grouped[name] and #grouped[name] > 0 then
-			any_groups = true
-			table.sort(grouped[name], function(a, b)
+	-- Emit tabs for a set of tabs under the current heading scope.
+	-- Organises them by group, then any ungrouped ones at the end.
+	local function emit_under_heading(heading_tabs)
+		local seen_in_heading = {}
+		for _, name in ipairs(group_names) do
+			local group_tabs = {}
+			for _, t in ipairs(heading_tabs) do
+				if tab_to_groups[t.id] and tab_to_groups[t.id][name] and not seen_in_heading[t.id] then
+					table.insert(group_tabs, t)
+					seen_in_heading[t.id] = true
+				end
+			end
+			if #group_tabs > 0 then
+				table.sort(group_tabs, function(a, b)
+					return a.path < b.path
+				end)
+				table.insert(lines, "## " .. name)
+				for _, t in ipairs(group_tabs) do
+					emit(t)
+				end
+			end
+		end
+		-- Ungrouped tabs under this heading
+		local ungrouped_h = {}
+		for _, t in ipairs(heading_tabs) do
+			if not seen_in_heading[t.id] then
+				table.insert(ungrouped_h, t)
+			end
+		end
+		if #ungrouped_h > 0 then
+			table.sort(ungrouped_h, function(a, b)
 				return a.path < b.path
 			end)
-			table.insert(lines, "## " .. name)
-			for _, t in ipairs(grouped[name]) do
+			table.insert(lines, "## ungrouped")
+			for _, t in ipairs(ungrouped_h) do
 				emit(t)
 			end
 		end
 	end
 
-	if #ungrouped > 0 then
-		table.sort(ungrouped, function(a, b)
-			return a.path < b.path
-		end)
-		if any_groups then
-			table.insert(lines, "## ungrouped")
+	-- Process headings: each tab appears under the FIRST heading whose
+	-- glob patterns match its path.
+	local seen_tab_ids = {}
+	for _, hname in ipairs(headings.order) do
+		local pats = headings.patterns[hname] or {}
+		if #pats > 0 then
+			local heading_tabs = {}
+			for _, t in ipairs(tabs) do
+				if not seen_tab_ids[t.id] and tab_matches_heading(t.path, pats) then
+					table.insert(heading_tabs, t)
+					seen_tab_ids[t.id] = true
+				end
+			end
+			if #heading_tabs > 0 then
+				table.insert(lines, "### " .. hname)
+				emit_under_heading(heading_tabs)
+			end
 		end
-		for _, t in ipairs(ungrouped) do
-			emit(t)
+	end
+
+	-- Tabs not matching any heading appear under ### Other
+	local remaining = {}
+	for _, t in ipairs(tabs) do
+		if not seen_tab_ids[t.id] then
+			table.insert(remaining, t)
+		end
+	end
+
+	if #remaining > 0 then
+		if #headings.order > 0 then
+			table.insert(lines, "### Other")
+		end
+		local grouped, ungrouped = {}, {}
+		for _, t in ipairs(remaining) do
+			local gs = tab_to_groups[t.id]
+			if gs and next(gs) then
+				for name in pairs(gs) do
+					grouped[name] = grouped[name] or {}
+					table.insert(grouped[name], t)
+				end
+			else
+				table.insert(ungrouped, t)
+			end
+		end
+		local any_groups = false
+		for _, name in ipairs(group_names) do
+			if grouped[name] and #grouped[name] > 0 then
+				any_groups = true
+				table.sort(grouped[name], function(a, b)
+					return a.path < b.path
+				end)
+				table.insert(lines, "## " .. name)
+				for _, t in ipairs(grouped[name]) do
+					emit(t)
+				end
+			end
+		end
+		if #ungrouped > 0 then
+			table.sort(ungrouped, function(a, b)
+				return a.path < b.path
+			end)
+			if any_groups then
+				table.insert(lines, "## ungrouped")
+			end
+			for _, t in ipairs(ungrouped) do
+				emit(t)
+			end
 		end
 	end
 

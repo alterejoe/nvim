@@ -21,6 +21,7 @@ vim.api.nvim_set_hl(0, "BrowserPartial", { fg = "#4a9eff", bold = true })
 vim.api.nvim_set_hl(0, "BrowserFull", { fg = "#4caf50" })
 vim.api.nvim_set_hl(0, "BrowserMethod", { fg = "#56b6c2", bold = true })
 vim.api.nvim_set_hl(0, "BrowserGroup", { fg = "#c678dd", bold = true })
+vim.api.nvim_set_hl(0, "BrowserHeading", { fg = "#e06c75", bold = true, italic = true })
 vim.api.nvim_set_hl(0, "BrowserTabID", { fg = "#555566" })
 vim.api.nvim_set_hl(0, "BrowserHttp2xx", { fg = "#4caf50", bold = true })
 vim.api.nvim_set_hl(0, "BrowserHttp3xx", { fg = "#e5a445", bold = true })
@@ -36,6 +37,7 @@ function M.browser_highlights(target_win)
 	local function ma(pat, hl, pri)
 		pcall(vim.fn.matchadd, hl, pat, pri, -1, { window = target_win })
 	end
+	ma("^###\\s\\+.*", "BrowserHeading", 14)
 	ma("{[^}]\\+}", "BrowserParam", 12)
 	ma("\\[partial\\]", "BrowserPartial", 13)
 	ma("\\[full\\]", "BrowserFull", 13)
@@ -143,43 +145,67 @@ end
 -- are chi_path entries for the current group.
 -- ============================================================
 function M.parse_group_buf(lines)
+	-- ## heading   glob patterns below it define which tabs appear under it in the panel
+	-- #  group     chi_path templates for grouping tabs
+	-- ### tag      chi_path templates for tab annotations
+	-- Returns: groups, tags, headings
+	--   groups   = { name = [chi_paths] }
+	--   tags     = { name = [chi_paths] }
+	--   headings = { order = [names], patterns = { name = [globs] } }
 	local groups = {}
 	local tags = {}
+	local headings = { order = {}, patterns = {} }
 	local current = nil
-	local is_tag = false
+	local current_type = nil -- "group" | "tag" | "heading"
+
 	local function strip_path(line)
 		local p = vim.trim(line)
 		p = p:gsub("^%u+%s+", "")
 		p = p:gsub("%s+%[%x+%].*$", "")
 		p = p:gsub("%s+%[partial%].*$", "")
 		p = p:gsub("%s+%[full%].*$", "")
-		p = p:gsub("%s+%[%a%w*%]", "") -- strip inline tag annotations
+		p = p:gsub("%s+%[%a[%a%d%-_]*%].*$", "")
 		return vim.trim(p)
 	end
+
 	for _, line in ipairs(lines) do
-		-- Check ### (tag) before ## (group) before # (group)
 		local tag_name = line:match("^###%s*(.+)")
-		local grp_name = not tag_name and line:match("^##?%s*(.+)")
+		local hdg_name = not tag_name and (line:match("^##([^#].*)") or line:match("^##$"))
+		local grp_name = not tag_name and not hdg_name and (line:match("^#([^#].*)") or line:match("^#$"))
+
 		if tag_name then
 			current = vim.trim(tag_name)
-			is_tag = true
+			current_type = "tag"
 			tags[current] = tags[current] or {}
+		elseif hdg_name then
+			hdg_name = vim.trim(hdg_name)
+			if hdg_name == "" then
+				hdg_name = "unnamed"
+			end
+			current = hdg_name
+			current_type = "heading"
+			if not headings.patterns[hdg_name] then
+				table.insert(headings.order, hdg_name)
+				headings.patterns[hdg_name] = {}
+			end
 		elseif grp_name then
 			current = vim.trim(grp_name)
-			is_tag = false
+			current_type = "group"
 			groups[current] = groups[current] or {}
 		elseif current and vim.trim(line) ~= "" then
 			local path = strip_path(line)
 			if path ~= "" then
-				if is_tag then
+				if current_type == "tag" then
 					table.insert(tags[current], path)
-				else
+				elseif current_type == "group" then
 					table.insert(groups[current], path)
+				elseif current_type == "heading" then
+					table.insert(headings.patterns[current], path)
 				end
 			end
 		end
 	end
-	return groups, tags
+	return groups, tags, headings
 end
 
 -- ============================================================
