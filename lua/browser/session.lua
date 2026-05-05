@@ -152,6 +152,41 @@ function M.send_cmd(cmd)
 end
 
 -- ------------------------------------------------------------
+-- active_tab_id
+--
+-- Returns the id of the currently active Brave tab (or nil if no
+-- tabs / devproxy is down). Used by callers that intend to operate
+-- on whatever the user is looking at right now.
+--
+-- Phase 1 of the navigate strict-mode migration: every navigate call
+-- needs an explicit --tab=<id>. Sites that previously relied on
+-- "navigate operates on active" now call this helper and pass the
+-- returned id explicitly. The strictness on the wire stays - the
+-- helper just makes the active-tab lookup cheap and consistent at
+-- the call site.
+--
+-- Round-trip: one socket call per invocation. Cheap; not cached.
+-- Don't loop-call this in a fan-out - look it up once outside the
+-- loop and pass the id in.
+-- ------------------------------------------------------------
+function M.active_tab_id()
+	local raw = M.send_cmd("tabs")
+	if not raw or raw:sub(1, 1) ~= "[" then
+		return nil
+	end
+	local ok, tabs = pcall(vim.json.decode, raw)
+	if not ok then
+		return nil
+	end
+	for _, t in ipairs(tabs) do
+		if t.active then
+			return t.id
+		end
+	end
+	return nil
+end
+
+-- ------------------------------------------------------------
 -- session lifecycle
 -- ------------------------------------------------------------
 function M.start()

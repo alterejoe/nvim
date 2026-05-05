@@ -18,13 +18,69 @@ local keymaps = require("browser.dashboard.keymaps")
 local _html_patterns = {}
 local _saved_state = { tab_cursor = 1 }
 
-local help_lines = {
-	"CR switch   dd+W close  W save    r refresh   q back",
-	":  paths    t toggle    T full    \\  name      S split",
-	"gz groups   +  +group   e  http   H  html",
-	"c  console  C  clr-con  n  netlog N  clr-net",
-	"n: R req/res  H: b head  U uuid  A +pat  ? pats",
+-- ============================================================
+-- Per-view help content
+--
+-- The help pane updates on focus change (primary <-> split) and on
+-- view change. The active view is determined by:
+--   - cursor in primary -> state.view_mode
+--   - cursor in split   -> state.split_view
+--
+-- Keys not belonging to a view aren't shown in that view's block,
+-- so the pane stays compact. Add new keys here when extending a
+-- panel.
+-- ============================================================
+local HELP_FOR_VIEW = {
+	tabs = {
+		"CR navigate  t partial  T full  \\ chi/resolved",
+		"dd+W close   :  routes   gz groups  + +group",
+		"e http  H html  c console  n network  a assets  S split",
+	},
+	groups = {
+		"CR open      W  save     :  routes",
+		"# group  ## heading  ### tag",
+		"gz back  <leader>u history",
+	},
+	http = {
+		"W save   :  +param   <leader>w curl",
+		"e/r back",
+	},
+	html = {
+		"b body/head   U uuid   P partial  T trigger",
+		"Y target  S swap  B boost",
+		"A +pattern    ?  patterns       H/r back",
+	},
+	console = {
+		"r refresh   C clear   c/r back",
+	},
+	network = {
+		"r refresh   N clear   R req/res   n/r back",
+	},
+	assets = {
+		"b src-only   m miss   l loaded   x extra   A all",
+		"R +html      r refresh           a/r back",
+	},
 }
+
+-- ============================================================
+-- build_help_lines
+-- Returns the help block for the view the cursor currently focuses.
+-- Falls back to the tabs block if the focused view is unknown.
+-- ============================================================
+local function build_help_lines(state)
+	-- Default before windows are wired up: show tabs help.
+	if not (state and state.primary_win) then
+		return HELP_FOR_VIEW.tabs
+	end
+	local cur_win = vim.api.nvim_get_current_win()
+	local view
+	if state.split_win and vim.api.nvim_win_is_valid(state.split_win) and cur_win == state.split_win then
+		view = state.split_view or "tabs"
+	else
+		view = state.view_mode or "tabs"
+	end
+	return HELP_FOR_VIEW[view] or HELP_FOR_VIEW.tabs
+end
 
 local function send_cmd(cmd)
 	return require("browser.session").send_cmd(cmd)
@@ -113,7 +169,7 @@ function M.open()
 		layout = nil,
 		primary_buf = nil,
 		primary_win = nil,
-		-- view mode: "tabs" | "groups" | "http" | "html" | "console" | "network"
+		-- view mode: "tabs" | "groups" | "http" | "html" | "console" | "network" | "assets"
 		view_mode = "tabs",
 		show_chi_path = true,
 		-- http panel
@@ -128,6 +184,14 @@ function M.open()
 		-- network panel
 		net_entries = {},
 		net_show_response = false,
+		-- assets panel
+		assets_referenced = {},
+		assets_loaded = {},
+		assets_missing = {},
+		assets_extra = {},
+		assets_filter = "all",
+		assets_src_only = false,
+		assets_show_html = false,
 		-- split pane
 		split_win = nil,
 		primary_w = nil,
@@ -139,12 +203,58 @@ function M.open()
 		split_html_full = nil,
 		split_html_show_full = false,
 		split_html_meta = nil,
+		-- split assets
+		split_assets_referenced = {},
+		split_assets_loaded = {},
+		split_assets_missing = {},
+		split_assets_extra = {},
+		split_assets_filter = "all",
+		split_assets_src_only = false,
+		split_assets_show_html = false,
 		-- keymap list, populated by keymaps.register, copied to split buffer
 		registered_keymaps = {},
 		-- module-level references (Lua tables are passed by reference)
 		html_patterns = _html_patterns,
 		saved_state = _saved_state,
+		-- Last view shown in the help pane. Used so we only set the help
+		-- pane lines when the view actually changed (avoids needless
+		-- redraws on every cursor move).
+		_help_last_view = nil,
 	}
+
+	-- ============================================================
+	-- update_help_pane
+	-- Recomputes the help pane lines for the focused view and pushes
+	-- them via state.layout.set. Cheap to call; bails if nothing
+	-- changed since last call.
+	-- ============================================================
+	local function update_help_pane()
+		if not state.layout then
+			return
+		end
+		local cur_win = vim.api.nvim_get_current_win()
+		local view
+		if state.split_win and vim.api.nvim_win_is_valid(state.split_win) and cur_win == state.split_win then
+			view = state.split_view or "tabs"
+		else
+			view = state.view_mode or "tabs"
+		end
+		local key = "primary:"
+			.. (state.view_mode or "?")
+			.. "|split:"
+			.. (state.split_view or "?")
+			.. "|focus:"
+			.. view
+		if state._help_last_view == key then
+			return
+		end
+		state._help_last_view = key
+		state.layout.set(util.HELP_TITLE, HELP_FOR_VIEW[view] or HELP_FOR_VIEW.tabs)
+	end
+
+	-- Expose so submodules can request a help refresh after they
+	-- change state.view_mode (open_html, open_http_panel, etc).
+	state._update_help_pane = update_help_pane
 
 	local tabs = tabops.fetch_tabs(state.tab_htmx)
 	if #tabs == 0 then
@@ -207,6 +317,7 @@ function M.open()
 		vim.bo[buf].filetype = "scratchbuf"
 		vim.bo[buf].modified = false
 		state.view_mode = "tabs"
+		update_help_pane()
 	end
 
 	-- do_buf_refresh: re-fetches tabs and updates the buffer in-place.
@@ -276,6 +387,9 @@ function M.open()
 			if state.view_mode == "network" then
 				return true
 			end
+			if state.view_mode == "assets" then
+				return true
+			end
 			-- Default: tabs view
 			if not (state.primary_buf and vim.api.nvim_buf_is_valid(state.primary_buf)) then
 				return true
@@ -288,6 +402,9 @@ function M.open()
 			if not state.layout then
 				return
 			end
+			-- Help pane reflects the current view. Cheap because
+			-- update_help_pane bails when nothing changed.
+			update_help_pane()
 			if state.view_mode == "network" then
 				local lnum = state.primary_win and vim.api.nvim_win_get_cursor(state.primary_win)[1]
 				local entry = lnum and state.net_entries[lnum]
@@ -421,8 +538,11 @@ function M.open()
 						end
 					end
 					local cmd = htmx and "navigate" or "navigate-full"
+					-- User edited and saved the HTTP Preview pane targeting
+					-- preview_tab_id. They expect focus on that tab in Brave.
+					-- Phase 1 strict: switch + targeted navigate.
 					send_cmd("switch " .. state.preview_tab_id)
-					send_cmd(cmd .. " " .. get_base_url() .. path_query)
+					send_cmd(cmd .. " --tab=" .. state.preview_tab_id .. " " .. get_base_url() .. path_query)
 					state.tab_htmx[state.preview_tab_id] = htmx
 					vim.notify("browser: " .. (htmx and "[partial]" or "[full]") .. " " .. path_query)
 					return true
@@ -431,11 +551,13 @@ function M.open()
 
 			-- ------------------------------------------------
 			-- Help pane (readonly)
+			-- Lines are re-set by update_help_pane on every focus or
+			-- view change. Initial value covers the tabs view.
 			-- ------------------------------------------------
 			{
 				title = util.HELP_TITLE,
 				role = "readonly",
-				lines = help_lines,
+				lines = HELP_FOR_VIEW.tabs,
 			},
 		},
 
@@ -478,6 +600,27 @@ function M.open()
 					end
 				end,
 			})
+
+			-- Help pane refresh on focus changes between primary and split.
+			-- WinEnter fires when the cursor moves into a new window.
+			-- BufEnter is a defensive fallback for anything that lands in
+			-- one of our buffers without firing WinEnter (rare, but harmless).
+			vim.api.nvim_create_autocmd({ "WinEnter", "BufEnter" }, {
+				callback = function()
+					if not (state.layout and state.primary_buf and vim.api.nvim_buf_is_valid(state.primary_buf)) then
+						return
+					end
+					local cur_buf = vim.api.nvim_get_current_buf()
+					local in_dashboard = cur_buf == state.primary_buf
+						or (state.split_buf and cur_buf == state.split_buf)
+					if in_dashboard then
+						update_help_pane()
+					end
+				end,
+			})
+
+			-- Initial help pane render now that windows exist.
+			update_help_pane()
 
 			keymaps.register(buf, win, layout, state, {
 				restore_tabs_fn = restore_tabs,

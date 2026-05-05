@@ -10,6 +10,30 @@ local function send_cmd(cmd)
 	return require("browser.session").send_cmd(cmd)
 end
 
+-- Pick the tab id this panel should target.
+--
+-- Console and network logs are per-tab. The panel was opened from a
+-- tab line under the cursor; that tab's id was recorded onto
+-- state.preview_tab_id by the on_cursor hook in dashboard.lua. We
+-- reuse it here so c/n/C/N (and r refresh) operate on the same tab
+-- the user was hovering over - not the active tab.
+--
+-- Returns "" when no tab is recorded; devproxy then falls back to
+-- the active tab (the consolelog/netlog commands accept that, since
+-- they aren't strict-mode yet).
+local function panel_tab_id(state)
+	return (state and state.preview_tab_id) or ""
+end
+
+-- Build the trailing arg for log commands. " <id>" when known, "" when not.
+local function tab_arg(state)
+	local id = panel_tab_id(state)
+	if id == "" then
+		return ""
+	end
+	return " " .. id
+end
+
 -- vim.json.decode turns JSON null into vim.NIL (userdata), which is truthy.
 -- Use this to safely test fields that may be null.
 local function nz(v)
@@ -149,9 +173,12 @@ end
 
 -- ============================================================
 -- Console open / refresh / clear
+-- All target the tab under cursor (state.preview_tab_id) instead
+-- of the active tab. devproxy's consolelog/consoleclear accept an
+-- optional tab id positional and fall back to active when absent.
 -- ============================================================
 function M.open_console(buf, state)
-	local raw = send_cmd("consolelog")
+	local raw = send_cmd("consolelog" .. tab_arg(state))
 	if not raw or vim.startswith(raw, "err:") then
 		vim.notify("browser: " .. (raw or "no response"), vim.log.levels.WARN)
 		return
@@ -166,8 +193,8 @@ function M.open_console(buf, state)
 	vim.notify("browser: console log - C=clear  r=refresh  c/<C-o>=back")
 end
 
-function M.refresh_console(buf)
-	local raw = send_cmd("consolelog")
+function M.refresh_console(buf, state)
+	local raw = send_cmd("consolelog" .. tab_arg(state))
 	if not raw or vim.startswith(raw, "err:") then
 		vim.notify("browser: " .. (raw or "no response"), vim.log.levels.WARN)
 		return
@@ -180,7 +207,7 @@ function M.refresh_console(buf)
 end
 
 function M.clear_console(buf, state)
-	send_cmd("consoleclear")
+	send_cmd("consoleclear" .. tab_arg(state))
 	vim.notify("browser: console log cleared")
 	if state.view_mode == "console" then
 		vim.bo[buf].modifiable = true
@@ -192,9 +219,10 @@ end
 
 -- ============================================================
 -- Network open / refresh / clear / toggle request-response
+-- Same per-tab targeting as console.
 -- ============================================================
 function M.open_network(buf, state)
-	local raw = send_cmd("netlog")
+	local raw = send_cmd("netlog" .. tab_arg(state))
 	if not raw or vim.startswith(raw, "err:") then
 		vim.notify("browser: " .. (raw or "no response"), vim.log.levels.WARN)
 		return
@@ -214,7 +242,7 @@ function M.open_network(buf, state)
 end
 
 function M.refresh_network(buf, state)
-	local raw = send_cmd("netlog")
+	local raw = send_cmd("netlog" .. tab_arg(state))
 	if not raw or vim.startswith(raw, "err:") then
 		vim.notify("browser: " .. (raw or "no response"), vim.log.levels.WARN)
 		return
@@ -232,7 +260,7 @@ function M.refresh_network(buf, state)
 end
 
 function M.clear_network(buf, state)
-	send_cmd("netclear")
+	send_cmd("netclear" .. tab_arg(state))
 	vim.notify("browser: network log cleared")
 	if state.view_mode == "network" then
 		state.net_entries = {}

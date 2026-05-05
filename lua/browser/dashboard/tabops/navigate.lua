@@ -81,6 +81,12 @@ function M.navigate_tab(meta, htmx, tab_htmx)
 		return
 	end
 	tab_htmx[meta.tab_id] = htmx
+	-- Tab-view CR/T/p intent: bring the tab to focus AND navigate it.
+	-- The switch is what gives the user the visible "now I'm on this
+	-- tab" feedback in Brave. The navigate uses --tab= so devproxy is
+	-- unambiguous about which tab to navigate, but the switch is still
+	-- explicit user intent here (different from fan-out cases that
+	-- operate WITHOUT changing focus).
 	send_cmd("switch " .. meta.tab_id)
 
 	local chi = meta.chi_path or fetch.infer_chi_path(meta)
@@ -102,12 +108,12 @@ function M.navigate_tab(meta, htmx, tab_htmx)
 		local qp = views.build_query_string(views.query_for_route(views.get_active_context(), chi, saved.query_keys))
 		local base = views.get_active_base()
 		local cmd = htmx and "navigate" or "navigate-full"
-		send_cmd(cmd .. " " .. base .. resolved .. qp)
+		send_cmd(cmd .. " --tab=" .. meta.tab_id .. " " .. base .. resolved .. qp)
 		vim.notify(string.format("browser: %s%s%s", resolved, qp, htmx and " [partial]" or " [full]"))
 	else
 		-- No chi_path inferred; navigate using the literal path as-is.
 		local cmd = htmx and "navigate" or "navigate-full"
-		send_cmd(cmd .. " " .. get_base_url() .. meta.path)
+		send_cmd(cmd .. " --tab=" .. meta.tab_id .. " " .. get_base_url() .. meta.path)
 		vim.notify("browser: " .. (htmx and "[partial]" or "[full]") .. " " .. meta.path)
 	end
 end

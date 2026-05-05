@@ -7,20 +7,24 @@
 --
 --   e   - HTTP context editor (open / return)
 --   H   - HTML source viewer  (open / return)
---   b   - HTML body / full toggle
+--   b   - HTML body / full toggle  OR  assets src-only toggle
 --   U   - jump to next UUID in HTML
 --   P   - jump to next htmx partial (hx-get/hx-post/etc) in HTML
 --   T   - jump to next hx-trigger in HTML
 --   Y   - jump to next hx-target in HTML
 --   S   - jump to next hx-swap in HTML
 --   B   - jump to next hx-boost in HTML
---   A   - add a named html search pattern
+--   A   - add named html search pattern (html view) OR show ALL (assets view)
 --   ?   - HTML pattern picker
 --   c   - console log         (open / return)
 --   C   - clear console
 --   n   - network log         (open / return)
 --   N   - clear network log
---   R   - toggle req/res in network preview
+--   R   - toggle req/res in network preview OR include-html in assets
+--   a   - assets panel        (open / return)
+--   m   - assets: show only MISSING
+--   l   - assets: show only LOADED
+--   x   - assets: show only EXTRA
 
 local M = {}
 
@@ -28,6 +32,7 @@ local util = require("browser.dashboard.util")
 local httpops = require("browser.dashboard.httpops")
 local logops = require("browser.dashboard.logops")
 local htmlops = require("browser.dashboard.htmlops")
+local assetops = require("browser.dashboard.assetops")
 
 local function send_cmd(cmd)
 	return require("browser.session").send_cmd(cmd)
@@ -172,11 +177,17 @@ function M.register(ctx)
 	end, "HTML source viewer")
 
 	-- ----------------------------------------------------------------
-	-- b: body/head toggle (html view, split-aware)
-	-- In split, lazily fetches full source on first switch into "head".
+	-- b: dual purpose, dispatched by view_mode.
+	--   html view   -> body / full toggle
+	--   assets view -> src-only toggle (strip host prefix off URLs)
+	-- Lazily fetches full source on first switch into "head" (html, split).
 	-- ----------------------------------------------------------------
 	map("b", function()
 		if is_in_split() then
+			if state.split_view == "assets" then
+				assetops.split_toggle_src_only(state, split_set)
+				return
+			end
 			if state.split_view ~= "html" then
 				return
 			end
@@ -197,11 +208,15 @@ function M.register(ctx)
 			split_set(lines, "html", true)
 			return
 		end
+		if state.view_mode == "assets" then
+			assetops.toggle_src_only(buf, state)
+			return
+		end
 		if state.view_mode ~= "html" then
 			return
 		end
 		htmlops.toggle_body_head(buf, state)
-	end, "Toggle body / full HTML")
+	end, "Toggle body/full HTML or assets src-only")
 
 	-- ----------------------------------------------------------------
 	-- HTMX motion keymaps. All scoped to HTML view (primary or split)
@@ -236,10 +251,19 @@ function M.register(ctx)
 	end, "Next hx-boost")
 
 	-- ----------------------------------------------------------------
-	-- A: add named html search pattern (primary html view only).
-	-- Two prompts: name then regex. Pattern stored on state.html_patterns.
+	-- A: dual purpose, dispatched by view_mode.
+	--   html view   -> add named search pattern (two prompts)
+	--   assets view -> show ALL sections (filter = "all")
 	-- ----------------------------------------------------------------
 	map("A", function()
+		if is_in_split() and state.split_view == "assets" then
+			assetops.split_set_filter(state, split_set, "all")
+			return
+		end
+		if state.view_mode == "assets" then
+			assetops.set_filter(buf, state, "all")
+			return
+		end
 		if state.view_mode ~= "html" then
 			return
 		end
@@ -255,7 +279,7 @@ function M.register(ctx)
 				vim.notify("browser: pattern '" .. name .. "' added - ? to search")
 			end)
 		end)
-	end, "Add html search pattern")
+	end, "Add html pattern / show ALL assets")
 
 	-- ----------------------------------------------------------------
 	-- ?: pick a stored html search pattern and run it (primary html only).
@@ -386,11 +410,82 @@ function M.register(ctx)
 	end, "Clear network log")
 
 	-- ----------------------------------------------------------------
-	-- R: toggle request/response display in network preview pane.
+	-- R: dual purpose, dispatched by view_mode.
+	--   network view -> toggle request/response display in preview pane
+	--   assets view  -> toggle inclusion of text/html responses in EXTRA
 	-- ----------------------------------------------------------------
 	map("R", function()
+		if is_in_split() and state.split_view == "assets" then
+			assetops.split_toggle_show_html(state, split_set)
+			return
+		end
+		if state.view_mode == "assets" then
+			assetops.toggle_show_html(buf, state)
+			return
+		end
 		logops.toggle_net_response(state)
-	end, "Toggle request/response preview")
+	end, "Toggle req/res or assets +html")
+
+	-- ----------------------------------------------------------------
+	-- a: assets panel (split-aware). Same shape as c / n.
+	-- ----------------------------------------------------------------
+	map("a", function()
+		if is_in_split() then
+			if state.split_view == "assets" then
+				split_restore_tabs()
+				return
+			end
+			local meta = split_selected_meta()
+			if not meta then
+				vim.notify("browser: no tab selected", vim.log.levels.WARN)
+				return
+			end
+			-- split_open reads state.preview_tab_id internally via fetch_referenced.
+			-- Make sure the split's selected tab is the one we use.
+			state.preview_tab_id = meta.tab_id
+			assetops.split_open(state, split_set)
+			return
+		end
+		if state.view_mode == "assets" then
+			restore_tabs(buf)
+			return
+		end
+		assetops.open(buf, state)
+	end, "Assets panel")
+
+	-- ----------------------------------------------------------------
+	-- m / l / x: assets section filters.
+	-- No-op outside assets view.
+	-- ----------------------------------------------------------------
+	map("m", function()
+		if is_in_split() and state.split_view == "assets" then
+			assetops.split_set_filter(state, split_set, "missing")
+			return
+		end
+		if state.view_mode == "assets" then
+			assetops.set_filter(buf, state, "missing")
+		end
+	end, "Assets: show MISSING")
+
+	map("l", function()
+		if is_in_split() and state.split_view == "assets" then
+			assetops.split_set_filter(state, split_set, "loaded")
+			return
+		end
+		if state.view_mode == "assets" then
+			assetops.set_filter(buf, state, "loaded")
+		end
+	end, "Assets: show LOADED")
+
+	map("x", function()
+		if is_in_split() and state.split_view == "assets" then
+			assetops.split_set_filter(state, split_set, "extra")
+			return
+		end
+		if state.view_mode == "assets" then
+			assetops.set_filter(buf, state, "extra")
+		end
+	end, "Assets: show EXTRA")
 end
 
 return M

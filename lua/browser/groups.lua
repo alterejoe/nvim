@@ -115,8 +115,13 @@ local function open_group(name, paths)
 			local qp = views.build_query_string(views.query_for_route(ctx, chi_path))
 			local saved = views.load_test_for_path(chi_path)
 			local htmx = saved and saved.htmx or false
-			send_cmd("switch " .. match.id)
-			send_cmd((htmx and "navigate" or "navigate-full") .. " " .. base .. resolved .. qp)
+			-- Phase 1 strict: navigate operates on the named tab without
+			-- changing browser focus. The previous "switch + navigate"
+			-- pair is gone - the switch was only there to put the tab in
+			-- focus before the navigate could land on it. With --tab=
+			-- the navigate targets the tab directly.
+			local cmd = htmx and "navigate" or "navigate-full"
+			send_cmd(cmd .. " --tab=" .. match.id .. " " .. base .. resolved .. qp)
 			table.insert(active_ids, match.id)
 		else
 			views.open_in_tab(chi_path)

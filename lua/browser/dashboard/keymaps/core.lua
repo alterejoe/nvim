@@ -20,6 +20,7 @@ local util = require("browser.dashboard.util")
 local tabops = require("browser.dashboard.tabops")
 local httpops = require("browser.dashboard.httpops")
 local logops = require("browser.dashboard.logops")
+local assetops = require("browser.dashboard.assetops")
 
 local function send_cmd(cmd)
 	return require("browser.session").send_cmd(cmd)
@@ -147,9 +148,10 @@ function M.register(ctx)
 
 	-- ----------------------------------------------------------------
 	-- r: context-aware refresh / return.
-	--   in split:  refresh console/network if in those views, else return to tabs
+	--   in split:  refresh console/network/assets if in those views, else return to tabs
 	--   in primary console: refresh console
 	--   in primary network: refresh network
+	--   in primary assets:  refresh assets
 	--   else: return to tabs
 	-- ----------------------------------------------------------------
 	map("r", function()
@@ -166,15 +168,19 @@ function M.register(ctx)
 					ctx.split_set(logops.build_net_lines(raw, state), "text", true)
 				end
 				vim.notify("browser: split network refreshed")
+			elseif state.split_view == "assets" then
+				assetops.split_refresh(state, ctx.split_set)
 			else
 				split_restore_tabs()
 			end
 			return
 		end
 		if state.view_mode == "console" then
-			logops.refresh_console(buf)
+			logops.refresh_console(buf, state)
 		elseif state.view_mode == "network" then
 			logops.refresh_network(buf, state)
+		elseif state.view_mode == "assets" then
+			assetops.refresh(buf, state)
 		else
 			restore_tabs(buf)
 		end

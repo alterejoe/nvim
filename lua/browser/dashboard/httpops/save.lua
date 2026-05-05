@@ -195,8 +195,12 @@ function M.on_save_http(state)
 					break
 				end
 			end
+			-- The user just hit W in the http panel for THIS tab - they
+			-- expect focus on this tab in Brave. Explicit switch +
+			-- targeted navigate. Phase 1 strict: navigate uses --tab=.
 			send_cmd("switch " .. state.http_tab_meta.tab_id)
-			send_cmd((htmx and "navigate" or "navigate-full") .. " " .. base .. nav_path .. qp)
+			local cmd = htmx and "navigate" or "navigate-full"
+			send_cmd(cmd .. " --tab=" .. state.http_tab_meta.tab_id .. " " .. base .. nav_path .. qp)
 			vim.notify(string.format("browser: %s%s%s", nav_path, qp, htmx and " [partial]" or " [full]"))
 		else
 			vim.notify("browser: unresolved params in " .. chi_path, vim.log.levels.WARN)
@@ -237,27 +241,23 @@ function M.on_save_http(state)
 						-- Filter query by the test file's declared keys.
 						local saved = views.load_test_for_path(chi)
 						local q = views.build_query_string(views.query_for_route(active_ctx_key, chi, saved.query_keys))
-						send_cmd("switch " .. m.tab_id)
+						-- Phase 1 strict: navigate the affected tab via
+						-- --tab= so we don't change focus. The previous
+						-- "switch + navigate" pair caused focus rot
+						-- because each iteration left the browser focused
+						-- on the last fan-out target.
 						local cmd = (m.htmx or false) and "navigate" or "navigate-full"
-						send_cmd(cmd .. " " .. views.get_active_base() .. nav .. q)
+						send_cmd(cmd .. " --tab=" .. m.tab_id .. " " .. views.get_active_base() .. nav .. q)
 					end
 				end
 				::next_tab::
 			end
 		end)
 
-		-- Re-focus the edited tab AFTER the fan-out completes. The
-		-- fan-out loop above issues `switch <tab_id>` for every
-		-- affected tab; whichever happens last leaves devproxy
-		-- focused on the wrong tab. Queueing this second
-		-- vim.schedule guarantees it runs after the fan-out (FIFO),
-		-- so the user lands back on the tab they just edited.
-		if state.http_tab_meta and state.http_tab_meta.tab_id then
-			local edited_id = state.http_tab_meta.tab_id
-			vim.schedule(function()
-				send_cmd("switch " .. edited_id)
-			end)
-		end
+		-- (Removed: previous final-switch hack that re-focused the
+		-- edited tab after fan-out. With per-tab navigate via --tab=,
+		-- fan-out doesn't change focus, so the user's tab stays focused
+		-- naturally.)
 
 		vim.notify(
 			string.format(

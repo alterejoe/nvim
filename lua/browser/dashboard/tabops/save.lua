@@ -413,12 +413,16 @@ function M.on_save_tabs(state)
 					if should_nav then
 						local nav = resolve_direct(chi)
 						if not nav:find("{") then
-							send_cmd("switch " .. m.tab_id)
+							-- Phase 1 strict: navigate the affected tab via
+							-- --tab= so we don't change focus during fan-out.
+							-- The previous "switch + navigate" pair caused
+							-- focus to bounce to whichever tab was last in
+							-- the fan-out order.
 							local cmd = (m.htmx or false) and "navigate" or "navigate-full"
 							-- Filter query by the test file's declared keys.
 							local saved = views.load_test_for_path(chi)
 							local q = views.build_query_string(views.query_for_route(ctx_key, chi, saved.query_keys))
-							send_cmd(cmd .. " " .. base .. nav .. q)
+							send_cmd(cmd .. " --tab=" .. m.tab_id .. " " .. base .. nav .. q)
 						end
 					end
 					::nav_next::
@@ -445,6 +449,8 @@ function M.on_save_tabs(state)
 		if #edited_nav > 0 then
 			vim.schedule(function()
 				for _, en in ipairs(edited_nav) do
+					-- User edited the tab line directly - they expect focus
+					-- on the edited tab. Explicit switch + targeted navigate.
 					send_cmd("switch " .. en.tab_id)
 					local cmd = en.info.htmx and "navigate" or "navigate-full"
 					local q = ""
@@ -454,7 +460,7 @@ function M.on_save_tabs(state)
 						local saved = views.load_test_for_path(en.info.chi_path)
 						q = views.build_query_string(views.query_for_route(ctx_key, en.info.chi_path, saved.query_keys))
 					end
-					send_cmd(cmd .. " " .. base .. en.info.path .. q)
+					send_cmd(cmd .. " --tab=" .. en.tab_id .. " " .. base .. en.info.path .. q)
 					vim.notify("browser: " .. (en.info.htmx and "[partial]" or "[full]") .. " " .. en.info.path .. q)
 				end
 			end)
