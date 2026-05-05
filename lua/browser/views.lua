@@ -142,39 +142,67 @@ end
 -- ------------------------------------------------------------
 -- Centralized query params (per-context, per-route)
 -- Storage: contexts.<ctx>.query.<chi_path> = { key = val, ... }
+--
+-- The test file declares which keys belong to a route via its
+-- `query: - keyname` block. query_for_route filters config values
+-- through that key list when filter_keys is provided so:
+--   - keys present in the test file render with their config value
+--   - keys present in config but NOT in the test file are ignored
+--   - keys present in the test file but NOT in config render as
+--     empty values (allows a test file to declare future keys)
 -- ------------------------------------------------------------
 
 -- Returns map of query params for a chi_path under a named context.
--- Returns {} when none configured.
-local function query_for_route(ctx_name, chi_path)
+-- filter_keys (optional list): when provided, only keys in this list
+-- are returned. Missing keys default to "" so callers can render the
+-- key alongside an empty value. Returns {} when none configured and
+-- no filter is given.
+local function query_for_route(ctx_name, chi_path, filter_keys)
 	if not chi_path or chi_path == "" then
 		return {}
 	end
 	local cfg = get_config()
 	local ctx = cfg.contexts[ctx_name]
-	if type(ctx) ~= "table" then
-		return {}
+	local route_q = nil
+	if type(ctx) == "table" then
+		local q = ctx.query
+		if type(q) == "table" and q ~= vim.NIL then
+			local rq = q[chi_path]
+			if type(rq) == "table" and rq ~= vim.NIL then
+				route_q = rq
+			end
+		end
 	end
-	local q = ctx.query
-	if type(q) ~= "table" or q == vim.NIL then
-		return {}
+
+	if filter_keys and #filter_keys > 0 then
+		-- Filter mode: return one entry per filter key, defaulting to "".
+		local out = {}
+		for _, k in ipairs(filter_keys) do
+			local v = route_q and route_q[k]
+			if v ~= nil and v ~= vim.NIL then
+				out[tostring(k)] = tostring(v)
+			else
+				out[tostring(k)] = ""
+			end
+		end
+		return out
 	end
-	local route_q = q[chi_path]
-	if type(route_q) ~= "table" or route_q == vim.NIL then
-		return {}
-	end
+
+	-- Unfiltered mode: return everything in config for this route.
 	local out = {}
-	for k, v in pairs(route_q) do
-		if v ~= nil and v ~= vim.NIL then
-			out[tostring(k)] = tostring(v)
+	if route_q then
+		for k, v in pairs(route_q) do
+			if v ~= nil and v ~= vim.NIL then
+				out[tostring(k)] = tostring(v)
+			end
 		end
 	end
 	return out
 end
 
 -- Builds "?k=v&k=v" from a params map. Keys sorted for stability.
--- Returns "" when empty. Values are not URL-encoded; they are passed through
--- as the user wrote them (matches existing behavior of saved.qp).
+-- Returns "" when empty. Values are not URL-encoded; they are passed
+-- through as the user wrote them.
 local function build_query_string(params)
 	if type(params) ~= "table" then
 		return ""
@@ -342,10 +370,17 @@ local function normalize_chi_path(chi_path)
 end
 
 -- ------------------------------------------------------------
--- Test file lookup
--- Test files store ONLY htmx:.
--- Path is resolved from chi_path + active context at navigate time.
--- Query params come from contexts.<ctx>.query.<chi_path> in config.yaml.
+-- Test file lookup and write
+--
+-- Test file format:
+--   htmx: true|false
+--   query:
+--     - keyname
+--     - keyname
+--
+-- The query: block is a list of key NAMES only. Values for those
+-- keys live in config.yaml under contexts.<ctx>.query.<chi>.<key>
+-- so values are context-swappable while the key list is per-route.
 -- ------------------------------------------------------------
 local function test_file_path(chi_path, ctx_name)
 	chi_path = normalize_chi_path(chi_path)
@@ -358,37 +393,122 @@ local function test_file_path(chi_path, ctx_name)
 	end
 end
 
-local function load_test_for_path(chi_path)
-	ensure_context_loaded()
-	chi_path = normalize_chi_path(chi_path)
-	local fpath = test_file_path(chi_path, _context)
-	local htmx_val = nil
+-- parse_test_file: read a single .http file into { htmx, query_keys }.
+-- Internal helper used by load_test_for_path and write_test_file (the
+-- writer needs to read existing values to preserve fields the caller
+-- didn't pass).
+local function parse_test_file(fpath)
+	local result = { htmx = nil, query_keys = {} }
 	local f = io.open(fpath, "r")
-	if f then
-		for line in f:lines() do
+	if not f then
+		return result
+	end
+	local in_query = false
+	for line in f:lines() do
+		-- Indented "- name" under query:
+		local q_item = line:match("^%s%s+%-%s*(.+)%s*$")
+		if in_query and q_item then
+			local key = vim.trim(q_item)
+			if key ~= "" then
+				table.insert(result.query_keys, key)
+			end
+		else
 			local label, val = line:match("^([%w%.%-_]+):%s*(.*)")
 			if label then
 				local low = label:lower()
 				if low == "htmx" then
-					htmx_val = vim.trim(val) == "true"
+					result.htmx = vim.trim(val) == "true"
+					in_query = false
+				elseif low == "query" then
+					in_query = true
+				else
+					in_query = false
 				end
-				-- "path" and "query" are intentionally ignored.
 			end
 		end
-		f:close()
 	end
-	-- qp now comes from config, not the test file.
-	-- Strip the leading "?" so existing callers that prefix "?" themselves
-	-- still produce a single "?" - matches the previous saved.qp shape.
-	local qp_str = build_query_string(query_for_route(_context, chi_path))
-	local qp = qp_str:gsub("^%?", "")
-	return { qp = qp, htmx = htmx_val }
+	f:close()
+	return result
+end
+
+-- load_test_for_path: returns
+--   { htmx, query_keys, query_string }
+-- query_string is the rendered "k=v&k=v" form (no leading "?")
+-- assembled from config.yaml values filtered to query_keys. Empty
+-- when there are no keys or no values.
+local function load_test_for_path(chi_path)
+	ensure_context_loaded()
+	chi_path = normalize_chi_path(chi_path)
+	local fpath = test_file_path(chi_path, _context)
+	local parsed = parse_test_file(fpath)
+
+	-- Render query_string from config.yaml values, filtered to the
+	-- key list declared in the test file. If the test file declares
+	-- no keys, query_string is empty even if config has values.
+	local q_map = {}
+	if #parsed.query_keys > 0 then
+		q_map = query_for_route(_context, chi_path, parsed.query_keys)
+	end
+	local qstr = build_query_string(q_map):gsub("^%?", "")
+
+	return {
+		htmx = parsed.htmx,
+		query_keys = parsed.query_keys,
+		query_string = qstr,
+	}
+end
+
+-- write_test_file: canonical writer for .http files. Reads the
+-- existing file, merges the provided fields with what's already
+-- there, writes back. Pass nil for any field to leave it unchanged.
+--
+-- Use this instead of writing test files inline in callers, so we
+-- never accidentally clobber a sibling field (htmx, query_keys).
+local function write_test_file(chi_path, ctx_name, opts)
+	opts = opts or {}
+	chi_path = normalize_chi_path(chi_path)
+	local fpath = test_file_path(chi_path, ctx_name)
+	local existing = parse_test_file(fpath)
+
+	local htmx = opts.htmx
+	if htmx == nil then
+		htmx = existing.htmx
+	end
+
+	local query_keys = opts.query_keys
+	if query_keys == nil then
+		query_keys = existing.query_keys
+	end
+
+	local lines = {}
+	if htmx ~= nil then
+		table.insert(lines, "htmx: " .. tostring(htmx))
+	end
+	if query_keys and #query_keys > 0 then
+		-- Stable order: write keys in the order provided.
+		table.insert(lines, "query:")
+		for _, k in ipairs(query_keys) do
+			table.insert(lines, "  - " .. k)
+		end
+	end
+
+	vim.fn.mkdir(vim.fn.fnamemodify(fpath, ":h"), "p")
+	local wf = io.open(fpath, "w")
+	if not wf then
+		return false
+	end
+	for _, l in ipairs(lines) do
+		wf:write(l .. "\n")
+	end
+	wf:close()
+	return true
 end
 
 -- ------------------------------------------------------------
 -- Navigation
 -- Always resolves path from chi_path + active context.
--- Test file provides htmx preference. Query params come from config.
+-- Test file provides htmx preference and query key list.
+-- Query values come from config (filtered to the test file's keys).
 -- ------------------------------------------------------------
 M._last_nav = nil
 
@@ -400,7 +520,9 @@ local function do_navigate(chi_path, htmx)
 		return
 	end
 	ensure_context_loaded()
-	local qp = build_query_string(query_for_route(_context, chi_path))
+	local saved = load_test_for_path(chi_path)
+	local q_map = query_for_route(_context, chi_path, saved.query_keys)
+	local qp = build_query_string(q_map)
 	M._last_nav = {
 		chi_path = chi_path,
 		resolved = path,
@@ -659,7 +781,8 @@ function M.pick()
 					if item.kind == "route" then
 						local path = resolve_path(item.chi_path)
 						ensure_context_loaded()
-						local qp = build_query_string(query_for_route(_context, item.chi_path))
+						local saved = load_test_for_path(item.chi_path)
+						local qp = build_query_string(query_for_route(_context, item.chi_path, saved.query_keys))
 						local url = get_active_base() .. path .. qp
 						send_cmd("open " .. url)
 						vim.notify("browser: new tab (full) -> " .. url)
@@ -675,7 +798,8 @@ function M.pick()
 					if item.kind == "route" then
 						local path = resolve_path(item.chi_path)
 						ensure_context_loaded()
-						local qp = build_query_string(query_for_route(_context, item.chi_path))
+						local saved = load_test_for_path(item.chi_path)
+						local qp = build_query_string(query_for_route(_context, item.chi_path, saved.query_keys))
 						local url = get_active_base() .. path .. qp
 						send_cmd("open " .. url)
 						vim.defer_fn(function()
@@ -904,8 +1028,8 @@ function M.open_in_tab(chi_path)
 		return nil
 	end
 	ensure_context_loaded()
-	local qp = build_query_string(query_for_route(_context, chi_path))
 	local saved = load_test_for_path(chi_path)
+	local qp = build_query_string(query_for_route(_context, chi_path, saved.query_keys))
 	local port = (send_cmd("active-server") or ""):match("port (%d+)") or "3333"
 	local url = "http://localhost:" .. port .. path .. qp
 	send_cmd("open " .. url)
@@ -936,6 +1060,9 @@ end
 function M.test_file_path(chi_path, ctx)
 	return test_file_path(chi_path, ctx)
 end
+function M.write_test_file(chi_path, ctx, opts)
+	return write_test_file(chi_path, ctx, opts)
+end
 function M.resolve_path(chi_path)
 	return resolve_path(chi_path)
 end
@@ -948,8 +1075,8 @@ end
 function M.normalize_chi_path(chi_path)
 	return normalize_chi_path(chi_path)
 end
-function M.query_for_route(ctx_name, chi_path)
-	return query_for_route(ctx_name, chi_path)
+function M.query_for_route(ctx_name, chi_path, filter_keys)
+	return query_for_route(ctx_name, chi_path, filter_keys)
 end
 function M.build_query_string(params)
 	return build_query_string(params)
@@ -959,36 +1086,11 @@ function M.build_query_template(params)
 end
 M.get_config = get_config
 
+-- save_htmx_for_path: now a thin wrapper over write_test_file. Preserves
+-- existing query_keys when toggling htmx alone.
 function M.save_htmx_for_path(chi_path, htmx)
-	chi_path = normalize_chi_path(chi_path)
 	ensure_context_loaded()
-	local fpath = test_file_path(chi_path, _context)
-	local lines = {}
-	local found = false
-	local f = io.open(fpath, "r")
-	if f then
-		for line in f:lines() do
-			local label = line:match("^([%w%.%-_]+):")
-			if label and label:lower() == "htmx" then
-				table.insert(lines, "htmx: " .. tostring(htmx))
-				found = true
-			else
-				table.insert(lines, line)
-			end
-		end
-		f:close()
-	end
-	if not found then
-		table.insert(lines, "htmx: " .. tostring(htmx))
-	end
-	vim.fn.mkdir(vim.fn.fnamemodify(fpath, ":h"), "p")
-	local wf = io.open(fpath, "w")
-	if wf then
-		for _, l in ipairs(lines) do
-			wf:write(l .. "\n")
-		end
-		wf:close()
-	end
+	write_test_file(chi_path, _context, { htmx = htmx })
 end
 
 return M
