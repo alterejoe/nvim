@@ -13,6 +13,9 @@
 --   <leader>w     - curl preview (http view only)
 --   <C-w> + lhwjk - close split if focused, otherwise close dashboard
 --   :             - path picker / attr insert / path insert (context-aware)
+-- browser/dashboard/keymaps/core.lua
+--
+-- Generic keymaps that don't belong to a single panel.
 
 local M = {}
 
@@ -21,6 +24,7 @@ local tabops = require("browser.dashboard.tabops")
 local httpops = require("browser.dashboard.httpops")
 local logops = require("browser.dashboard.logops")
 local assetops = require("browser.dashboard.assetops")
+local htmxops = require("browser.dashboard.htmxops")
 
 local function send_cmd(cmd)
 	return require("browser.session").send_cmd(cmd)
@@ -39,18 +43,19 @@ function M.register(ctx)
 	local close_split = ctx.close_split
 
 	-- ----------------------------------------------------------------
-	-- <CR>: context-aware open
-	-- groups view -> open group / tag / path under cursor
-	-- tabs view   -> navigate the highlighted tab
+	-- <CR>: context-aware open. Now also handles htmx-view expansion.
 	-- ----------------------------------------------------------------
 	map("<CR>", function()
+		if state.view_mode == "htmx" then
+			htmxops.toggle_expand_at_cursor(buf, state)
+			return
+		end
 		if state.view_mode == "groups" then
 			local line = vim.api.nvim_get_current_line()
 			local tag_name = line:match("^###%s*(.+)")
-			local hdg_name = not tag_name and line:match("^##([^#].*)") -- ## heading (skip)
+			local hdg_name = not tag_name and line:match("^##([^#].*)")
 			local grp_name = not tag_name and not hdg_name and line:match("^#([^#].*)")
 			if tag_name then
-				-- Tag header: open all tagged endpoints
 				tag_name = vim.trim(tag_name)
 				local tags = tabops.load_tags()
 				local paths = type(tags[tag_name]) == "table" and tags[tag_name] or {}
@@ -61,7 +66,6 @@ function M.register(ctx)
 				restore_tabs(buf)
 				require("browser.groups").open_group(tag_name, paths)
 			elseif hdg_name then
-				-- ## heading: no action (purely visual organizer)
 				return
 			elseif grp_name then
 				grp_name = vim.trim(grp_name)
@@ -75,7 +79,6 @@ function M.register(ctx)
 				restore_tabs(buf)
 				require("browser.groups").open_group(grp_name, paths)
 			else
-				-- Path line: open a new tab
 				local p = vim.trim(line)
 				if p ~= "" and p:sub(1, 1) == "/" then
 					tabops.open_path(p, buf, state.tab_metadata, do_buf_refresh)
@@ -84,11 +87,6 @@ function M.register(ctx)
 			return
 		end
 		if state.view_mode == "tabs" then
-			-- DEBUG: trace why CR sometimes doesn't navigate.
-			-- Prints the raw line, the stripped key used for metadata
-			-- lookup, and whether a meta entry was found. If meta is
-			-- nil here, the line content doesn't match any rendered
-			-- key in state.tab_metadata.
 			local raw_line = vim.api.nvim_get_current_line()
 			local stripped = util.strip_prefix(raw_line)
 			local meta = current_meta()
@@ -102,8 +100,6 @@ function M.register(ctx)
 				)
 			)
 			if not meta then
-				-- Show first 3 metadata keys so we can see what the
-				-- buffer SHOULD match against.
 				local i = 0
 				for k, _ in pairs(state.tab_metadata) do
 					i = i + 1
@@ -114,9 +110,6 @@ function M.register(ctx)
 				end
 				return
 			end
-			-- Read htmx from the test file as the authoritative source.
-			-- meta.htmx may not reflect the saved preference on first
-			-- load since tab_htmx starts empty each session.
 			local chi = meta.chi_path or tabops.infer_chi_path(meta)
 			local htmx = meta.htmx or false
 			if chi then
@@ -127,32 +120,21 @@ function M.register(ctx)
 			end
 			tabops.navigate_tab(meta, htmx, state.tab_htmx)
 		end
-	end, "Open entry / open group")
+	end, "Open / expand")
 
-	-- ----------------------------------------------------------------
-	-- <leader>w: curl preview (http view only)
-	-- ----------------------------------------------------------------
 	map("<leader>w", function()
 		if state.view_mode ~= "http" then
 			return
 		end
 		httpops.curl_preview(state)
-	end, "Curl preview in HTTP Preview pane")
+	end, "Curl preview")
 
-	-- ----------------------------------------------------------------
-	-- q: return to tab list
-	-- ----------------------------------------------------------------
 	map("q", function()
 		restore_tabs(buf)
-	end, "Return to tab list")
+	end, "Return to tabs")
 
 	-- ----------------------------------------------------------------
-	-- r: context-aware refresh / return.
-	--   in split:  refresh console/network/assets if in those views, else return to tabs
-	--   in primary console: refresh console
-	--   in primary network: refresh network
-	--   in primary assets:  refresh assets
-	--   else: return to tabs
+	-- r: refresh dispatch. Has htmx case for both primary and split.
 	-- ----------------------------------------------------------------
 	map("r", function()
 		if is_in_split() then
@@ -170,6 +152,8 @@ function M.register(ctx)
 				vim.notify("browser: split network refreshed")
 			elseif state.split_view == "assets" then
 				assetops.split_refresh(state, ctx.split_set)
+			elseif state.split_view == "htmx" then
+				htmxops.split_refresh(state, ctx.split_set)
 			else
 				split_restore_tabs()
 			end
@@ -181,22 +165,20 @@ function M.register(ctx)
 			logops.refresh_network(buf, state)
 		elseif state.view_mode == "assets" then
 			assetops.refresh(buf, state)
+		elseif state.view_mode == "htmx" then
+			htmxops.refresh(buf, state)
 		else
 			restore_tabs(buf)
 		end
-	end, "Refresh / return to tab list")
+	end, "Refresh / return")
 
-	-- ----------------------------------------------------------------
-	-- <C-o> and <leader>e: aliases for "return to tab list".
-	-- <C-o> particularly matters for muscle memory (jump back).
-	-- ----------------------------------------------------------------
 	map("<C-o>", function()
 		if is_in_split() then
 			split_restore_tabs()
 			return
 		end
 		restore_tabs(buf)
-	end, "Return to tab list")
+	end, "Return")
 
 	map("<leader>e", function()
 		if is_in_split() then
@@ -204,11 +186,8 @@ function M.register(ctx)
 			return
 		end
 		restore_tabs(buf)
-	end, "Return to tab list")
+	end, "Return")
 
-	-- ----------------------------------------------------------------
-	-- \: toggle between chi_path templates and resolved paths in tabs.
-	-- ----------------------------------------------------------------
 	map("\\", function()
 		if state.view_mode ~= "tabs" and not (is_in_split() and state.split_view == "tabs") then
 			return
@@ -219,13 +198,8 @@ function M.register(ctx)
 			split_restore_tabs()
 		end
 		vim.notify("browser: showing " .. (state.show_chi_path and "chi_path templates" or "resolved paths"))
-	end, "Toggle chi_path / resolved path display")
+	end, "Toggle chi/resolved")
 
-	-- ----------------------------------------------------------------
-	-- <C-w> family: in primary, close dashboard. In split, close split only.
-	-- The base <C-w> is set with nowait=false so multi-key mappings still
-	-- compose; the explicit <C-w>l/h/j/k forms get nowait=true.
-	-- ----------------------------------------------------------------
 	local function close_or_dashboard()
 		if state.split_win and vim.api.nvim_win_is_valid(state.split_win) then
 			if vim.api.nvim_get_current_win() == state.split_win then
@@ -241,17 +215,10 @@ function M.register(ctx)
 	map("<C-w>j", close_or_dashboard, "Close split or dashboard")
 	map("<C-w>k", close_or_dashboard, "Close split or dashboard")
 
-	-- ----------------------------------------------------------------
-	-- /: native vim search (overrides scratchbuf's line filter on /).
-	-- ----------------------------------------------------------------
 	map("/", function()
 		vim.api.nvim_feedkeys("/", "n", false)
 	end, "Search")
 
-	-- ----------------------------------------------------------------
-	-- t: toggle partial/full navigation for the tab under cursor.
-	-- Re-navigates with the new htmx setting, persists to test file.
-	-- ----------------------------------------------------------------
 	map("t", function()
 		if state.view_mode ~= "tabs" then
 			return
@@ -273,15 +240,6 @@ function M.register(ctx)
 		end, 400)
 	end, "Toggle partial/full")
 
-	-- ----------------------------------------------------------------
-	-- T: dual purpose, dispatched by view_mode.
-	--   tabs view -> force full (htmx=false) navigation on tab under cursor.
-	--   html view -> jump to next hx-trigger attribute (cursor inside
-	--                quoted value so yi" yanks it).
-	-- Lives here (not in keymaps/views.lua) because vim.keymap.set
-	-- overwrites previous registrations on the same buffer; one
-	-- callback per key. Same pattern as S in keymaps/split.lua.
-	-- ----------------------------------------------------------------
 	map("T", function()
 		if state.view_mode == "html" then
 			require("browser.dashboard.htmlops").next_trigger(buf, win)
@@ -308,17 +266,9 @@ function M.register(ctx)
 				do_buf_refresh(buf)
 			end
 		end, 400)
-	end, "Navigate full page / next hx-trigger")
+	end, "Full nav / next hx-trigger")
 
-	-- ----------------------------------------------------------------
-	-- :: context-aware insert / picker.
-	--   http view   -> show all insertable test file attributes
-	--   groups view -> show route picker, insert chi_path on selection
-	--   tabs view   -> route picker; CR opens new tab,
-	--                                C-j replaces current tab nav
-	-- ----------------------------------------------------------------
 	map(":", function()
-		-- http view: show all insertable test file attributes
 		if state.view_mode == "http" then
 			local tests = require("browser.session").TESTS_DIR
 			local seen, attrs = {}, {}

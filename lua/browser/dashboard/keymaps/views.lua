@@ -1,30 +1,22 @@
 -- browser/dashboard/keymaps/views.lua
 --
--- Per-panel action keymaps. Each of these dispatches based on view_mode
--- (or split_view when the cursor is in the split). All of them are
--- split-aware: pressing the key with the cursor in the split affects
--- the split; with the cursor in primary affects primary.
---
---   e   - HTTP context editor (open / return)
---   H   - HTML source viewer  (open / return)
---   b   - HTML body / full toggle  OR  assets src-only toggle
---   U   - jump to next UUID in HTML
---   P   - jump to next htmx partial (hx-get/hx-post/etc) in HTML
---   T   - jump to next hx-trigger in HTML
---   Y   - jump to next hx-target in HTML
---   S   - jump to next hx-swap in HTML
---   B   - jump to next hx-boost in HTML
---   A   - add named html search pattern (html view) OR show ALL (assets view)
+--   e   - HTTP context editor
+--   H   - HTML source viewer
+--   b   - HTML body/full toggle  OR  assets src-only toggle  OR  htmx src-only toggle
+--   U/P/Y/B - htmx attribute motions in HTML view
+--   T   - hx-trigger motion in HTML / force-full nav in tabs (in core.lua)
+--   S   - hx-swap motion in HTML / split toggle (in split.lua)
+--   A   - add html search pattern  OR  assets/htmx filter=all
 --   ?   - HTML pattern picker
---   c   - console log         (open / return)
+--   c   - console
 --   C   - clear console
---   n   - network log         (open / return)
---   N   - clear network log
---   R   - toggle req/res in network preview OR include-html in assets
---   a   - assets panel        (open / return)
---   m   - assets: show only MISSING
---   l   - assets: show only LOADED
---   x   - assets: show only EXTRA
+--   n   - network
+--   N   - clear network  OR  clear htmx
+--   R   - toggle req/res in network preview  OR  assets +html
+--   ,   - assets panel
+--   m/l/x - assets section filters
+--   M   - htmx panel
+--   e (htmx) - filter errors
 
 local M = {}
 
@@ -33,6 +25,7 @@ local httpops = require("browser.dashboard.httpops")
 local logops = require("browser.dashboard.logops")
 local htmlops = require("browser.dashboard.htmlops")
 local assetops = require("browser.dashboard.assetops")
+local htmxops = require("browser.dashboard.htmxops")
 
 local function send_cmd(cmd)
 	return require("browser.session").send_cmd(cmd)
@@ -50,12 +43,6 @@ function M.register(ctx)
 	local split_set = ctx.split_set
 	local split_restore_tabs = ctx.split_restore_tabs
 
-	-- ----------------------------------------------------------------
-	-- html_motion: shared dispatcher for all htmx motion keymaps.
-	-- Picks primary or split buf/win based on focus, then forwards to
-	-- the right htmlops function. Returns true if it handled the press,
-	-- false otherwise (caller falls through to other behaviors).
-	-- ----------------------------------------------------------------
 	local function html_motion(jump_fn)
 		if is_in_split() and state.split_view == "html" then
 			jump_fn(state.split_buf, state.split_win)
@@ -68,13 +55,15 @@ function M.register(ctx)
 		return false
 	end
 
-	-- ----------------------------------------------------------------
-	-- e: HTTP context editor (split-aware)
-	-- In primary: opens the full http panel via httpops.open_http_panel.
-	-- In split: renders a lightweight per-context summary (path, query)
-	-- without entering the http_panel state machine.
-	-- ----------------------------------------------------------------
 	map("e", function()
+		if is_in_split() and state.split_view == "htmx" then
+			htmxops.split_set_filter(state, split_set, "errors")
+			return
+		end
+		if state.view_mode == "htmx" then
+			htmxops.set_filter(buf, state, "errors")
+			return
+		end
 		if is_in_split() then
 			if state.split_view == "http" then
 				split_restore_tabs()
@@ -126,11 +115,8 @@ function M.register(ctx)
 			return
 		end
 		httpops.open_http_panel(meta, buf, state)
-	end, "HTTP context editor")
+	end, "HTTP editor / htmx errors")
 
-	-- ----------------------------------------------------------------
-	-- H: HTML source viewer (split-aware)
-	-- ----------------------------------------------------------------
 	map("H", function()
 		if is_in_split() then
 			if state.split_view == "html" then
@@ -176,14 +162,12 @@ function M.register(ctx)
 		htmlops.open_html(meta, buf, state)
 	end, "HTML source viewer")
 
-	-- ----------------------------------------------------------------
-	-- b: dual purpose, dispatched by view_mode.
-	--   html view   -> body / full toggle
-	--   assets view -> src-only toggle (strip host prefix off URLs)
-	-- Lazily fetches full source on first switch into "head" (html, split).
-	-- ----------------------------------------------------------------
 	map("b", function()
 		if is_in_split() then
+			if state.split_view == "htmx" then
+				htmxops.split_toggle_src_only(state, split_set)
+				return
+			end
 			if state.split_view == "assets" then
 				assetops.split_toggle_src_only(state, split_set)
 				return
@@ -208,6 +192,10 @@ function M.register(ctx)
 			split_set(lines, "html", true)
 			return
 		end
+		if state.view_mode == "htmx" then
+			htmxops.toggle_src_only(buf, state)
+			return
+		end
 		if state.view_mode == "assets" then
 			assetops.toggle_src_only(buf, state)
 			return
@@ -216,48 +204,32 @@ function M.register(ctx)
 			return
 		end
 		htmlops.toggle_body_head(buf, state)
-	end, "Toggle body/full HTML or assets src-only")
+	end, "Toggle body/full or assets/htmx src-only")
 
-	-- ----------------------------------------------------------------
-	-- HTMX motion keymaps. All scoped to HTML view (primary or split)
-	-- via html_motion(). When not in HTML view, the keymap is a no-op.
-	--
-	-- U / P / T / Y / S / B all share the same shape - dispatch to
-	-- the corresponding htmlops.next_* function with the focused
-	-- buf/win. Cursor lands inside the quoted attribute value so
-	-- yi" yanks the value cleanly.
-	-- ----------------------------------------------------------------
 	map("U", function()
 		html_motion(htmlops.next_uuid)
 	end, "Next UUID")
-
 	map("P", function()
 		html_motion(htmlops.next_partial)
 	end, "Next htmx partial")
-
-	-- T: handled in keymaps/core.lua because the same key is also used
-	-- in tabs view (force-full nav). vim.keymap.set overwrites previous
-	-- registrations per buffer, so one callback dispatches both.
-
 	map("Y", function()
 		html_motion(htmlops.next_target)
 	end, "Next hx-target")
-
-	-- S: handled in keymaps/split.lua because the same key is also used
-	-- to open/close the split. Same dispatch pattern as T.
-
 	map("B", function()
 		html_motion(htmlops.next_boost)
 	end, "Next hx-boost")
 
-	-- ----------------------------------------------------------------
-	-- A: dual purpose, dispatched by view_mode.
-	--   html view   -> add named search pattern (two prompts)
-	--   assets view -> show ALL sections (filter = "all")
-	-- ----------------------------------------------------------------
 	map("A", function()
+		if is_in_split() and state.split_view == "htmx" then
+			htmxops.split_set_filter(state, split_set, "all")
+			return
+		end
 		if is_in_split() and state.split_view == "assets" then
 			assetops.split_set_filter(state, split_set, "all")
+			return
+		end
+		if state.view_mode == "htmx" then
+			htmxops.set_filter(buf, state, "all")
 			return
 		end
 		if state.view_mode == "assets" then
@@ -279,11 +251,8 @@ function M.register(ctx)
 				vim.notify("browser: pattern '" .. name .. "' added - ? to search")
 			end)
 		end)
-	end, "Add html pattern / show ALL assets")
+	end, "Add pattern / show ALL")
 
-	-- ----------------------------------------------------------------
-	-- ?: pick a stored html search pattern and run it (primary html only).
-	-- ----------------------------------------------------------------
 	map("?", function()
 		if state.view_mode ~= "html" then
 			return
@@ -306,11 +275,6 @@ function M.register(ctx)
 		end)
 	end, "Pattern picker")
 
-	-- ----------------------------------------------------------------
-	-- c: console log (split-aware)
-	-- In split: switch to console view; second press returns to tabs.
-	-- In primary: open the console panel.
-	-- ----------------------------------------------------------------
 	map("c", function()
 		if is_in_split() then
 			if state.split_view == "console" then
@@ -336,10 +300,6 @@ function M.register(ctx)
 		logops.open_console(buf, state)
 	end, "Console log")
 
-	-- ----------------------------------------------------------------
-	-- C: clear console (split-aware).
-	-- Works from tabs or console views; sends consoleclear over socket.
-	-- ----------------------------------------------------------------
 	map("C", function()
 		if is_in_split() then
 			if state.split_view ~= "tabs" and state.split_view ~= "console" then
@@ -356,11 +316,8 @@ function M.register(ctx)
 			return
 		end
 		logops.clear_console(buf, state)
-	end, "Clear console log")
+	end, "Clear console")
 
-	-- ----------------------------------------------------------------
-	-- n: network log (split-aware). Same shape as c.
-	-- ----------------------------------------------------------------
 	map("n", function()
 		if is_in_split() then
 			if state.split_view == "network" then
@@ -387,10 +344,15 @@ function M.register(ctx)
 		logops.open_network(buf, state)
 	end, "Network log")
 
-	-- ----------------------------------------------------------------
-	-- N: clear network log (split-aware). Same shape as C.
-	-- ----------------------------------------------------------------
 	map("N", function()
+		if is_in_split() and state.split_view == "htmx" then
+			htmxops.split_clear(state, split_set)
+			return
+		end
+		if state.view_mode == "htmx" then
+			htmxops.clear(buf, state)
+			return
+		end
 		if is_in_split() then
 			if state.split_view ~= "tabs" and state.split_view ~= "network" then
 				return
@@ -407,13 +369,8 @@ function M.register(ctx)
 			return
 		end
 		logops.clear_network(buf, state)
-	end, "Clear network log")
+	end, "Clear network / htmx")
 
-	-- ----------------------------------------------------------------
-	-- R: dual purpose, dispatched by view_mode.
-	--   network view -> toggle request/response display in preview pane
-	--   assets view  -> toggle inclusion of text/html responses in EXTRA
-	-- ----------------------------------------------------------------
 	map("R", function()
 		if is_in_split() and state.split_view == "assets" then
 			assetops.split_toggle_show_html(state, split_set)
@@ -426,10 +383,7 @@ function M.register(ctx)
 		logops.toggle_net_response(state)
 	end, "Toggle req/res or assets +html")
 
-	-- ----------------------------------------------------------------
-	-- a: assets panel (split-aware). Same shape as c / n.
-	-- ----------------------------------------------------------------
-	map("a", function()
+	map(",", function()
 		if is_in_split() then
 			if state.split_view == "assets" then
 				split_restore_tabs()
@@ -440,8 +394,6 @@ function M.register(ctx)
 				vim.notify("browser: no tab selected", vim.log.levels.WARN)
 				return
 			end
-			-- split_open reads state.preview_tab_id internally via fetch_referenced.
-			-- Make sure the split's selected tab is the one we use.
 			state.preview_tab_id = meta.tab_id
 			assetops.split_open(state, split_set)
 			return
@@ -453,10 +405,6 @@ function M.register(ctx)
 		assetops.open(buf, state)
 	end, "Assets panel")
 
-	-- ----------------------------------------------------------------
-	-- m / l / x: assets section filters.
-	-- No-op outside assets view.
-	-- ----------------------------------------------------------------
 	map("m", function()
 		if is_in_split() and state.split_view == "assets" then
 			assetops.split_set_filter(state, split_set, "missing")
@@ -465,7 +413,7 @@ function M.register(ctx)
 		if state.view_mode == "assets" then
 			assetops.set_filter(buf, state, "missing")
 		end
-	end, "Assets: show MISSING")
+	end, "Assets: MISSING")
 
 	map("l", function()
 		if is_in_split() and state.split_view == "assets" then
@@ -475,7 +423,7 @@ function M.register(ctx)
 		if state.view_mode == "assets" then
 			assetops.set_filter(buf, state, "loaded")
 		end
-	end, "Assets: show LOADED")
+	end, "Assets: LOADED")
 
 	map("x", function()
 		if is_in_split() and state.split_view == "assets" then
@@ -485,7 +433,29 @@ function M.register(ctx)
 		if state.view_mode == "assets" then
 			assetops.set_filter(buf, state, "extra")
 		end
-	end, "Assets: show EXTRA")
+	end, "Assets: EXTRA")
+
+	map("M", function()
+		if is_in_split() then
+			if state.split_view == "htmx" then
+				split_restore_tabs()
+				return
+			end
+			local meta = split_selected_meta()
+			if not meta then
+				vim.notify("browser: no tab selected", vim.log.levels.WARN)
+				return
+			end
+			state.preview_tab_id = meta.tab_id
+			htmxops.split_open(state, split_set)
+			return
+		end
+		if state.view_mode == "htmx" then
+			restore_tabs(buf)
+			return
+		end
+		htmxops.open(buf, state)
+	end, "Htmx panel")
 end
 
 return M

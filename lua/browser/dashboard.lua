@@ -1,8 +1,4 @@
 -- browser/dashboard.lua
--- Scratchbuf-based browser management dashboard.
--- This file is the entry point only: it owns module-level state,
--- builds the initial scratchbuf config, and delegates everything else
--- to the sub-modules under browser/dashboard/.
 
 local M = {}
 
@@ -11,22 +7,17 @@ local tabops = require("browser.dashboard.tabops")
 local httpops = require("browser.dashboard.httpops")
 local logops = require("browser.dashboard.logops")
 local assetops = require("browser.dashboard.assetops")
+local htmxops = require("browser.dashboard.htmxops")
 local keymaps = require("browser.dashboard.keymaps")
 
--- Module-level state: persists across dashboard opens within a session.
--- html_patterns accumulates user-added patterns until Neovim restarts.
--- saved_state carries the cursor position so re-opening lands where you left off.
 local _html_patterns = {}
 local _saved_state = { tab_cursor = 1 }
 
--- ============================================================
--- Per-view help content
--- ============================================================
 local HELP_FOR_VIEW = {
 	tabs = {
 		"CR navigate  t partial  T full  \\ chi/resolved",
 		"dd+W close   :  routes   gz groups  + +group",
-		"e http  H html  c console  n network  a assets  S split",
+		"e http  H html  c console  n net  , assets  M htmx  S split",
 	},
 	groups = {
 		"CR open      W  save     :  routes",
@@ -51,6 +42,10 @@ local HELP_FOR_VIEW = {
 	assets = {
 		"W reevaluate  b src   m miss  l loaded  x extra",
 		"A all   R +html   r refresh   a/r back",
+	},
+	htmx = {
+		"CR expand  e errors  A all  b src",
+		"N clear   r refresh   M/r back",
 	},
 }
 
@@ -148,6 +143,10 @@ function M.open()
 		assets_filter = "all",
 		assets_src_only = false,
 		assets_show_html = false,
+		htmx_groups = {},
+		htmx_filter = "all",
+		htmx_src_only = false,
+		htmx_expanded = {},
 		split_win = nil,
 		primary_w = nil,
 		split_buf = nil,
@@ -165,6 +164,10 @@ function M.open()
 		split_assets_filter = "all",
 		split_assets_src_only = false,
 		split_assets_show_html = false,
+		split_htmx_groups = {},
+		split_htmx_filter = "all",
+		split_htmx_src_only = false,
+		split_htmx_expanded = {},
 		registered_keymaps = {},
 		html_patterns = _html_patterns,
 		saved_state = _saved_state,
@@ -275,10 +278,6 @@ function M.open()
 
 		on_open = function(_content, _parsed) end,
 
-		-- on_save: dispatches W to the correct handler for the current view.
-		-- A debug log on the first line lets us verify view_mode at save time
-		-- (the assets-panel destruction bug came from view_mode somehow being
-		-- "tabs" when W fired in assets view).
 		on_save = function(_changes)
 			vim.notify(
 				string.format(
@@ -291,6 +290,9 @@ function M.open()
 				if state.primary_buf and vim.api.nvim_buf_is_valid(state.primary_buf) then
 					assetops.reevaluate(state.primary_buf, state)
 				end
+				return true
+			end
+			if state.view_mode == "htmx" then
 				return true
 			end
 			if state.view_mode == "groups" then
@@ -317,7 +319,6 @@ function M.open()
 			if state.view_mode == "network" then
 				return true
 			end
-			-- Default: tabs view
 			if not (state.primary_buf and vim.api.nvim_buf_is_valid(state.primary_buf)) then
 				return true
 			end
