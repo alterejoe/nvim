@@ -17,6 +17,13 @@ local function send_cmd(cmd)
 	return require("browser.session").send_cmd(cmd)
 end
 
+local function server_for_chi(chi_path)
+	local tabops = require("browser.dashboard.tabops")
+	local tags, order = tabops.load_server_tags()
+	local name = tabops.tab_server_for(chi_path, tags, order)
+	return (name and name ~= "") and (" --server=" .. name) or ""
+end
+
 -- ============================================================
 -- do_navigate
 -- Resolves chi_path against the active context, looks up the test
@@ -65,7 +72,8 @@ function M.do_navigate(chi_path, htmx)
 		vim.notify("browser: no active tab to navigate", vim.log.levels.WARN)
 		return
 	end
-	local resp = send_cmd(cmd .. " --tab=" .. id .. " " .. base .. path .. qp)
+	local srv = server_for_chi(chi_path)
+	local resp = send_cmd(cmd .. " --tab=" .. id .. srv .. " " .. base .. path .. qp)
 	if resp and vim.startswith(resp, "err:") then
 		vim.notify("browser: " .. resp, vim.log.levels.WARN)
 		return
@@ -106,20 +114,16 @@ function M.open_in_tab(chi_path)
 	local qp = test_files.build_query_string(
 		test_files.query_for_route(config.get_active_context(), chi_path, saved.query_keys)
 	)
-	local port = (send_cmd("active-server") or ""):match("port (%d+)") or "3333"
-	local url = "http://localhost:" .. port .. path .. qp
-	-- The `open` response is "ok: opened tab <id> -> <url>". We parse
-	-- the new tab id out so the deferred follow-up navigate can target
-	-- it explicitly via --tab= (phase 1 strict).
-	local open_resp = send_cmd("open " .. url) or ""
+	local srv = server_for_chi(chi_path)
+	local open_resp = send_cmd("open" .. srv .. " " .. path .. qp) or ""
 	local new_id = open_resp:match("opened tab (%S+)")
 	local htmx = saved and saved.htmx
 	if htmx and new_id then
 		vim.defer_fn(function()
-			send_cmd("navigate --tab=" .. new_id .. " " .. url)
+			send_cmd("navigate --tab=" .. new_id .. srv .. " " .. path .. qp)
 		end, 800)
 	end
-	return url
+	return path .. qp
 end
 
 return M

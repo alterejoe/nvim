@@ -3,21 +3,14 @@
 -- build_tab_lines: turn a list of fetched tabs into the multi-section
 -- text view shown in the dashboard primary buffer.
 --
--- Sections rendered (in order):
---   ### heading             (if any glob patterns matched)
---     ## group              (tabs that match a group's chi_path)
---     ## ungrouped          (tabs in this heading but in no group)
---   ### Other               (everything that didn't match a heading)
---     ## group / ungrouped  (same shape as above)
+-- Layout per line:
+--   <prefix><GET ><content>
 --
--- Returns three values:
---   lines  - the buffer lines (each tab line prefixed with "GET ")
---   meta   - { content_string -> {tab_id, path, chi_path, htmx, active} }
---            keyed by content (post-prefix), used by typed_diff and on_save
---   counts - { tab_id -> count } counts how many display lines each tab
---            got. Multi-group tabs appear under multiple groups, so
---            counts[id] can be > 1 even though meta[content] collapses
---            duplicates. Required for delete-one-deletes-all in on_save_tabs.
+-- prefix is "(server) " when the tab matches a #### server tag, empty
+-- otherwise. The meta map is keyed by content (without prefix and
+-- without "GET "), so util.strip_prefix on a buffer line returns the
+-- same string. This lets every existing tab_metadata lookup work
+-- without per-call adjustments.
 
 local M = {}
 
@@ -27,10 +20,8 @@ local yaml_io = require("browser.dashboard.tabops.yaml_io")
 function M.build_tab_lines(tabs, show_chi_path)
 	local groups = require("browser.groups").load_groups()
 	local headings = yaml_io.load_headings()
+	local server_tags = yaml_io.load_server_tags()
 
-	-- Group names in the order they appear in groups.yaml. New names not
-	-- yet in the file are appended alphabetically. This order drives both
-	-- the matching iteration and the rendered section order.
 	local yaml_order = require("browser.yaml_order")
 	local sess = require("browser.session")
 	local group_names = yaml_order.resolve_order(
@@ -38,9 +29,13 @@ function M.build_tab_lines(tabs, show_chi_path)
 		groups,
 		yaml_order.read_top_level_order(sess.DEVPROXY_DIR .. "/groups.yaml", "groups")
 	)
+	local server_tag_order = yaml_order.read_top_level_order(sess.DEVPROXY_DIR .. "/server_tags.yaml", "server_tags")
 
-	-- tab_to_groups[tab_id] = { group_name = true, ... }
-	-- A tab can belong to multiple groups simultaneously.
+	for _, t in ipairs(tabs) do
+		local decoded = (t.path or ""):gsub("%%7B", "{"):gsub("%%7D", "}")
+		t.server = yaml_io.tab_server_for(decoded, server_tags, server_tag_order)
+	end
+
 	local tab_to_groups = {}
 	for _, name in ipairs(group_names) do
 		local chi_paths = type(groups[name]) == "table" and groups[name] or {}
@@ -70,9 +65,6 @@ function M.build_tab_lines(tabs, show_chi_path)
 		end
 	end
 
-	-- tab_to_tags[tab_id] = { tag_name = true, ... }
-	-- Tags are decorations only (no panel grouping) but show as pill
-	-- annotations on each tab line.
 	local all_tags = yaml_io.load_tags()
 	local tab_to_tags = {}
 	for tag_name, chi_paths in pairs(all_tags) do
@@ -117,11 +109,6 @@ function M.build_tab_lines(tabs, show_chi_path)
 		return result
 	end
 
-	-- ----------------------------------------------------------------
-	-- Output buffers and emit helper.
-	-- emit() is the only place that produces a tab line; it updates
-	-- meta and counts atomically so they stay in sync.
-	-- ----------------------------------------------------------------
 	local lines = {}
 	local meta = {}
 	local counts = {}
@@ -129,21 +116,22 @@ function M.build_tab_lines(tabs, show_chi_path)
 	local function emit(t)
 		local tag_names = get_tag_names(t.id)
 		local content = fetch.make_content(t, show_chi_path, tag_names)
-		table.insert(lines, "GET " .. content)
+		local prefix = ""
+		if t.server and t.server ~= "" then
+			prefix = "(" .. t.server .. ") "
+		end
+		table.insert(lines, prefix .. "GET " .. content)
 		meta[content] = {
 			tab_id = t.id,
 			path = t.path,
 			chi_path = t.chi_path,
 			htmx = t.htmx,
 			active = t.active,
+			server = t.server,
 		}
 		counts[t.id] = (counts[t.id] or 0) + 1
 	end
 
-	-- emit_under_heading: render groups (then ungrouped) within a heading.
-	-- seen_in_heading prevents the same tab appearing twice within one
-	-- heading even if it matches multiple groups (the first matching
-	-- group wins for that heading).
 	local function emit_under_heading(heading_tabs)
 		local seen_in_heading = {}
 		for _, name in ipairs(group_names) do
@@ -181,11 +169,6 @@ function M.build_tab_lines(tabs, show_chi_path)
 		end
 	end
 
-	-- ----------------------------------------------------------------
-	-- Phase 1: emit each heading section.
-	-- A tab can only land in the FIRST matching heading
-	-- (seen_tab_ids guards this). Order honors headings.order.
-	-- ----------------------------------------------------------------
 	local seen_tab_ids = {}
 	for _, hname in ipairs(headings.order) do
 		local pats = headings.patterns[hname] or {}
@@ -204,11 +187,6 @@ function M.build_tab_lines(tabs, show_chi_path)
 		end
 	end
 
-	-- ----------------------------------------------------------------
-	-- Phase 2: everything that didn't match any heading.
-	-- Rendered under "### Other" if any headings were emitted; otherwise
-	-- the groups/ungrouped sections appear at the top level.
-	-- ----------------------------------------------------------------
 	local remaining = {}
 	for _, t in ipairs(tabs) do
 		if not seen_tab_ids[t.id] then

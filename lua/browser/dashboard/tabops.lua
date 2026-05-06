@@ -9,20 +9,12 @@
 --   tabops.make_content(...)
 --   tabops.infer_chi_path(...)
 --   tabops.load_tags() / save_tags() / load_headings() / save_headings()
+--   tabops.load_server_tags() / save_server_tags()
+--   tabops.tab_server_for(...)
 --   tabops.navigate_tab(...) / open_path(...)
 --   tabops.on_save_tabs(state)
 --
 -- without touching their require sites.
---
--- Submodule responsibilities:
---   yaml_io.lua  - tags.yaml + headings.yaml read/write, glob matching
---   fetch.lua    - sync-tabs over socket, infer_chi_path, make_content,
---                  groups_chi_list (private cross-module helper)
---   render.lua   - build_tab_lines (assembles the multi-section view,
---                  returns lines + meta + counts)
---   navigate.lua - navigate_tab, open_path
---   save.lua     - on_save_tabs (delete-one-deletes-all, param edits,
---                  new tab opens)
 
 local yaml_io = require("browser.dashboard.tabops.yaml_io")
 local fetch = require("browser.dashboard.tabops.fetch")
@@ -37,6 +29,10 @@ M.load_tags = yaml_io.load_tags
 M.save_tags = yaml_io.save_tags
 M.load_headings = yaml_io.load_headings
 M.save_headings = yaml_io.save_headings
+M.load_server_tags = yaml_io.load_server_tags
+M.save_server_tags = yaml_io.save_server_tags
+M.tab_server_for = yaml_io.tab_server_for
+M.matches_glob = yaml_io.matches_glob
 
 -- fetch
 M.fetch_tabs = fetch.fetch_tabs

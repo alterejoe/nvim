@@ -89,6 +89,8 @@ function M.navigate_tab(meta, htmx, tab_htmx)
 	-- operate WITHOUT changing focus).
 	send_cmd("switch " .. meta.tab_id)
 
+	local srv = (meta.server and meta.server ~= "") and (" --server=" .. meta.server) or ""
+	vim.notify("browser: srv=" .. srv .. " server=" .. tostring(meta.server))
 	local chi = meta.chi_path or fetch.infer_chi_path(meta)
 	if chi then
 		local views = require("browser.views")
@@ -108,12 +110,12 @@ function M.navigate_tab(meta, htmx, tab_htmx)
 		local qp = views.build_query_string(views.query_for_route(views.get_active_context(), chi, saved.query_keys))
 		local base = views.get_active_base()
 		local cmd = htmx and "navigate" or "navigate-full"
-		send_cmd(cmd .. " --tab=" .. meta.tab_id .. " " .. base .. resolved .. qp)
+		send_cmd(cmd .. " --tab=" .. meta.tab_id .. srv .. " " .. base .. resolved .. qp)
 		vim.notify(string.format("browser: %s%s%s", resolved, qp, htmx and " [partial]" or " [full]"))
 	else
 		-- No chi_path inferred; navigate using the literal path as-is.
 		local cmd = htmx and "navigate" or "navigate-full"
-		send_cmd(cmd .. " --tab=" .. meta.tab_id .. " " .. get_base_url() .. meta.path)
+		send_cmd(cmd .. " --tab=" .. meta.tab_id .. srv .. " " .. get_base_url() .. meta.path)
 		vim.notify("browser: " .. (htmx and "[partial]" or "[full]") .. " " .. meta.path)
 	end
 end

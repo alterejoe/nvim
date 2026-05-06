@@ -200,6 +200,18 @@ function M.open()
 
 	state._update_help_pane = update_help_pane
 
+	local function update_server_title()
+		if not (state.primary_win and vim.api.nvim_win_is_valid(state.primary_win)) then
+			return
+		end
+		local raw = send_cmd("active-server")
+		local name = raw and raw:match("ok: (%S+)") or "?"
+		pcall(vim.api.nvim_win_set_config, state.primary_win, {
+			title = " " .. util.TITLE .. " [" .. name .. "] ",
+			title_pos = "center",
+		})
+	end
+	state.update_server_title = update_server_title
 	local tabs = tabops.fetch_tabs(state.tab_htmx)
 	if #tabs == 0 then
 		vim.notify("browser: no open tabs", vim.log.levels.WARN)
@@ -300,10 +312,12 @@ function M.open()
 					return true
 				end
 				local all_lines = vim.api.nvim_buf_get_lines(state.primary_buf, 0, -1, false)
-				local groups, tags, headings, group_order, tag_order = util.parse_group_buf(all_lines)
+				local groups, tags, headings, server_tags, group_order, tag_order, server_tag_order =
+					util.parse_group_buf(all_lines)
 				require("browser.groups").save_groups(groups, group_order)
 				tabops.save_tags(tags, tag_order)
 				tabops.save_headings(headings)
+				tabops.save_server_tags(server_tags, server_tag_order)
 				vim.notify("browser.groups: saved")
 				return true
 			end
@@ -449,9 +463,18 @@ function M.open()
 							break
 						end
 					end
+					local pmeta
+					for _, m in pairs(state.tab_metadata) do
+						if m.tab_id == state.preview_tab_id then
+							pmeta = m
+							break
+						end
+					end
+					local psrv = (pmeta and pmeta.server and pmeta.server ~= "") and (" --server=" .. pmeta.server)
+						or ""
 					local cmd = htmx and "navigate" or "navigate-full"
 					send_cmd("switch " .. state.preview_tab_id)
-					send_cmd(cmd .. " --tab=" .. state.preview_tab_id .. " " .. get_base_url() .. path_query)
+					send_cmd(cmd .. " --tab=" .. state.preview_tab_id .. psrv .. " " .. get_base_url() .. path_query)
 					state.tab_htmx[state.preview_tab_id] = htmx
 					vim.notify("browser: " .. (htmx and "[partial]" or "[full]") .. " " .. path_query)
 					return true
@@ -520,6 +543,7 @@ function M.open()
 				restore_tabs_fn = restore_tabs,
 				do_buf_refresh_fn = do_buf_refresh,
 			})
+			update_server_title()
 		end,
 	})
 end

@@ -1,18 +1,12 @@
 -- browser/dashboard/tabops/yaml_io.lua
 --
--- YAML read/write for the three editable files driven by the gz buffer:
---   tags.yaml      - tab annotations (chi_path -> tag names)
---   headings.yaml  - panel section headers (glob patterns)
+-- YAML read/write for the editable files driven by the gz buffer:
+--   tags.yaml         - tab annotations (chi_path -> tag names)
+--   headings.yaml     - panel section headers (glob patterns)
+--   server_tags.yaml  - per-tab server bindings (server name -> globs)
 --
 -- Plus the matches_glob helper used by render.lua to decide which tabs
--- belong under which heading.
---
--- groups.yaml is owned by browser/groups.lua, not here, because groups
--- have richer behavior (open_group, cycle_next, M.pick, etc).
---
--- Save sites snapshot the existing file via groups_history before write
--- so accidental overwrites can be recovered. Save honors an optional
--- `order` parameter; see yaml_order.lua for the resolve_order rules.
+-- belong under which heading or server tag.
 
 local M = {}
 
@@ -84,7 +78,6 @@ function M.headings_path()
 end
 
 function M.load_headings()
-	-- Returns { order=[names], patterns={name=[globs]} }
 	local path = headings_path()
 	if vim.fn.filereadable(path) == 0 then
 		return { order = {}, patterns = {} }
@@ -105,10 +98,6 @@ function M.load_headings()
 end
 
 function M.save_headings(headings)
-	-- headings: { order=[names], patterns={name=[globs]} }
-	-- Headings always use the explicit order from headings.order; no
-	-- "preserve file order" logic needed because parse_group_buf already
-	-- captures buffer order into headings.order during the line walk.
 	local path = headings_path()
 	require("browser.groups_history").snapshot(path)
 	local lines = { "headings:" }
@@ -130,17 +119,80 @@ function M.save_headings(headings)
 end
 
 -- ============================================================
--- glob matching for headings
+-- server_tags.yaml
+-- ============================================================
+
+local function server_tags_path()
+	return devproxy_dir() .. "/server_tags.yaml"
+end
+
+function M.server_tags_path()
+	return server_tags_path()
+end
+
+function M.load_server_tags()
+	local path = server_tags_path()
+	if vim.fn.filereadable(path) == 0 then
+		return {}
+	end
+	local raw = vim.fn.system("yq -o=json . " .. vim.fn.shellescape(path) .. " 2>/dev/null")
+	local ok, data = pcall(vim.json.decode, raw)
+	if not ok or not data or not data.server_tags or type(data.server_tags) ~= "table" then
+		return {}
+	end
+	local result = {}
+	for name, paths in pairs(data.server_tags) do
+		result[name] = type(paths) == "table" and paths or {}
+	end
+	return result
+end
+
+function M.save_server_tags(server_tags, order)
+	local path = server_tags_path()
+	require("browser.groups_history").snapshot(path)
+
+	local yaml_order = require("browser.yaml_order")
+	local existing = yaml_order.read_top_level_order(path, "server_tags")
+	local final_order = yaml_order.resolve_order(order, server_tags, existing)
+
+	local lines = { "server_tags:" }
+	for _, name in ipairs(final_order) do
+		table.insert(lines, "  " .. name .. ":")
+		for _, p in ipairs(server_tags[name] or {}) do
+			table.insert(lines, "    - " .. p)
+		end
+	end
+	local f = io.open(path, "w")
+	if f then
+		f:write(table.concat(lines, "\n") .. "\n")
+		f:close()
+	end
+end
+
+-- ============================================================
+-- glob matching for headings + server tags
 -- Supports:
---   /admin/*     trailing * matches any single suffix (no slashes)
---   /admin/**    trailing ** matches any suffix including slashes
---   /**/edit/*   ** in the middle matches any path segments
+--   /admin/*     trailing * matches any single path segment (no slashes)
+--   /admin/**    trailing ** matches the prefix exactly OR any suffix
+--                including slashes. /admin/** matches both /admin AND
+--                /admin/foo/bar. This is the "this or everything under it"
+--                semantics most glob systems use.
+--   /**/edit/*  ** in the middle matches any path segments (any chars)
 --   /exact/path  exact match
 -- ============================================================
 function M.matches_glob(path, pattern)
 	path = (path:match("^([^?#]+)") or path):gsub("%%7B", "{"):gsub("%%7D", "}")
-	-- Convert glob to a Lua pattern: escape magic chars except *, then
-	-- handle ** (any chars including /) before * (any non-slash chars).
+
+	-- Special case: if the pattern ends with "/**", also accept the
+	-- prefix without the trailing slash. So "/proofing/**" matches
+	-- "/proofing", "/proofing/", and "/proofing/anything/here".
+	local prefix = pattern:match("^(.+)/%*%*$")
+	if prefix and prefix ~= "" then
+		if path == prefix then
+			return true
+		end
+	end
+
 	local lua_pat = pattern
 		:gsub("([%.%+%-%^%$%(%)%[%]%%])", "%%%1")
 		:gsub("%*%*", "DOUBLESTAR")
@@ -157,6 +209,34 @@ function M.tab_matches_heading(tab_path, patterns)
 		end
 	end
 	return false
+end
+
+function M.tab_server_for(tab_path, server_tags, order)
+	if not server_tags then
+		return nil
+	end
+	if order then
+		for _, name in ipairs(order) do
+			local pats = server_tags[name]
+			if type(pats) == "table" then
+				for _, pat in ipairs(pats) do
+					if M.matches_glob(tab_path, pat) then
+						return name
+					end
+				end
+			end
+		end
+	end
+	for name, pats in pairs(server_tags) do
+		if type(pats) == "table" then
+			for _, pat in ipairs(pats) do
+				if M.matches_glob(tab_path, pat) then
+					return name
+				end
+			end
+		end
+	end
+	return nil
 end
 
 return M

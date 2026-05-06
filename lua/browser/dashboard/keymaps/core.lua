@@ -13,6 +13,7 @@
 --   <leader>w     - curl preview (http view only)
 --   <C-w> + lhwjk - close split if focused, otherwise close dashboard
 --   :             - path picker / attr insert / path insert (context-aware)
+--   0             - cycle active server (admin/client/auth0)
 -- browser/dashboard/keymaps/core.lua
 --
 -- Generic keymaps that don't belong to a single panel.
@@ -381,6 +382,38 @@ function M.register(ctx)
 			end
 		end)
 	end, "Path picker / insert attr / insert path")
+
+	-- ----------------------------------------------------------------
+	-- 0: cycle active server. Rotates through all known servers,
+	-- updates the window title, and refreshes tab lines so server
+	-- prefixes reflect the new default.
+	-- ----------------------------------------------------------------
+	map("0", function()
+		local raw = send_cmd("servers")
+		if not raw or vim.startswith(raw, "err:") then
+			return
+		end
+		local ok, servers = pcall(vim.json.decode, raw)
+		if not ok or type(servers) ~= "table" or #servers == 0 then
+			return
+		end
+		-- Find current active index and pick next.
+		local current_idx = 1
+		for i, s in ipairs(servers) do
+			if s.active then
+				current_idx = i
+				break
+			end
+		end
+		local next_idx = (current_idx % #servers) + 1
+		local next_name = servers[next_idx].name
+		send_cmd("switch-server " .. next_name)
+		if state.update_server_title then
+			state.update_server_title()
+		end
+		do_buf_refresh(buf)
+		vim.notify("browser: active server -> " .. next_name)
+	end, "Cycle active server")
 end
 
 return M

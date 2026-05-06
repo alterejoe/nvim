@@ -26,16 +26,19 @@ function M.register(ctx)
 
 	-- ----------------------------------------------------------------
 	-- open_group_editor
-	-- Renders groups.yaml + headings.yaml + tags.yaml into the dashboard
-	-- primary buffer as an editable text view. Sets view_mode = "groups"
-	-- so on_save dispatches to the group save handler.
+	-- Renders groups.yaml + headings.yaml + tags.yaml + server_tags.yaml
+	-- into the dashboard primary buffer as an editable text view. Sets
+	-- view_mode = "groups" so on_save dispatches to the group save handler.
 	--
-	-- Group and tag names are read from disk in the order they appear
-	-- in their yaml files (via yaml_order.read_top_level_order). New
-	-- names not yet in the file get appended alphabetically. This way:
-	--   - reordering in the buffer + W persists the new order
-	--   - reopening gz reflects the saved order, not alphabetical
-	-- Headings already use headings.order from disk and need no change.
+	-- Section markers in the editor:
+	--   #    group       chi_path templates
+	--   ##   heading     glob patterns
+	--   ###  tag         chi_path templates
+	--   #### server_tag  glob patterns; binds tab to server name
+	--
+	-- Order on disk drives buffer order. New names not yet in their file
+	-- get appended alphabetically (yaml_order.resolve_order). Reordering
+	-- in the buffer + W persists the new order.
 	-- ----------------------------------------------------------------
 	local function open_group_editor()
 		if state.view_mode == "groups" then
@@ -48,6 +51,7 @@ function M.register(ctx)
 		local groups = require("browser.groups").load_groups()
 		local headings = tabops.load_headings()
 		local tags = tabops.load_tags()
+		local server_tags = tabops.load_server_tags()
 		local new_lines = {}
 
 		local yaml_order = require("browser.yaml_order")
@@ -90,7 +94,21 @@ function M.register(ctx)
 			table.insert(new_lines, "")
 		end
 
-		if #group_names == 0 and #headings.order == 0 and #tag_names == 0 then
+		-- #### server tags (glob patterns) - order from server_tags.yaml file
+		local server_tag_names = yaml_order.resolve_order(
+			nil,
+			server_tags,
+			yaml_order.read_top_level_order(sess.DEVPROXY_DIR .. "/server_tags.yaml", "server_tags")
+		)
+		for _, name in ipairs(server_tag_names) do
+			table.insert(new_lines, "#### " .. name)
+			for _, p in ipairs(type(server_tags[name]) == "table" and server_tags[name] or {}) do
+				table.insert(new_lines, p)
+			end
+			table.insert(new_lines, "")
+		end
+
+		if #group_names == 0 and #headings.order == 0 and #tag_names == 0 and #server_tag_names == 0 then
 			table.insert(new_lines, "# new-group")
 			table.insert(new_lines, "")
 		end
@@ -102,7 +120,7 @@ function M.register(ctx)
 		vim.bo[buf].filetype = "scratchbuf"
 		vim.bo[buf].modified = false
 		state.view_mode = "groups"
-		vim.notify("browser: group editor - W=save  :=add path  CR=open  gz/r=back  #=group  ###=tag")
+		vim.notify("browser: group editor - W=save  :=add path  CR=open  gz/r=back  #=group  ###=tag  ####=server")
 	end
 
 	-- Expose for cross-submodule use (history picker on_done callback).
@@ -112,21 +130,15 @@ function M.register(ctx)
 	-- Keymaps
 	-- ----------------------------------------------------------------
 
-	-- gz: register manually (not via map) because state.registered_keymaps
-	-- needs the explicit insert with the same fn reference for split-copy
-	-- to work, and we want the callback to be the local open_group_editor.
 	vim.keymap.set("n", "gz", open_group_editor, { buffer = buf, nowait = true, noremap = true, desc = "Group editor" })
 	table.insert(state.registered_keymaps, { lhs = "gz", fn = open_group_editor, desc = "Group editor" })
 
-	-- <leader>u: groups view shows the history picker; outside groups
-	-- mode this falls through to the global undotree binding.
 	local function leader_u()
 		if state.view_mode ~= "groups" then
 			vim.cmd.UndotreeToggle()
 			return
 		end
 		require("browser.groups_history").pick(function()
-			-- Re-open the group editor so the restored yaml is reflected.
 			open_group_editor()
 		end)
 	end
@@ -138,7 +150,6 @@ function M.register(ctx)
 	})
 	table.insert(state.registered_keymaps, { lhs = "<leader>u", fn = leader_u, desc = "Groups history (or undotree)" })
 
-	-- +: add the current tab to a group via path picker.
 	map("+", function()
 		if state.view_mode ~= "tabs" then
 			return

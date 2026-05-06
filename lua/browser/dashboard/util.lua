@@ -30,6 +30,7 @@ vim.api.nvim_set_hl(0, "BrowserHttp5xx", { fg = "#f44336", bold = true })
 vim.api.nvim_set_hl(0, "BrowserHdrKey", { fg = "#56b6c2" })
 vim.api.nvim_set_hl(0, "BrowserHdrVal", { fg = "#888899" })
 vim.api.nvim_set_hl(0, "BrowserTag", { fg = "#e06c75", italic = true })
+vim.api.nvim_set_hl(0, "BrowserServerTag", { fg = "#56b6c2", bold = true })
 vim.api.nvim_set_hl(0, "BrowserJsonKey", { fg = "#c678dd" })
 vim.api.nvim_set_hl(0, "BrowserJsonStr", { fg = "#98c379" })
 
@@ -41,6 +42,8 @@ function M.browser_highlights(target_win)
 	ma("{[^}]\\+}", "BrowserParam", 12)
 	ma("\\[partial\\]", "BrowserPartial", 13)
 	ma("\\[full\\]", "BrowserFull", 13)
+	-- (server) prefix on tab lines
+	ma("^(\\a[a-zA-Z0-9_-]*) ", "BrowserServerTag", 12)
 	ma("^\\%(GET\\|POST\\|PUT\\|PATCH\\|DELETE\\) ", "BrowserMethod", 11)
 	ma("^## .*", "BrowserGroup", 11)
 	ma("\\s\\+\\[[0-9A-Fa-f]\\{8\\}\\]", "BrowserTabID", 10)
@@ -63,15 +66,23 @@ end
 
 -- ============================================================
 -- strip_prefix
--- Strips a leading HTTP method prefix (e.g. "GET ") from a line.
+-- Strips a leading "(server) " server prefix AND/OR a leading
+-- HTTP method prefix ("GET ") from a line. The server prefix
+-- appears before the method on tab lines that have a server tag
+-- binding, so we strip it first.
 -- ============================================================
 function M.strip_prefix(line)
+	local stripped = vim.trim(line)
+	local server_rest = stripped:match("^%([%w_%-]+%)%s+(.*)$")
+	if server_rest then
+		stripped = server_rest
+	end
 	for _, pfx in ipairs(M.PREFIXES) do
-		if vim.startswith(line, pfx) then
-			return vim.trim(line:sub(#pfx + 1))
+		if vim.startswith(stripped, pfx) then
+			return vim.trim(stripped:sub(#pfx + 1))
 		end
 	end
-	return vim.trim(line)
+	return stripped
 end
 
 -- ============================================================
@@ -139,32 +150,44 @@ function M.format_html(raw)
 end
 
 -- ============================================================
--- REPLACE function M.parse_group_buf in
---   ~/.config/nvim/lua/browser/dashboard/util.lua
--- (lines ~147-209) with this version. Adds group_order and
--- tag_order to the returns. Headings already has its own order.
+-- parse_group_buf
+--
+-- Parses the gz buffer into the four declarable kinds:
+--   #    group       chi_path templates
+--   ##   heading     glob patterns; defines panel sections
+--   ###  tag         chi_path templates; decorations on tab lines
+--   #### server tag  glob patterns; binds tab to server name = tag name
+--
+-- Server tags are 1:1 (one server per tab) - if a tab matches multiple
+-- server-tag globs, the first one wins. The tag NAME is the server name
+-- (must exist in config.yaml's servers map).
+--
+-- Returns: groups, tags, headings, server_tags, group_order, tag_order, server_tag_order
+--   groups           = { name = [chi_paths] }
+--   tags             = { name = [chi_paths] }
+--   headings         = { order = [names], patterns = { name = [globs] } }
+--   server_tags      = { name = [globs] }   -- each name is a server name
+--   group_order      = [names]
+--   tag_order        = [names]
+--   server_tag_order = [names]
 -- ============================================================
-
 function M.parse_group_buf(lines)
-	-- ## heading   glob patterns below it define which tabs appear under it in the panel
-	-- #  group     chi_path templates for grouping tabs
-	-- ### tag      chi_path templates for tab annotations
-	-- Returns: groups, tags, headings, group_order, tag_order
-	--   groups      = { name = [chi_paths] }
-	--   tags        = { name = [chi_paths] }
-	--   headings    = { order = [names], patterns = { name = [globs] } }
-	--   group_order = [names]   -- buffer order of group definitions
-	--   tag_order   = [names]   -- buffer order of tag definitions
 	local groups = {}
 	local tags = {}
 	local headings = { order = {}, patterns = {} }
+	local server_tags = {}
 	local group_order = {}
 	local tag_order = {}
+	local server_tag_order = {}
 	local current = nil
-	local current_type = nil -- "group" | "tag" | "heading"
+	local current_type = nil -- "group" | "tag" | "heading" | "server_tag"
 
 	local function strip_path(line)
 		local p = vim.trim(line)
+		local rest = p:match("^%([%w_%-]+%)%s+(.*)$")
+		if rest then
+			p = rest
+		end
 		p = p:gsub("^%u+%s+", "")
 		p = p:gsub("%s+%[%x+%].*$", "")
 		p = p:gsub("%s+%[partial%].*$", "")
@@ -174,11 +197,30 @@ function M.parse_group_buf(lines)
 	end
 
 	for _, line in ipairs(lines) do
-		local tag_name = line:match("^###%s*(.+)")
-		local hdg_name = not tag_name and (line:match("^##([^#].*)") or line:match("^##$"))
-		local grp_name = not tag_name and not hdg_name and (line:match("^#([^#].*)") or line:match("^#$"))
+		-- Order matters: longest prefix first. #### must be checked
+		-- before ###/##/#.
+		local server_name = line:match("^####%s*(.+)") or (line:match("^####$") and "")
+		local tag_name = not server_name and line:match("^###%s*(.+)")
+		local hdg_name = not server_name and not tag_name and (line:match("^##([^#].*)") or line:match("^##$"))
+		local grp_name = not server_name
+			and not tag_name
+			and not hdg_name
+			and (line:match("^#([^#].*)") or line:match("^#$"))
 
-		if tag_name then
+		if server_name then
+			server_name = vim.trim(server_name)
+			if server_name ~= "" then
+				current = server_name
+				current_type = "server_tag"
+				if not server_tags[current] then
+					server_tags[current] = {}
+					table.insert(server_tag_order, current)
+				end
+			else
+				current = nil
+				current_type = nil
+			end
+		elseif tag_name then
 			current = vim.trim(tag_name)
 			current_type = "tag"
 			if not tags[current] then
@@ -212,11 +254,13 @@ function M.parse_group_buf(lines)
 					table.insert(groups[current], path)
 				elseif current_type == "heading" then
 					table.insert(headings.patterns[current], path)
+				elseif current_type == "server_tag" then
+					table.insert(server_tags[current], path)
 				end
 			end
 		end
 	end
-	return groups, tags, headings, group_order, tag_order
+	return groups, tags, headings, server_tags, group_order, tag_order, server_tag_order
 end
 
 -- ============================================================
