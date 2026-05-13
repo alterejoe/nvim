@@ -1,0 +1,14 @@
+**/**/_data**
+**/**/*.env*
+**/*.env*
+*/**/node_modules
+*/tests/**
+node_modules
+*/__debug_*
+*/**/__debug_*
+**/**/tmp/**
+./ansible/vaults/
+gitleaks-report.json
+_dockerdata/
+backups/
+.signin

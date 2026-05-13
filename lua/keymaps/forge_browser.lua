@@ -76,7 +76,8 @@ local function open_handler_url(partial)
 	end
 
 	local url = BASE_URL .. path
-	local cmd = partial and ("navigate " .. url) or ("navigate-full " .. url)
+	local cmd = partial and ("navigate " .. path) or ("navigate-full " .. "http://localhost:19878" .. path)
+
 	local r = send_cmd(cmd)
 	if r then
 		vim.notify(string.format("[%s] %s", action.data.handler_func or "?", r))

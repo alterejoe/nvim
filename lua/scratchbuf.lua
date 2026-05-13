@@ -1,56 +1,96 @@
 --[[
-scratchbuf.lua v2
+scratchbuf.lua v3
 Generic oil.nvim-style editable list buffer with optional multi-pane layout.
+
+Changes in v3:
+  - diff() is now count-aware: if a value appears more times in current than
+    original, the extras are treated as created entries (not reordered).
+    Shortfalls are treated as deleted. This fixes V+p duplicate-and-rename
+    workflows where pasting a copy of an existing line was previously invisible
+    to the diff.
+  - fuzzy_filter restores the full line list into the buffer on <CR> so that
+    the buffer always contains the complete (unfiltered) content when save
+    fires. The cursor is left on the line the user had selected in the filter.
 --]]
 local M = {}
 local km = require("keymaps.scratchbuf")
 
 local function diff(original, current)
-	local orig_idx = {}
-	for i, v in ipairs(original) do
-		orig_idx[v] = i
+	local orig_counts = {}
+	for _, v in ipairs(original) do
+		orig_counts[v] = (orig_counts[v] or 0) + 1
 	end
-	local curr_idx = {}
-	for i, v in ipairs(current) do
-		curr_idx[v] = i
+	local curr_counts = {}
+	for _, v in ipairs(current) do
+		curr_counts[v] = (curr_counts[v] or 0) + 1
 	end
+
+	local orig_set = {}
+	for _, v in ipairs(original) do
+		orig_set[v] = true
+	end
+	local curr_set = {}
+	for _, v in ipairs(current) do
+		curr_set[v] = true
+	end
+
 	local renamed, deleted, created = {}, {}, {}
+
+	-- positional rename detection
 	for i, orig in ipairs(original) do
-		if not curr_idx[orig] then
+		if not curr_set[orig] then
 			local curr = current[i]
-			if curr and curr ~= "" and not orig_idx[curr] then
+			if curr and curr ~= "" and not orig_set[curr] then
 				table.insert(renamed, { old = orig, new = curr })
 			else
 				table.insert(deleted, orig)
 			end
 		end
 	end
-	for i, curr in ipairs(current) do
-		if curr ~= "" and not orig_idx[curr] then
-			local orig = original[i]
-			if not orig then
-				table.insert(created, curr)
+
+	-- count-based extra creations (duplicates pasted in)
+	local all_values = {}
+	for v in pairs(curr_counts) do all_values[v] = true end
+	for v in pairs(orig_counts) do all_values[v] = true end
+	for v in pairs(all_values) do
+		local orig_c = orig_counts[v] or 0
+		local curr_c = curr_counts[v] or 0
+		if curr_c > orig_c then
+			for _ = 1, curr_c - orig_c do
+				table.insert(created, v)
 			end
 		end
 	end
-	local reordered = false
-	if #original == #current then
-		local all_present = true
-		for _, v in ipairs(original) do
-			if not curr_idx[v] then
-				all_present = false
-				break
-			end
-		end
-		if all_present then
-			for i, v in ipairs(original) do
-				if current[i] ~= v then
-					reordered = true
-					break
+
+	-- brand-new values at positions beyond original length
+	for i, curr in ipairs(current) do
+		if curr ~= "" and not orig_set[curr] then
+			local orig = original[i]
+			if not orig then
+				local already = false
+				for _, c in ipairs(created) do
+					if c == curr then already = true; break end
+				end
+				if not already then
+					table.insert(created, curr)
 				end
 			end
 		end
 	end
+
+	local reordered = false
+	if #original == #current then
+		local all_present = true
+		for _, v in ipairs(original) do
+			if not curr_set[v] then all_present = false; break end
+		end
+		if all_present then
+			for i, v in ipairs(original) do
+				if current[i] ~= v then reordered = true; break end
+			end
+		end
+	end
+
 	return { renamed = renamed, deleted = deleted, created = created, reordered = reordered, order = current }
 end
 
@@ -149,10 +189,7 @@ local function typed_diff(orig_parsed, curr_parsed, metadata)
 	end
 	if #orig_common == #curr_common then
 		for i, v in ipairs(orig_common) do
-			if curr_common[i] ~= v then
-				reordered = true
-				break
-			end
+			if curr_common[i] ~= v then reordered = true; break end
 		end
 	end
 	return { renamed = renamed, deleted = deleted, created = created, reordered = reordered, order = curr_parsed }
@@ -166,6 +203,8 @@ end
 local function fuzzy_filter(buf, win, lines)
 	local ns = vim.api.nvim_create_namespace("scratchbuf_filter")
 	local query = ""
+	local last_filtered = lines
+
 	local function apply(q)
 		local filtered = {}
 		for _, l in ipairs(lines) do
@@ -176,17 +215,20 @@ local function fuzzy_filter(buf, win, lines)
 		if #filtered == 0 then
 			filtered = lines
 		end
+		last_filtered = filtered
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, filtered)
 		vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 		vim.api.nvim_buf_set_extmark(buf, ns, 0, 0, {
-			virt_text = { { "  /" .. q .. "¿", "Comment" } },
+			virt_text = { { "  /" .. q .. "Û", "Comment" } },
 			virt_text_pos = "eol",
 		})
 		vim.api.nvim_win_set_cursor(win, { 1, 0 })
 		vim.cmd("redraw")
 		return filtered
 	end
+
 	apply("")
+
 	local function loop()
 		while true do
 			local ok, ch = pcall(vim.fn.getcharstr)
@@ -194,12 +236,27 @@ local function fuzzy_filter(buf, win, lines)
 				break
 			end
 			if ch == "\27" then
+				-- ESC: restore full list, abandon filter
 				vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 				vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 				vim.cmd("redraw")
 				break
 			elseif ch == "\r" then
+				-- CR: remember selected line, restore full buffer, place cursor
 				vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+				local sel_row = vim.api.nvim_win_get_cursor(win)[1]
+				local sel_line = last_filtered[sel_row]
+				-- restore full unfiltered content
+				vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+				-- move cursor to the selected line in the full list
+				if sel_line then
+					for i, l in ipairs(lines) do
+						if l == sel_line then
+							pcall(vim.api.nvim_win_set_cursor, win, { i, 0 })
+							break
+						end
+					end
+				end
 				vim.cmd("redraw")
 				break
 			elseif is_backspace(ch) then
@@ -313,7 +370,7 @@ end
 
 vim.api.nvim_set_hl(0, "ScratchbufVisual", { bg = "#2a6faa", fg = "#ffffff", bold = true })
 vim.api.nvim_set_hl(0, "ScratchbufCursorLine", { bg = "#1e2a3a" })
-vim.api.nvim_set_hl(0, "ScratchbufCursorLineV", { bg = "NONE" }) -- transparent in v mode
+vim.api.nvim_set_hl(0, "ScratchbufCursorLineV", { bg = "NONE" })
 
 local function set_win_opts(win, buf)
 	vim.wo[win].cursorline = true
@@ -321,15 +378,14 @@ local function set_win_opts(win, buf)
 	vim.wo[win].signcolumn = "no"
 	vim.wo[win].wrap = false
 	vim.wo[win].winhighlight = "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLine"
-	-- In charwise visual, clear CursorLine bg so Visual isn't occluded
 	if buf then
 		vim.api.nvim_create_autocmd("ModeChanged", {
 			buffer = buf,
 			callback = function()
 				local mode = vim.api.nvim_get_mode().mode
-				local hl = (mode == "v" or mode == "\22") and "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLineV"
+				local hl = (mode == "v" or mode == "\22")
+						and "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLineV"
 					or "Visual:ScratchbufVisual,CursorLine:ScratchbufCursorLine"
-				-- Apply to every window currently showing this buffer (including splits)
 				for _, w in ipairs(vim.api.nvim_list_wins()) do
 					if vim.api.nvim_win_is_valid(w) and vim.api.nvim_win_get_buf(w) == buf then
 						vim.wo[w].winhighlight = hl
@@ -385,9 +441,7 @@ local function setup_pane(pane, all_panes, layout, pane_opts)
 	local typed = pane_opts.prefixes ~= nil
 
 	local function map(lhs, rhs, desc, mode)
-		if not lhs then
-			return
-		end
+		if not lhs then return end
 		vim.keymap.set(mode or "n", lhs, rhs, { buffer = buf, nowait = true, noremap = true, desc = desc })
 	end
 
@@ -410,10 +464,7 @@ local function setup_pane(pane, all_panes, layout, pane_opts)
 
 	local my_idx = 1
 	for i, p in ipairs(all_panes) do
-		if p.buf == buf then
-			my_idx = i
-			break
-		end
+		if p.buf == buf then my_idx = i; break end
 	end
 
 	if #all_panes > 1 then
@@ -440,9 +491,7 @@ local function setup_pane(pane, all_panes, layout, pane_opts)
 		end,
 	})
 
-	if pane.role == "readonly" then
-		return
-	end
+	if pane.role == "readonly" then return end
 
 	if pane_opts.current then
 		local hl_ns = vim.api.nvim_create_namespace("scratchbuf_current_" .. buf)
@@ -459,9 +508,7 @@ local function setup_pane(pane, all_panes, layout, pane_opts)
 		map(k.open, function()
 			local raw_line = vim.api.nvim_get_current_line()
 			local line = vim.trim(raw_line)
-			if line == "" then
-				return
-			end
+			if line == "" then return end
 			local parsed_entry = nil
 			if typed then
 				local all_raw = get_lines(buf, true)
@@ -519,18 +566,13 @@ local function setup_pane(pane, all_panes, layout, pane_opts)
 		vim.cmd("startinsert")
 	end, "New entry above")
 
-	-- NOTE: d operator is NOT blocked here so dw/diw/etc work normally.
-	-- dd is mapped directly as cut via k.cut below.
 	map(k.cut, function()
 		local lnum = vim.api.nvim_win_get_cursor(win)[1]
 		local lines = vim.api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)
 		local raw = lines[1] or ""
 		local line = vim.trim(raw)
-		if line == "" then
-			return
-		end
+		if line == "" then return end
 		pane.scratch_reg = raw
-		-- Also yank to vim's default register so p works in any buffer
 		vim.fn.setreg('"', raw)
 		vim.fn.setreg("0", raw)
 		vim.api.nvim_buf_set_lines(buf, lnum - 1, lnum, false, {})
@@ -604,18 +646,10 @@ local function setup_pane(pane, all_panes, layout, pane_opts)
 				if ok then
 					vim.bo[buf].modified = false
 					local parts = {}
-					if #changes.renamed > 0 then
-						table.insert(parts, #changes.renamed .. " renamed")
-					end
-					if #changes.deleted > 0 then
-						table.insert(parts, #changes.deleted .. " deleted")
-					end
-					if #changes.created > 0 then
-						table.insert(parts, #changes.created .. " created")
-					end
-					if changes.reordered then
-						table.insert(parts, "reordered")
-					end
+					if #changes.renamed > 0 then table.insert(parts, #changes.renamed .. " renamed") end
+					if #changes.deleted > 0 then table.insert(parts, #changes.deleted .. " deleted") end
+					if #changes.created > 0 then table.insert(parts, #changes.created .. " created") end
+					if changes.reordered then table.insert(parts, "reordered") end
 					vim.notify(
 						"["
 							.. (pane_opts.title or "scratchbuf")
@@ -630,9 +664,7 @@ local function setup_pane(pane, all_panes, layout, pane_opts)
 						pane.scratch_reg = nil
 					elseif pane_opts.refresh and result ~= true then
 						vim.defer_fn(function()
-							if not vim.api.nvim_buf_is_valid(buf) then
-								return
-							end
+							if not vim.api.nvim_buf_is_valid(buf) then return end
 							local fresh = pane_opts.refresh()
 							vim.api.nvim_buf_set_lines(buf, 0, -1, false, fresh)
 							pane.original = vim.deepcopy(fresh)
@@ -752,7 +784,6 @@ function M.open(opts)
 		end
 	end
 
-	-- BufDelete on any pane closes all others
 	for _, pane in ipairs(all_panes) do
 		vim.api.nvim_create_autocmd("BufDelete", {
 			buffer = pane.buf,
@@ -786,9 +817,7 @@ function M.open(opts)
 		vim.api.nvim_create_autocmd("CursorMoved", {
 			buffer = primary_buf,
 			callback = function()
-				if not vim.api.nvim_buf_is_valid(primary_buf) then
-					return
-				end
+				if not vim.api.nvim_buf_is_valid(primary_buf) then return end
 				local line, parsed = resolve_cursor_entry(primary_buf, opts)
 				opts.on_cursor(line, parsed, layout)
 			end,

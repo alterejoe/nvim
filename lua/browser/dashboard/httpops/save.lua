@@ -1,30 +1,4 @@
 -- browser/dashboard/httpops/save.lua
---
--- on_save_http is the W handler for the http panel. It reads every
--- per-context section, derives:
---   path params  from the displayed (resolved) path, by segment-matching
---                against the chi_path template,
---   htmx         from each section's htmx: line,
---   query params from each section's params: block,
--- then persists each according to the storage layout:
---   path params  -> contexts.<ctx>.<key>            in config.yaml
---   query params -> contexts.<ctx>.query.<chi>.<k>  in config.yaml (wipe
---                   route block first, then write each entry; deleting
---                   a line removes the entry from config)
---   htmx         -> tests/<ctx?>/<slug>.http
---   query KEYS   -> same test file, under
---                     query:
---                       - keyname
---                   The key list is the source of truth for "what keys
---                   this route uses." Values stay in config.yaml so
---                   they're context-swappable.
---
--- After persistence:
---   - reload_config_silent so other readers see the changes,
---   - re-navigate the active tab to its new resolved URL,
---   - fan out: re-navigate other open tabs whose chi_path shares any
---     of the changed PATH params (query params are per-route and
---     don't fan out).
 
 local M = {}
 
@@ -35,14 +9,15 @@ local function send_cmd(cmd)
 	return require("browser.session").send_cmd(cmd)
 end
 
--- ============================================================
--- yq helpers
--- All write operations go through yq so config.yaml stays clean
--- (preserves unrelated keys, comments, and ordering).
--- ============================================================
+local function get_proxy_base(server)
+	local raw = send_cmd("proxy-port " .. (server or ""))
+	if raw and raw ~= "" and not vim.startswith(raw, "err") then
+		return "http://localhost:" .. vim.trim(raw)
+	end
+	return "http://localhost:19878"
+end
+
 local function yq_quote_path(s)
-	-- chi_paths contain slashes and braces; quote with double quotes
-	-- inside the yq path expression so they're treated as a single key.
 	return '"' .. s:gsub('"', '\\"') .. '"'
 end
 
@@ -57,9 +32,6 @@ local function yq_delete(yaml_path, dotted_path)
 	return vim.v.shell_error == 0
 end
 
--- ============================================================
--- on_save_http
--- ============================================================
 function M.on_save_http(state)
 	local buf = state.primary_buf
 	local all_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
@@ -86,9 +58,6 @@ function M.on_save_http(state)
 	for _, sec in ipairs(sections) do
 		local sec_ctx_key = sec.ctx == "" and "default" or sec.ctx
 
-		-- Derive path params from the displayed (injected) path. Walk
-		-- the chi template segments; wherever there's a {param}, take
-		-- the corresponding segment from the displayed path as its value.
 		local sec_path_params = {}
 		if sec.path and sec.path ~= "" then
 			local chi_s = util.segs(chi_path)
@@ -106,7 +75,6 @@ function M.on_save_http(state)
 			end
 		end
 
-		-- Persist path params under contexts.<ctx>.<key>.
 		if yaml_ok and next(sec_path_params) then
 			for k, v in pairs(sec_path_params) do
 				if not yq_set_string(yaml_path, "." .. ".contexts." .. sec_ctx_key .. "." .. k, v) then
@@ -115,9 +83,6 @@ function M.on_save_http(state)
 			end
 		end
 
-		-- Build q_map (the section's params block as a key->value table)
-		-- before writing. We need q_map for both the config.yaml writes
-		-- AND the test file's query_keys list.
 		local q_map = {}
 		local sec_qkeys = {}
 		for _, kv in ipairs(sec.params) do
@@ -127,10 +92,6 @@ function M.on_save_http(state)
 			end
 		end
 
-		-- Persist query params under contexts.<ctx>.query.<chi>.<key>.
-		-- Wipe-and-rewrite: delete the route block first, then write
-		-- each entry. Removing a line in the editor removes it from
-		-- config.
 		if yaml_ok then
 			local route_path = string.format(".contexts.%s.query[%s]", sec_ctx_key, yq_quote_path(chi_path))
 			yq_delete(yaml_path, route_path)
@@ -145,10 +106,6 @@ function M.on_save_http(state)
 			end
 		end
 
-		-- Persist htmx + query_keys to the test file. write_test_file
-		-- preserves any field not provided, so passing both htmx and
-		-- query_keys here makes the edited section authoritative for
-		-- both. q_map keys order isn't deterministic; sort for stability.
 		table.sort(sec_qkeys)
 		views.write_test_file(chi_path, sec.ctx, {
 			htmx = sec.htmx,
@@ -162,8 +119,6 @@ function M.on_save_http(state)
 
 	views.reload_config_silent()
 
-	-- Resolve a chi_path with the freshly-edited params, falling back
-	-- to the stored context for any param the user did not edit here.
 	local function resolve_direct(cp, new_params)
 		local existing = views.params_for_context(views.get_active_context())
 		local result = cp
@@ -179,14 +134,10 @@ function M.on_save_http(state)
 		return result
 	end
 
-	-- Re-navigate the current tab.
 	if state.http_tab_meta and chi_path then
 		local nav_path = resolve_direct(chi_path, active_path_params_changed)
 		if not nav_path:find("{") then
 			local qp = views.build_query_string(active_query_params)
-			local base = views.get_active_base()
-			-- Pick up htmx from the active context's section. Falls back
-			-- to the tab's stored htmx if the section didn't set it.
 			local htmx = state.http_tab_meta.htmx or false
 			for _, sec in ipairs(sections) do
 				local k = sec.ctx == "" and "default" or sec.ctx
@@ -195,23 +146,19 @@ function M.on_save_http(state)
 					break
 				end
 			end
-			-- The user just hit W in the http panel for THIS tab - they
-			-- expect focus on this tab in Brave. Explicit switch +
-			-- targeted navigate. Phase 1 strict: navigate uses --tab=.
-			local srv = (state.http_tab_meta.server and state.http_tab_meta.server ~= "")
-					and (" --server=" .. state.http_tab_meta.server)
-				or ""
+			local tab_server = state.http_tab_meta.server
+			local srv = (tab_server and tab_server ~= "") and (" --server=" .. tab_server) or ""
+			local proxy = get_proxy_base(tab_server)
 			send_cmd("switch " .. state.http_tab_meta.tab_id)
 			local cmd = htmx and "navigate" or "navigate-full"
-			send_cmd(cmd .. " --tab=" .. state.http_tab_meta.tab_id .. srv .. " " .. base .. nav_path .. qp)
+			local url = htmx and (nav_path .. qp) or (proxy .. nav_path .. qp)
+			send_cmd(cmd .. " --tab=" .. state.http_tab_meta.tab_id .. srv .. " " .. url)
 			vim.notify(string.format("browser: %s%s%s", nav_path, qp, htmx and " [partial]" or " [full]"))
 		else
 			vim.notify("browser: unresolved params in " .. chi_path, vim.log.levels.WARN)
 		end
 	end
 
-	-- Fan out: re-navigate other tabs that share any of the updated
-	-- PATH params. Query params are per-route and don't fan out.
 	if next(active_path_params_changed) then
 		local routes = views.get_routes()
 		vim.schedule(function()
@@ -241,27 +188,18 @@ function M.on_save_http(state)
 				if should_nav then
 					local nav = resolve_direct(chi, active_path_params_changed)
 					if not nav:find("{") then
-						-- Filter query by the test file's declared keys.
 						local saved = views.load_test_for_path(chi)
 						local q = views.build_query_string(views.query_for_route(active_ctx_key, chi, saved.query_keys))
-						-- Phase 1 strict: navigate the affected tab via
-						-- --tab= so we don't change focus. The previous
-						-- "switch + navigate" pair caused focus rot
-						-- because each iteration left the browser focused
-						-- on the last fan-out target.
 						local cmd = (m.htmx or false) and "navigate" or "navigate-full"
 						local fsrv = (m.server and m.server ~= "") and (" --server=" .. m.server) or ""
-						send_cmd(cmd .. " --tab=" .. m.tab_id .. fsrv .. " " .. views.get_active_base() .. nav .. q)
+						local proxy = get_proxy_base(m.server)
+						local url = (m.htmx or false) and (nav .. q) or (proxy .. nav .. q)
+						send_cmd(cmd .. " --tab=" .. m.tab_id .. fsrv .. " " .. url)
 					end
 				end
 				::next_tab::
 			end
 		end)
-
-		-- (Removed: previous final-switch hack that re-focused the
-		-- edited tab after fan-out. With per-tab navigate via --tab=,
-		-- fan-out doesn't change focus, so the user's tab stays focused
-		-- naturally.)
 
 		vim.notify(
 			string.format(

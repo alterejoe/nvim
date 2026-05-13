@@ -1,1 +1,3 @@
-return { "monkoose/neocodeium" }
+return {
+	{ "monkoose/neocodeium" },
+}

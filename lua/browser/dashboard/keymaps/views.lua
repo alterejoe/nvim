@@ -10,7 +10,8 @@
 --   ?   - HTML pattern picker
 --   c   - console
 --   C   - clear console
---   n   - network
+--   CR  - expand console object args (in console view)
+--   9   - network
 --   N   - clear network  OR  clear htmx
 --   R   - toggle req/res in network preview  OR  assets +html
 --   ,   - assets panel
@@ -288,17 +289,39 @@ function M.register(ctx)
 				vim.notify("browser: " .. (raw or "no response"), vim.log.levels.WARN)
 				return
 			end
-			split_set(logops.build_console_lines(raw), "text", true)
+			split_set(logops.build_console_lines(raw, nil), "text", true)
 			state.split_view = "console"
-			vim.notify("browser: split console - C=clear  r=refresh  c/r=back")
+			vim.notify("browser: split console - C clear  r refresh  c/r back")
 			return
 		end
 		if state.view_mode == "console" then
 			restore_tabs(buf)
 			return
 		end
+		state.log_tab_id = state.preview_tab_id
 		logops.open_console(buf, state)
 	end, "Console log")
+
+	-- CR in console view expands object args; falls through to normal CR elsewhere
+	map("<CR>", function()
+		if state.view_mode == "console" then
+			logops.toggle_expand_console_at_cursor(buf, state)
+			return
+		end
+		if is_in_split() and state.split_view == "htmx" then
+			htmxops.split_toggle_expand(state, split_set)
+			return
+		end
+		if state.view_mode == "htmx" then
+			htmxops.toggle_expand_at_cursor(buf, state)
+			return
+		end
+		-- fall through to core CR handler (navigate)
+		local core_cr = state._core_cr
+		if core_cr then
+			core_cr()
+		end
+	end, "Expand / navigate")
 
 	map("C", function()
 		if is_in_split() then
@@ -318,7 +341,8 @@ function M.register(ctx)
 		logops.clear_console(buf, state)
 	end, "Clear console")
 
-	map("n", function()
+	-- Network is on 9 (n was hijacking vim's next-search-result motion)
+	map("9", function()
 		if is_in_split() then
 			if state.split_view == "network" then
 				split_restore_tabs()
@@ -334,13 +358,14 @@ function M.register(ctx)
 			state.net_show_response = false
 			split_set(logops.build_net_lines(raw, state), "text", true)
 			state.split_view = "network"
-			vim.notify("browser: split network - R=req/res  N=clear  r=refresh  n/r=back")
+			vim.notify("browser: split network - R req/res  N clear  r refresh  9/r back")
 			return
 		end
 		if state.view_mode == "network" then
 			restore_tabs(buf)
 			return
 		end
+		state.log_tab_id = state.preview_tab_id
 		logops.open_network(buf, state)
 	end, "Network log")
 
@@ -454,6 +479,7 @@ function M.register(ctx)
 			restore_tabs(buf)
 			return
 		end
+		state.log_tab_id = state.preview_tab_id
 		htmxops.open(buf, state)
 	end, "Htmx panel")
 end

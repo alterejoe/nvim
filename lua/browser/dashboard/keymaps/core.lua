@@ -88,29 +88,16 @@ function M.register(ctx)
 			return
 		end
 		if state.view_mode == "tabs" then
-			local raw_line = vim.api.nvim_get_current_line()
-			local stripped = util.strip_prefix(raw_line)
 			local meta = current_meta()
-			vim.notify(
-				string.format(
-					"CR debug: line=%q stripped=%q meta=%s meta_count=%d",
-					raw_line,
-					stripped,
-					meta and meta.tab_id:sub(1, 8) or "nil",
-					vim.tbl_count(state.tab_metadata)
-				)
-			)
 			if not meta then
-				local i = 0
-				for k, _ in pairs(state.tab_metadata) do
-					i = i + 1
-					vim.notify(string.format("  meta key %d: %q", i, k))
-					if i >= 3 then
-						break
-					end
+				-- metadata stale - refresh and retry
+				do_buf_refresh(buf)
+				meta = current_meta()
+				if not meta then
+					return
 				end
-				return
 			end
+			state.preview_tab_id = meta.tab_id
 			local chi = meta.chi_path or tabops.infer_chi_path(meta)
 			local htmx = meta.htmx or false
 			if chi then
@@ -170,6 +157,7 @@ function M.register(ctx)
 			htmxops.refresh(buf, state)
 		else
 			restore_tabs(buf)
+			do_buf_refresh(buf)
 		end
 	end, "Refresh / return")
 
@@ -228,6 +216,7 @@ function M.register(ctx)
 		if not meta then
 			return
 		end
+		state.preview_tab_id = meta.tab_id
 		local new_htmx = not meta.htmx
 		tabops.navigate_tab(meta, new_htmx, state.tab_htmx)
 		local chi = tabops.infer_chi_path(meta) or meta.chi_path or meta.path
@@ -257,6 +246,7 @@ function M.register(ctx)
 		if not meta then
 			return
 		end
+		state.preview_tab_id = meta.tab_id
 		tabops.navigate_tab(meta, false, state.tab_htmx)
 		local chi = tabops.infer_chi_path(meta) or meta.chi_path or meta.path
 		if chi then
@@ -370,6 +360,7 @@ function M.register(ctx)
 			local use_htmx = saved and saved.htmx ~= nil and saved.htmx or false
 			local meta = current_meta()
 			if replace_current and meta then
+				state.preview_tab_id = meta.tab_id
 				tabops.navigate_tab(meta, use_htmx, state.tab_htmx)
 				views.do_navigate(chi_path, use_htmx)
 				vim.defer_fn(function()
@@ -388,7 +379,7 @@ function M.register(ctx)
 	-- updates the window title, and refreshes tab lines so server
 	-- prefixes reflect the new default.
 	-- ----------------------------------------------------------------
-	map("0", function()
+	map("-", function()
 		local raw = send_cmd("servers")
 		if not raw or vim.startswith(raw, "err:") then
 			return
@@ -414,6 +405,14 @@ function M.register(ctx)
 		do_buf_refresh(buf)
 		vim.notify("browser: active server -> " .. next_name)
 	end, "Cycle active server")
+
+	map(")", function()
+		local r = send_cmd("save-server")
+		if state.update_server_title then
+			state.update_server_title()
+		end
+		vim.notify("browser: " .. (r or "save-server failed"))
+	end, "Save active server as default")
 end
 
 return M

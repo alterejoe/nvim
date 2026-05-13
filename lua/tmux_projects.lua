@@ -14,14 +14,11 @@ Slot switching (line order in scratchbuf = slot order):
 <leader>tl  slot 3    <leader>tL  slot 7
 <leader>t;  slot 4    <leader>t:  slot 8
 Scratchbuf keymaps (inside <leader>ts):
-<CR>  switch to session
+<CR>  switch to session (closes scratchbuf)
 o     new session below
 O     new session above
-dd    cut session
-gp    paste below  (reorder)
-gP    paste above  (reorder)
-W     save persists slot order
-/     fuzzy filter
+W     save
+/     fuzzy filter (restores full list on CR)
 r     refresh
 Q     close
 +     add session to existing group
@@ -216,14 +213,12 @@ local function switch_slot(index)
 	tmux("switch-client -t " .. vim.fn.shellescape(target))
 end
 
--- Slots 1-4: <leader>t j/k/l/;
 for i, key in ipairs({ "j", "k", "l", ";" }) do
 	vim.keymap.set("n", "<leader>t" .. key, function()
 		switch_slot(i)
 	end, { desc = "Tmux slot " .. i, noremap = true })
 end
 
--- Slots 5-8: <leader>t J/K/L/:
 for i, key in ipairs({ "J", "K", "L", ":" }) do
 	vim.keymap.set("n", "<leader>t" .. key, function()
 		switch_slot(i + 4)
@@ -271,11 +266,7 @@ vim.keymap.set("n", "<C-f>", function()
 			finder = require("telescope.finders").new_table({
 				results = dirs,
 				entry_maker = function(entry)
-					return {
-						value = entry,
-						display = vim.fn.fnamemodify(entry, ":~"),
-						ordinal = entry,
-					}
+					return { value = entry, display = vim.fn.fnamemodify(entry, ":~"), ordinal = entry }
 				end,
 			}),
 			sorter = require("telescope.config").values.generic_sorter({}),
@@ -303,17 +294,25 @@ vim.keymap.set("n", "<leader>ts", function()
 	end
 	local current_session = vim.trim(vim.fn.system("tmux display-message -p '#S'"))
 	local sessions = ordered_sessions()
-	vim.notify(table.concat(sessions, ", "), vim.log.levels.INFO)
+
+	-- snapshot of all sessions at open time - used to detect deletes/creates
+	-- now that fuzzy_filter restores the full buffer on CR, changes.order is
+	-- always the complete buffer, so this diff is reliable.
+	local original_sessions = vim.deepcopy(sessions)
+
 	scratchbuf.open({
 		title = "Tmux Sessions",
 		lines = sessions,
-		refresh = ordered_sessions,
+		refresh = function()
+			local fresh = ordered_sessions()
+			original_sessions = vim.deepcopy(fresh)
+			return fresh
+		end,
 		current = current_session,
 		close_on_open = false,
 		on_open = function(entry)
 			local current = vim.trim(vim.fn.system("tmux display-message -p '#S'"))
 			if entry ~= current then
-				-- close the scratchbuf then switch
 				for _, w in ipairs(vim.api.nvim_list_wins()) do
 					local b = vim.api.nvim_win_get_buf(w)
 					if vim.b[b]._scratchbuf == "Tmux Sessions" then
@@ -325,49 +324,134 @@ vim.keymap.set("n", "<leader>ts", function()
 			end
 		end,
 		on_save = function(changes)
-			for _, r in ipairs(changes.renamed) do
-				tmux("rename-session -t " .. vim.fn.shellescape(r.old) .. " " .. vim.fn.shellescape(r.new))
+			local current_lines = {}
+			for _, s in ipairs(changes.order) do
+				local t = vim.trim(s)
+				if t ~= "" then
+					table.insert(current_lines, t)
+				end
 			end
-			for _, d in ipairs(changes.deleted) do
-				local current = vim.trim(vim.fn.system("tmux display-message -p '#S' 2>/dev/null"))
-				if current == d then
+
+			-- count occurrences
+			local orig_counts = {}
+			for _, s in ipairs(original_sessions) do
+				orig_counts[s] = (orig_counts[s] or 0) + 1
+			end
+			local curr_counts = {}
+			for _, s in ipairs(current_lines) do
+				curr_counts[s] = (curr_counts[s] or 0) + 1
+			end
+
+			-- error on duplicates
+			for name, count in pairs(curr_counts) do
+				local orig_c = orig_counts[name] or 0
+				if count > math.max(orig_c, 1) then
+					vim.notify("tmux: duplicate session name '" .. name .. "' - save aborted", vim.log.levels.ERROR)
+					return
+				end
+			end
+
+			-- deleted: fewer in current than original
+			local deleted_set = {}
+			local deleted = {}
+			for _, s in ipairs(original_sessions) do
+				if (curr_counts[s] or 0) < (orig_counts[s] or 0) and not deleted_set[s] then
+					table.insert(deleted, s)
+					deleted_set[s] = true
+				end
+			end
+
+			-- created: more in current than original, or brand new
+			local created_set = {}
+			local created = {}
+			for _, s in ipairs(current_lines) do
+				if not created_set[s] then
+					local orig_c = orig_counts[s] or 0
+					local curr_c = curr_counts[s] or 0
+					if curr_c > orig_c then
+						table.insert(created, s)
+						created_set[s] = true
+					end
+				end
+			end
+
+			-- positional renames
+			local renamed = {}
+			for i, orig in ipairs(original_sessions) do
+				if deleted_set[orig] then
+					local curr = current_lines[i]
+					if curr and created_set[curr] then
+						table.insert(renamed, { old = orig, new = curr })
+						deleted_set[orig] = nil
+						created_set[curr] = nil
+					end
+				end
+			end
+			local final_deleted = {}
+			for s in pairs(deleted_set) do
+				table.insert(final_deleted, s)
+			end
+			local final_created = {}
+			for s in pairs(created_set) do
+				table.insert(final_created, s)
+			end
+
+			-- apply renames
+			for _, r in ipairs(renamed) do
+				tmux("rename-session -t " .. vim.fn.shellescape(r.old) .. " " .. vim.fn.shellescape(r.new))
+				for _, entries in pairs(M.projects) do
+					for _, e in ipairs(entries) do
+						if e.name == r.old then
+							e.name = r.new
+						end
+					end
+				end
+			end
+			if #renamed > 0 then
+				save_overrides()
+			end
+
+			-- apply deletes
+			for _, d in ipairs(final_deleted) do
+				local cur = vim.trim(vim.fn.system("tmux display-message -p '#S' 2>/dev/null"))
+				if cur == d then
 					switch_to_first_available(d)
 				end
 				tmux("kill-session -t " .. vim.fn.shellescape(d))
 			end
-			for _, c in ipairs(changes.created) do
+
+			-- apply creates
+			for _, c in ipairs(final_created) do
 				local path = vim.fn.input("Path for [" .. c .. "]: ", vim.fn.getcwd(), "dir")
 				if path and path ~= "" then
 					tmux("new-session -ds " .. vim.fn.shellescape(c) .. " -c " .. vim.fn.shellescape(path))
 				end
 			end
+
+			-- rebuild slot order from current buffer lines
 			local rename_map = {}
-			for _, r in ipairs(changes.renamed) do
+			for _, r in ipairs(renamed) do
 				rename_map[r.old] = r.new
 			end
-			local deleted_set = {}
-			for _, d in ipairs(changes.deleted) do
-				deleted_set[d] = true
-			end
-			local final = {}
-			for _, s in ipairs(changes.order) do
-				if not deleted_set[s] then
-					table.insert(final, rename_map[s] or s)
+			local seen_order = {}
+			local final_order = {}
+			for _, s in ipairs(current_lines) do
+				local mapped = rename_map[s] or s
+				if not deleted_set[s] and not seen_order[mapped] then
+					table.insert(final_order, mapped)
+					seen_order[mapped] = true
 				end
 			end
-			for _, c in ipairs(changes.created) do
-				local already = false
-				for _, s in ipairs(final) do
-					if s == c then
-						already = true
-						break
-					end
-				end
-				if not already then
-					table.insert(final, c)
+			for _, c in ipairs(final_created) do
+				if not seen_order[c] then
+					table.insert(final_order, c)
+					seen_order[c] = true
 				end
 			end
-			save_order(final)
+			save_order(final_order)
+
+			-- update snapshot for next save
+			original_sessions = vim.deepcopy(ordered_sessions())
 		end,
 		on_ready = function(buf, _win)
 			local ns = vim.api.nvim_create_namespace("tmux_session_group_hints")
@@ -377,9 +461,7 @@ vim.keymap.set("n", "<leader>ts", function()
 				local line_count = vim.api.nvim_buf_line_count(buf)
 				vim.api.nvim_buf_set_extmark(buf, ns, math.max(line_count - 1, 0), 0, {
 					virt_lines = {
-						{
-							{ "  ", "Comment" },
-						},
+						{ { "  ", "Comment" } },
 						{
 							{ "  + ", "Title" },
 							{ "add to group  ", "Comment" },
@@ -421,7 +503,6 @@ vim.keymap.set("n", "<leader>ts", function()
 				})
 			end
 
-			-- + add cursor session to an existing group
 			vim.keymap.set("n", "+", function()
 				local session = vim.trim(vim.api.nvim_get_current_line())
 				if session == "" then
@@ -434,7 +515,6 @@ vim.keymap.set("n", "<leader>ts", function()
 				end)
 			end, { buffer = buf, nowait = true, noremap = true, desc = "Add session to group" })
 
-			-- +g add cursor session to a new group
 			vim.keymap.set("n", "+g", function()
 				local session = vim.trim(vim.api.nvim_get_current_line())
 				if session == "" then
@@ -447,7 +527,6 @@ vim.keymap.set("n", "<leader>ts", function()
 				M.add_to_group(session, group)
 			end, { buffer = buf, nowait = true, noremap = true, desc = "Add session to new group" })
 
-			-- - remove cursor session from a group it belongs to
 			vim.keymap.set("n", "-", function()
 				local session = vim.trim(vim.api.nvim_get_current_line())
 				if session == "" then
@@ -472,7 +551,6 @@ vim.keymap.set("n", "<leader>ts", function()
 				end)
 			end, { buffer = buf, nowait = true, noremap = true, desc = "Remove session from group" })
 
-			-- -g remove an entire group
 			vim.keymap.set("n", "-g", function()
 				local groups = vim.tbl_keys(M.projects)
 				table.sort(groups)
@@ -484,7 +562,6 @@ vim.keymap.set("n", "<leader>ts", function()
 				end)
 			end, { buffer = buf, nowait = true, noremap = true, desc = "Remove entire group" })
 
-			-- e edit session path, update group refs, reopen session
 			vim.keymap.set("n", "e", function()
 				local session = vim.trim(vim.api.nvim_get_current_line())
 				if session == "" then
@@ -872,6 +949,7 @@ function M.edit_session(session_name)
 		vim.notify("tmux: " .. session_name .. " reopened at " .. new_path, vim.log.levels.INFO)
 	end)
 end
+
 -- -----------------------------------------------------------------------
 -- Setup
 -- -----------------------------------------------------------------------

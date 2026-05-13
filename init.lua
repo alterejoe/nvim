@@ -21,6 +21,8 @@ require("lazycfg")
 require("tmux_projects")
 require("air")
 require("browser")
+require("opencode")
+require("opencode-sessions")
 require("keymaps")
 require("clipboard").setup()
 

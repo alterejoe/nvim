@@ -24,7 +24,7 @@ wk.add({
 	{ "<leader>K", desc = "Grapple slot 6" },
 	{ "<leader>L", desc = "Grapple slot 7" },
 	{ "<leader>:", desc = "Grapple slot 8" },
-	{ "<leader>a", desc = "Grapple add/toggle" },
+	{ "<leader>A", desc = "Grapple add/toggle" },
 
 	-- autoroot project slots
 	{ "<leader>1", desc = "Project root 1" },

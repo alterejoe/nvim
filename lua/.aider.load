@@ -1,0 +1,3 @@
+# Aider startup commands - copied to new projects as .aider.load
+# Add /read entries for files aider should see on startup
+# Example: /read CONVENTIONS.md

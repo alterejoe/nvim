@@ -18,6 +18,7 @@ local HELP_FOR_VIEW = {
 		"CR navigate  t partial  T full  \\ chi/resolved",
 		"dd+W close   :  routes   gz groups  + +group",
 		"e http  H html  c console  n net  , assets  M htmx  S split",
+		"-  cycle server   )  save as default",
 	},
 	groups = {
 		"CR open      W  save     :  routes",
@@ -474,7 +475,8 @@ function M.open()
 						or ""
 					local cmd = htmx and "navigate" or "navigate-full"
 					send_cmd("switch " .. state.preview_tab_id)
-					send_cmd(cmd .. " --tab=" .. state.preview_tab_id .. psrv .. " " .. get_base_url() .. path_query)
+					local nav_url = htmx and path_query or ("http://localhost:19878" .. path_query)
+					send_cmd(cmd .. " --tab=" .. state.preview_tab_id .. psrv .. " " .. nav_url)
 					state.tab_htmx[state.preview_tab_id] = htmx
 					vim.notify("browser: " .. (htmx and "[partial]" or "[full]") .. " " .. path_query)
 					return true

@@ -2,7 +2,7 @@
 -- htmx event log panel.
 -- Pulls window.__devproxy_htmx_log from the hovered tab and renders
 -- entries grouped by status: errors first, then successful swaps.
--- Targets state.preview_tab_id like the other per-tab panels.
+-- Targets state.log_tab_id (set at panel-open time, not cursor position).
 
 local M = {}
 
@@ -18,7 +18,7 @@ local function nz(v)
 end
 
 local function panel_tab_id(state)
-	return (state and state.preview_tab_id) or ""
+	return (state and state.log_tab_id) or ""
 end
 
 local function tab_arg(state)
