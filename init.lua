@@ -21,10 +21,9 @@ require("lazycfg")
 require("tmux_projects")
 require("air")
 require("browser")
-require("opencode")
-require("opencode-sessions")
 require("keymaps")
 require("clipboard").setup()
+require("opencode-ext")
 
 vim.api.nvim_create_autocmd("VimEnter", {
 	callback = function()

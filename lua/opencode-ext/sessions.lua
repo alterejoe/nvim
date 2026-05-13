@@ -1,4 +1,4 @@
--- opencode-session.lua
+-- opencode-ext/sessions.lua
 -- Manages OpenCode in dedicated tmux sessions.
 -- Sessions are named `opencode-<parent>-<dir>` and persist across nvim restarts.
 --
@@ -87,8 +87,6 @@ local function close_oc_buffer()
 	return was_open
 end
 
--- 컴 start / toggle 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
-
 vim.keymap.set("n", "<leader>oo", function()
 	if not in_tmux() then
 		vim.notify("opencode: not in tmux", vim.log.levels.WARN)
@@ -97,14 +95,12 @@ vim.keymap.set("n", "<leader>oo", function()
 
 	local name = session_name()
 
-	-- If session doesn't exist, start it
 	if not session_exists(name) then
 		local cwd = vim.fn.shellescape(vim.fn.getcwd())
 		tmux("new-session -ds " .. vim.fn.shellescape(name) .. " -c " .. cwd .. " 'opencode'")
 		vim.notify("opencode: started [" .. name .. "]")
 	end
 
-	-- Toggle the buffer
 	local existing_buf = find_oc_buf()
 	if existing_buf and vim.api.nvim_buf_is_valid(existing_buf) then
 		local wins = vim.fn.win_findbuf(existing_buf)
@@ -121,8 +117,6 @@ vim.keymap.set("n", "<leader>oo", function()
 		open_oc_buffer()
 	end
 end, { desc = "OpenCode: start/toggle" })
-
--- 컴 restart 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴�
 
 vim.keymap.set("n", "<leader>or", function()
 	if not in_tmux() then
@@ -152,8 +146,6 @@ vim.keymap.set("n", "<leader>or", function()
 		open_oc_buffer()
 	end, 500)
 end, { desc = "OpenCode: restart" })
-
--- 컴 kill 컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
 
 vim.keymap.set("n", "<leader>oq", function()
 	if not in_tmux() then

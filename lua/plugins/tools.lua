@@ -12,6 +12,9 @@ return {
 			"MunifTanjim/nui.nvim",
 		},
 		opts = {
+			cmdline = {
+				view = "cmdline",
+			},
 			lsp = { progress = { enabled = false } },
 			messages = {
 				enabled = true,
