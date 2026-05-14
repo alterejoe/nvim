@@ -26,3 +26,8 @@ end, { desc = "Reload buffer" })
 
 vim.keymap.set("n", "<leader>mh", "<cmd>Noice history<cr>", { desc = "Noice history" })
 vim.keymap.set("n", "<leader>mm", "<cmd>messages<cr>", { desc = "Noice messages" })
+
+vim.keymap.set("n", "<leader>ww", function()
+	vim.wo.wrap = not vim.wo.wrap
+	vim.notify("Wrap: " .. tostring(vim.wo.wrap), vim.log.levels.INFO)
+end, { desc = "Toggle wrap" })

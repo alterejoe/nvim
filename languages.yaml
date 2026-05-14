@@ -120,6 +120,11 @@ languages:
       - prettierd
     formatter: prettierd
     treesitter: json
+  jsonc:
+    mason:
+      - prettierd
+    formatter: prettierd
+    treesitter: json
 
   yaml:
     mason:

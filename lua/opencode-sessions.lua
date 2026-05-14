@@ -1,4 +1,4 @@
--- sessions.lua
+-- opencode-session.lua
 -- Manages OpenCode in dedicated tmux sessions.
 -- Sessions are named `opencode-<parent>-<dir>` and persist across nvim restarts.
 --
