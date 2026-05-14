@@ -1,18 +1,22 @@
+-- lua/opencode-ext/model.lua
 -- Builds conversation tree from raw DB data.
 -- All functions are stateless — just takes data in, returns data out.
 
 local M = {}
 
--- Extract ```-fenced code blocks from a list of lines.
+-- model.lua:7
 local function extract_code_blocks(lines)
 	local blocks = {}
 	local i = 1
 	while i <= #lines do
-		if lines[i]:match("^```") then
-			local lang = lines[i]:match("^```(.+)") or ""
+		local open_lang = lines[i]:match("^```(.+)")
+		local is_bare_open = lines[i]:match("^```%s*$")
+		if open_lang or is_bare_open then
+			local lang = open_lang or ""
 			local code = {}
 			i = i + 1
-			while i <= #lines and not lines[i]:match("^```") do
+			-- Close only on bare ``` — ```lang inside content is not a close
+			while i <= #lines and not lines[i]:match("^```%s*$") do
 				table.insert(code, lines[i])
 				i = i + 1
 			end
@@ -25,7 +29,6 @@ local function extract_code_blocks(lines)
 	return blocks
 end
 
--- Render a single part to text lines.
 local function render_part(part)
 	local lines = {}
 	if part.type == "text" and part.text and part.text ~= "" then
@@ -71,7 +74,6 @@ local function render_part(part)
 	return lines, extract_code_blocks(lines)
 end
 
--- Group parts by message_id.
 local function group_parts(raw_parts)
 	local by_msg = {}
 	for _, p in ipairs(raw_parts or {}) do
@@ -82,7 +84,6 @@ local function group_parts(raw_parts)
 	return by_msg
 end
 
--- Build conversations array from raw DB output.
 function M.build(raw)
 	local parts_by_msg = group_parts(raw.parts)
 	local conversations = {}
@@ -93,7 +94,6 @@ function M.build(raw)
 		if role ~= "user" and role ~= "assistant" then
 			goto next
 		end
-
 		local msg_parts = parts_by_msg[msg.id] or {}
 		local all_lines = {}
 		local text_lines = {}
@@ -105,7 +105,6 @@ function M.build(raw)
 			for _, l in ipairs(plines) do
 				table.insert(all_lines, l)
 			end
-
 			if part.type == "tool" then
 				has_tool = true
 				for _, l in ipairs(plines) do
@@ -113,20 +112,15 @@ function M.build(raw)
 				end
 			else
 				for _, l in ipairs(plines) do
-					if l:match("^```") then
-						-- Will be handled by extract_code_blocks below
-					end
 				end
-				-- Extract code blocks from rendered text
 				for _, cb in ipairs(cblocks) do
 					table.insert(code_blocks, cb)
 				end
-				-- Add non-fence lines to text
 				local i = 1
 				while i <= #plines do
 					if plines[i]:match("^```") then
 						i = i + 1
-						while i <= #plines and not plines[i]:match("^```") do
+						while i <= #plines and not plines[i]:match("^```%s*$") do
 							i = i + 1
 						end
 						i = i + 1
@@ -141,7 +135,6 @@ function M.build(raw)
 		if #all_lines == 0 then
 			goto next
 		end
-
 		local label = ""
 		for _, l in ipairs(all_lines) do
 			local t = vim.trim(l)
@@ -152,12 +145,7 @@ function M.build(raw)
 		end
 
 		if role == "user" then
-			current_user = {
-				idx = #conversations + 1,
-				label = label,
-				user_lines = all_lines,
-				asst_sections = {},
-			}
+			current_user = { idx = #conversations + 1, label = label, user_lines = all_lines, asst_sections = {} }
 			table.insert(conversations, current_user)
 		elseif role == "assistant" and current_user then
 			local asst_label = ""
@@ -172,19 +160,16 @@ function M.build(raw)
 				asst_label = "(" .. #code_blocks .. " blocks)"
 			end
 			local kind = (#code_blocks > 0) and "code" or (has_tool and "tool" or "summary")
-			table.insert(current_user.asst_sections, {
-				label = asst_label,
-				text_lines = text_lines,
-				code_blocks = code_blocks,
-				kind = kind,
-			})
+			table.insert(
+				current_user.asst_sections,
+				{ label = asst_label, text_lines = text_lines, code_blocks = code_blocks, kind = kind }
+			)
 		end
 		::next::
 	end
 	return conversations
 end
 
--- Build buffer lines and line_map from conversations.
 function M.build_lines(convs)
 	local lines = {}
 	local line_map = {}
@@ -210,7 +195,6 @@ function M.build_lines(convs)
 				lines[#lines + 1] = "  " .. tl
 				line_map[#line_map + 1] = { type = "text", conv_idx = ci }
 			end
-
 			for bi, cb in ipairs(asst.code_blocks) do
 				local fname = (cb.lines[1] or "") ~= "" and " " .. vim.trim(cb.lines[1]) or ""
 				local lang_tag = (cb.lang ~= "") and (" (" .. cb.lang .. ")") or ""
@@ -227,18 +211,12 @@ function M.build_lines(convs)
 		lines[#lines + 1] = ""
 		line_map[#line_map + 1] = { type = "blank" }
 	end
-
 	lines[#lines + 1] = ""
 	line_map[#line_map + 1] = { type = "blank" }
 	emit(string.rep("-", 60), { type = "sep" })
-	emit(
-		"<CR>=tog  [=prev  ]=next  y=yank  Y=y+hdr  c=copy  o=open  ff=split  /=filt  r=ref  q=quit  D=dbg  ?=help",
-		{ type = "help" }
-	)
 	return lines, line_map
 end
 
--- Concatenate all text in a conversation for search.
 function M.search_text(conv)
 	local parts = { conv.label or "" }
 	for _, l in ipairs(conv.user_lines) do
@@ -258,7 +236,6 @@ function M.search_text(conv)
 	return table.concat(parts, " "):lower()
 end
 
--- Fuzzy match: all chars of each word appear in order.
 function M.match(query, text)
 	local t = type(text) == "string" and text or text:lower()
 	if type(text) ~= "string" then
