@@ -1,3 +1,4 @@
+-- lua/opencode-ext/sessions.lua FINAL
 -- sessions.lua
 -- Manages OpenCode in dedicated tmux sessions.
 -- Sessions are named `opencode-<parent>-<dir>` and persist across nvim restarts.
@@ -8,6 +9,7 @@
 --   <leader>oq  Kill OpenCode session
 --   <leader>os  Pick a main session (via telescope)
 --   <leader>om  Toggle main session (works from any CWD)
+--   <leader>am  Open code block picker for main session
 
 local M = {}
 local OC_PREFIX = "opencode-"
@@ -94,17 +96,21 @@ end
 local function get_main_session()
 	local f = io.open(MAIN_SESSION_FILE, "r")
 	if not f then
-		return nil
+		return nil, nil
 	end
 	local name = f:read("*l")
+	local path = f:read("*l")
 	f:close()
-	return name and name ~= "" and name or nil
+	name = name and name ~= "" and name or nil
+	path = path and path ~= "" and path or nil
+	return name, path
 end
 
-local function set_main_session(name)
+local function set_main_session(name, path)
 	local f = io.open(MAIN_SESSION_FILE, "w")
 	if f then
-		f:write(name or "")
+		f:write((name or "") .. "\n")
+		f:write((path or "") .. "\n")
 		f:close()
 	end
 end
@@ -154,7 +160,7 @@ local function session_preview_lines(name)
 	return lines
 end
 
---- <leader>oo ¿ start/toggle ----------------------------------------
+--- <leader>oo -- start/toggle ----------------------------------------
 
 vim.keymap.set("n", "<leader>oo", function()
 	if not in_tmux() then
@@ -187,7 +193,7 @@ vim.keymap.set("n", "<leader>oo", function()
 	end
 end, { desc = "OpenCode: start/toggle" })
 
---- <leader>or ¿ restart ---------------------------------------------
+--- <leader>or -- restart ---------------------------------------------
 
 vim.keymap.set("n", "<leader>or", function()
 	if not in_tmux() then
@@ -218,7 +224,7 @@ vim.keymap.set("n", "<leader>or", function()
 	end, 500)
 end, { desc = "OpenCode: restart" })
 
---- <leader>oq ¿ kill ------------------------------------------------
+--- <leader>oq -- kill ------------------------------------------------
 
 vim.keymap.set("n", "<leader>oq", function()
 	if not in_tmux() then
@@ -241,7 +247,7 @@ vim.keymap.set("n", "<leader>oq", function()
 	vim.notify("opencode: killed [" .. name .. "]")
 end, { desc = "OpenCode: kill" })
 
---- <leader>os ¿ pick main session -----------------------------------
+--- <leader>os -- pick main session -----------------------------------
 
 vim.keymap.set("n", "<leader>os", function()
 	if not in_tmux() then
@@ -297,8 +303,22 @@ vim.keymap.set("n", "<leader>os", function()
 					local selection = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
 					if selection then
-						set_main_session(selection.value.name)
-						vim.notify("opencode: main ¿ [" .. selection.value.name .. "]", vim.log.levels.INFO)
+						local name = selection.value.name
+						-- Resolve directory from tmux
+						local dir_result = vim.fn.systemlist({
+							"tmux",
+							"list-windows",
+							"-F",
+							"#{pane_current_path}",
+							"-t",
+							name,
+						})
+						local dir = nil
+						if vim.v.shell_error == 0 and #dir_result > 0 then
+							dir = dir_result[1]
+						end
+						set_main_session(name, dir)
+						vim.notify("opencode: main -> [" .. name .. "]", vim.log.levels.INFO)
 					end
 				end)
 				return true
@@ -307,7 +327,7 @@ vim.keymap.set("n", "<leader>os", function()
 		:find()
 end, { desc = "OpenCode: set main session" })
 
---- <leader>om ¿ toggle main session ----------------------------------
+--- <leader>om -- toggle main session ----------------------------------
 
 vim.keymap.set("n", "<leader>om", function()
 	if not in_tmux() then
@@ -363,5 +383,22 @@ vim.keymap.set("n", "<leader>om", function()
 		vim.notify("opencode: attached [" .. name .. "]", vim.log.levels.INFO)
 	end
 end, { desc = "OpenCode: toggle main session" })
+
+--- <leader>am -- open code block picker for main session -------------
+
+vim.keymap.set("n", "<leader>am", function()
+	if not in_tmux() then
+		vim.notify("opencode: not in tmux", vim.log.levels.WARN)
+		return
+	end
+
+	local name, dir = get_main_session()
+	if not dir then
+		vim.notify("opencode: no main session directory (<leader>os to pick)", vim.log.levels.WARN)
+		return
+	end
+
+	require("opencode-ext.viewer").toggle_for_dir(dir)
+end, { desc = "OpenCode: main session picker" })
 
 return M

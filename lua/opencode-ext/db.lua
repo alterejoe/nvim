@@ -1,3 +1,4 @@
+-- lua/opencode-ext/db.lua FINAL
 local DB_PATH = vim.fn.expand("~/.local/share/opencode/opencode.db")
 local M = {}
 
@@ -91,9 +92,9 @@ function M.fetch_session(sid)
 	return data
 end
 
--- Fetch the latest session for the current project (kept for compat).
-function M.fetch_all()
-	local cwd = vim.fn.getcwd()
+-- Fetch the latest session for the current project, or a specified directory.
+function M.fetch_all(cwd_override)
+	local cwd = cwd_override or vim.fn.getcwd()
 	local esc_cwd = cwd:gsub("'", "''")
 
 	local sql = [[

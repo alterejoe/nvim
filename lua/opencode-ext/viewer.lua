@@ -1,4 +1,4 @@
--- lua/opencode-ext/viewer.lua
+-- lua/opencode-ext/viewer.lua FINAL
 local db = require("opencode-ext.db")
 local model = require("opencode-ext.model")
 
@@ -137,7 +137,7 @@ local function context_tail(lines, max_lines)
 		end
 		return r
 	end
-	local r = { "… (truncated)" }
+	local r = { "... (truncated)" }
 	for i = end_idx - max_lines + 1, end_idx do
 		r[#r + 1] = lines[i]
 	end
@@ -226,7 +226,7 @@ local function extract_filenames(lines)
 end
 
 -- Resolve path for a code block. Returns {best_path, all_candidates}.
--- Tries: line-1 comment → filenames in code → context cross-validated → context directly.
+-- Tries: line-1 comment -> filenames in code -> context cross-validated -> context directly.
 local function resolve_path(lines, context, project_root)
 	local candidates = {}
 	local seen = {}
@@ -396,7 +396,6 @@ local function compute_per_block_contexts(text_lines, code_blocks)
 	return contexts
 end
 
--- viewer.lua:398 FINAL
 local ed = require("telescope.pickers.entry_display")
 local code_display = ed.create({
 	separator = " ",
@@ -407,7 +406,6 @@ local code_display = ed.create({
 	},
 })
 
--- viewer.lua:399-492 FINAL
 local function build_entries(raw, project_path, parsed)
 	clear_cache()
 	local conversations = model.build(raw)
@@ -416,7 +414,7 @@ local function build_entries(raw, project_path, parsed)
 		local label = (conv.label or ""):gsub("\n", " "):sub(1, 70)
 		if label ~= "" then
 			entries[#entries + 1] = {
-				display = ("── %s ──"):format(label),
+				display = ("--- %s ---"):format(label),
 				ordinal = label,
 				section_header = true,
 				user_label = label,
@@ -436,7 +434,7 @@ local function build_entries(raw, project_path, parsed)
 				local path_exists = path ~= ""
 					and project_path
 					and vim.fn.filereadable(project_path .. "/" .. path) == 1
-				local icon = path_exists and "✓" or (path ~= "" and "▸") or (#candidates > 0 and "?") or "○"
+				local icon = path_exists and "*" or (path ~= "" and ">" or (#candidates > 0 and "?") or "o")
 				local icon_hl = path_exists and "Identifier"
 					or (path ~= "" and "Special")
 					or (#candidates > 0 and "WarningMsg")
@@ -534,7 +532,7 @@ local function pick_path(entry, project_root, on_pick)
 	end
 
 	if #candidates == 0 then
-		-- No candidates — let user type a path directly
+		-- No candidates - let user type a path directly
 		local path = vim.fn.input("File path: ", "", "file")
 		if path and path ~= "" then
 			on_pick(path)
@@ -619,7 +617,7 @@ local function open_picker(sid, project_path)
 		return e and e.section_header
 	end
 
-	-- FIXED: build_content returns raw code lines as-is. No path comment reconstruction.
+	-- build_content returns raw code lines as-is. No path comment reconstruction.
 	-- The path is for display and navigation only.
 	local function build_content(block)
 		local parts = {}
@@ -701,13 +699,13 @@ local function open_picker(sid, project_path)
 		define_preview = function(self, entry)
 			if entry.section_header then
 				vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, {
-					("── %s ──"):format(entry.user_label or ""),
+					("--- %s ---"):format(entry.user_label or ""),
 					"",
 					"  Icon legend:",
-					"    ✓  file exists on disk",
-					"    ▸  path known, file doesn't exist yet",
+					"    *  file exists on disk",
+					"    >  path known, file doesn't exist yet",
 					"    ?  multiple candidate files found",
-					"    ○  no path information",
+					"    o  no path information",
 				})
 				vim.bo[self.state.bufnr].filetype = "markdown"
 				return
@@ -720,7 +718,7 @@ local function open_picker(sid, project_path)
 			end
 			if #ctx > 0 then
 				lines[#lines + 1] = ""
-				lines[#lines + 1] = "───"
+				lines[#lines + 1] = "---"
 				lines[#lines + 1] = ""
 			end
 			for _, l in ipairs(block.lines) do
@@ -732,7 +730,7 @@ local function open_picker(sid, project_path)
 	})
 
 	local prompt_title = string.format(
-		"Code Blocks [%s]  ↵=copy+open  c=copy  o=open  a=create  A=create+fill  C=acc  f=flush  p=path  r=refresh  s=session  t=toggle",
+		"Code Blocks [%s]  ENTER=copy+open  c=copy  o=open  a=create  A=create+fill  C=acc  f=flush  p=path  r=refresh  s=session  t=toggle",
 		parsed_mode and "parsed" or "raw"
 	)
 
@@ -983,6 +981,15 @@ function M.toggle()
 		open_picker(raw.sid, vim.fn.getcwd())
 	else
 		pick_session()
+	end
+end
+
+function M.toggle_for_dir(dir)
+	local raw, err = db.fetch_all(dir)
+	if raw and raw.sid and raw.sid ~= vim.NIL then
+		open_picker(raw.sid, dir)
+	else
+		vim.notify(err or "No session for this directory", vim.log.levels.WARN)
 	end
 end
 
