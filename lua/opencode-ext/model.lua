@@ -1,10 +1,9 @@
--- lua/opencode-ext/model.lua
+-- lua/opencode-ext/model.lua FINAL
 -- Builds conversation tree from raw DB data.
 -- All functions are stateless — just takes data in, returns data out.
 
 local M = {}
 
--- model.lua:7
 local function extract_code_blocks(lines)
 	local blocks = {}
 	local i = 1
@@ -15,7 +14,6 @@ local function extract_code_blocks(lines)
 			local lang = open_lang or ""
 			local code = {}
 			i = i + 1
-			-- Close only on bare ``` — ```lang inside content is not a close
 			while i <= #lines and not lines[i]:match("^```%s*$") do
 				table.insert(code, lines[i])
 				i = i + 1
@@ -110,9 +108,10 @@ function M.build(raw)
 				for _, l in ipairs(plines) do
 					table.insert(text_lines, l)
 				end
-			else
-				for _, l in ipairs(plines) do
+				for _, cb in ipairs(cblocks) do
+					table.insert(code_blocks, cb)
 				end
+			else
 				for _, cb in ipairs(cblocks) do
 					table.insert(code_blocks, cb)
 				end
@@ -160,10 +159,13 @@ function M.build(raw)
 				asst_label = "(" .. #code_blocks .. " blocks)"
 			end
 			local kind = (#code_blocks > 0) and "code" or (has_tool and "tool" or "summary")
-			table.insert(
-				current_user.asst_sections,
-				{ label = asst_label, text_lines = text_lines, code_blocks = code_blocks, kind = kind }
-			)
+			table.insert(current_user.asst_sections, {
+				label = asst_label,
+				text_lines = text_lines,
+				code_blocks = code_blocks,
+				kind = kind,
+				all_lines = all_lines,
+			})
 		end
 		::next::
 	end
