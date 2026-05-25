@@ -1,11 +1,12 @@
--- lua/opencode-ext/viewer.lua FINAL-7
+-- /home/jmeyer/.config/nvim/lua/opencode-ext/viewer.lua FINAL-9
 -- One-keybind, full-chat buffer.  No scratchbuf, no 3-hop navigation.
 --
 -- Flow:
 --   <leader>ae  → opens latest conversation from latest CWD session directly
 --   <leader>am  → same for main session
 --   In buffer:  [] cycle blocks, <A-[> <A-]> cycle conversations
---               c copy block, Y yank all, r refresh, ? help, q close, s picker
+--               c copy block, C copy + navigate, Y yank all,
+--               r refresh, ? help, q close, s picker
 
 local db = require("opencode-ext.db")
 local model = require("opencode-ext.model")
@@ -103,6 +104,21 @@ local function find_code_blocks(lines)
 	return blocks
 end
 
+--- Ensure every element is a true single line (no embedded \n).
+local function sanitize_lines(arr)
+	local out = {}
+	for _, s in ipairs(arr or {}) do
+		if type(s) == "string" and s:find("\n") then
+			for _, part in ipairs(vim.split(s, "\n", { plain = true })) do
+				table.insert(out, part)
+			end
+		else
+			table.insert(out, s or "")
+		end
+	end
+	return out
+end
+
 -- Render conversation content (no title — that's in the winbar).
 -- Returns: { content_lines, blocks, block_positions }
 --   content_lines[1..n]  — flat array with sections and fences intact
@@ -114,13 +130,13 @@ local function render_content(conv)
 	local block_positions = {}
 
 	if conv.user_lines then
-		for _, l in ipairs(conv.user_lines) do
+		for _, l in ipairs(sanitize_lines(conv.user_lines)) do
 			table.insert(lines, l)
 		end
 	end
 
 	for _, asst in ipairs(conv.asst_sections or {}) do
-		local src = asst.all_lines or asst.text_lines
+		local src = sanitize_lines(asst.all_lines or asst.text_lines)
 		if not src or #src == 0 then
 			goto next_asst
 		end
@@ -202,6 +218,7 @@ local HELP_LINES = {
 	"<A-[>           previous conversation",
 	"<A-]>           next conversation",
 	"c               copy code block",
+	"C               copy + navigate to file",
 	"r               refresh (re-read session)",
 	"Y               yank all conversation text",
 	"?               toggle this help",
@@ -289,7 +306,7 @@ local function open_chat_buffer(conv, project_path, all_convs, conv_idx, raw)
 	vim.wo[win].winbar = title
 
 	-- Minimal statusline with most-used keymaps
-	vim.wo[win].statusline = "c copy    [ ] blocks    <A-[> <A-]> conv    Y yank    ? help"
+	vim.wo[win].statusline = "c copy    [ ] blocks    C copy+navigate    <A-[> <A-]> conv    ? help"
 
 	local km_opts = { buffer = buf, nowait = true, noremap = true }
 
@@ -338,6 +355,126 @@ local function open_chat_buffer(conv, project_path, all_convs, conv_idx, raw)
 		vim.fn.setreg("+", text)
 		vim.fn.setreg('"', text)
 		vim.notify(string.format("Copied block %d (%d chars)", bi, #text), vim.log.levels.INFO)
+	end, km_opts)
+
+	-- Copy + navigate to file
+	vim.keymap.set("n", "C", function()
+		local block, bi = find_block_at_line(vim.fn.line("."), block_positions, blocks)
+		if not block then
+			vim.notify("Not inside a code block", vim.log.levels.WARN)
+			return
+		end
+
+		-- 1. Copy
+		local text = table.concat(block.lines, "\n")
+		vim.fn.setreg("+", text)
+		vim.fn.setreg('"', text)
+		vim.notify(string.format("Copied block %d (%d chars)", bi, #text), vim.log.levels.INFO)
+
+		-- 2. Extract path from first line
+		local raw_path, lineno = extract_path_from_line(block.lines[1] or "")
+		if not raw_path then
+			vim.notify("No file path in this block", vim.log.levels.WARN)
+			return
+		end
+
+		-- 3. Resolve to absolute
+		local resolved
+		if raw_path:sub(1, 1) == "/" then
+			resolved = raw_path
+		else
+			resolved = vim.fn.resolve(project_path .. "/" .. raw_path)
+		end
+
+		-- 4. Find target window (not the viewer)
+		local target_win = nil
+		local viewer_buf = buf
+		for _, w in ipairs(vim.api.nvim_list_wins()) do
+			local wbuf = vim.api.nvim_win_get_buf(w)
+			if wbuf ~= viewer_buf and vim.api.nvim_buf_is_valid(wbuf) then
+				target_win = w
+				break
+			end
+		end
+		if not target_win then
+			vim.notify("No other window — vsplitting", vim.log.levels.INFO)
+			vim.cmd("vsplit")
+			for _, w in ipairs(vim.api.nvim_list_wins()) do
+				local wbuf = vim.api.nvim_win_get_buf(w)
+				if wbuf ~= viewer_buf then
+					target_win = w
+					break
+				end
+			end
+			if not target_win then
+				vim.notify("Failed to create split", vim.log.levels.ERROR)
+				return
+			end
+		end
+
+		-- 5. Navigate
+		local open_path = resolved
+		if not vim.fn.filereadable(resolved) then
+			-- Try basename search with ../ and ../../ prefix scans
+			local basename = vim.fn.fnamemodify(resolved, ":t")
+			local resolved_dir = vim.fn.fnamemodify(resolved, ":h")
+			local search_dirs = { resolved_dir }
+			local up = resolved_dir
+			for _ = 1, 4 do
+				local parent = vim.fn.fnamemodify(up, ":h")
+				if parent == up then
+					break
+				end
+				table.insert(search_dirs, parent)
+				up = parent
+			end
+			local found = ""
+			for _, d in ipairs(search_dirs) do
+				local m = vim.fn.findfile(d .. "/" .. basename)
+				if m ~= "" then
+					for _, candidate in ipairs(vim.split(m, "\n")) do
+						local full = vim.fn.resolve(candidate)
+						if vim.fn.filereadable(full) == 1 then
+							found = full
+							break
+						end
+					end
+				end
+				if found ~= "" then
+					break
+				end
+			end
+			if found ~= "" then
+				local choice = vim.fn.confirm(
+					"Not found at:\n  " .. resolved .. "\n\nOpen instead:\n  " .. found .. "?",
+					"&Yes\n&No",
+					1
+				)
+				if choice == 1 then
+					open_path = found
+				else
+					return
+				end
+			else
+				local create = vim.fn.confirm("Create file?\n  " .. resolved, "&Yes\n&No", 1)
+				if create ~= 1 then
+					return
+				end
+				local parent = vim.fn.fnamemodify(resolved, ":h")
+				if vim.fn.isdirectory(parent) == 0 then
+					vim.fn.mkdir(parent, "p")
+				end
+			end
+		end
+
+		-- Save viewer win, open file in target, restore focus
+		local viewer_win = vim.api.nvim_get_current_win()
+		vim.api.nvim_set_current_win(target_win)
+		vim.cmd("edit " .. vim.fn.fnameescape(open_path))
+		if lineno then
+			vim.api.nvim_win_set_cursor(target_win, { lineno, 0 })
+		end
+		vim.api.nvim_set_current_win(viewer_win)
 	end, km_opts)
 
 	-- Yank all conversation text
