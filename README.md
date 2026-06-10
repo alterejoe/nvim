@@ -377,3 +377,15 @@ To add your own settings, create:
 - `jk` = escape (in insert mode)
 
 Everything else you'll pick up naturally as you use it!
+
+if command -v tmux &>/dev/null && [ -z "$TMUX" ]; then
+  tmux attach 2>/dev/null || tmux new-session -s home -c ~/
+fi
+
+nvim() {
+  if [ -n "$TMUX" ]; then
+    command nvim "$@"
+  else
+    tmux new-session -As "nvim-$(basename $(pwd))" -c "$(pwd)" "nvim $*"
+  fi
+}
