@@ -1,4 +1,4 @@
--- lua/opencode-ext/sessions.lua FINAL
+-- /home/jmeyer/.config/nvim/lua/opencode-ext/sessions.lua FINAL
 -- sessions.lua
 -- Manages OpenCode in dedicated tmux sessions.
 -- Sessions are named `opencode-<parent>-<dir>` and persist across nvim restarts.
@@ -57,6 +57,14 @@ local function find_oc_buf()
 	return nil
 end
 
+-- Protect opencode terminal buffers from accidental <C-c> close/kill.
+-- In normal mode: no-op (don't close the window).
+-- In terminal mode: forward literal <C-c> to the job instead of sending SIGINT.
+local function protect_opencode_buf(buf)
+	vim.keymap.set("n", "<C-c>", "<Nop>", { buffer = buf, noremap = true, silent = true })
+	vim.keymap.set("t", "<C-c>", "<C-\\><C-c>", { buffer = buf, noremap = true })
+end
+
 local function open_oc_buffer()
 	local name = session_name()
 	local bufname = "opencode-term-" .. project_key()
@@ -73,6 +81,7 @@ local function open_oc_buffer()
 	})
 	vim.api.nvim_buf_set_name(buf, bufname)
 	vim.bo[buf].bufhidden = "hide"
+	protect_opencode_buf(buf)
 	vim.cmd("startinsert")
 end
 
@@ -379,6 +388,7 @@ vim.keymap.set("n", "<leader>om", function()
 		})
 		vim.api.nvim_buf_set_name(buf, bufname)
 		vim.bo[buf].bufhidden = "hide"
+		protect_opencode_buf(buf)
 		vim.cmd("startinsert")
 		vim.notify("opencode: attached [" .. name .. "]", vim.log.levels.INFO)
 	end
