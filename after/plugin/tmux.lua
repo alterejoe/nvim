@@ -1,8 +1,24 @@
 local tmux = require("tmux_projects")
 
 tmux.setup({
-	project_order = { "work", "workWtools", "side" },
+	project_order = { "election", "work" },
 	projects = {
+		election = {
+			{ name = "TN/2026G", path = "/mnt/g/Tennessee/!Tennessee - 2026G" },
+			{ name = "TN/2026G/workflow", path = "/mnt/g/Tennessee/!Tennessee - 2026G/Workflow" },
+			{ name = "TN/2026G/proofing", path = "/mnt/g/Tennessee/!Tennessee - 2026G/Proofing" },
+			{ name = "TN/2026G/databases", path = "/mnt/g/Tennessee/!Tennessee - 2026G/Databases" },
+			{ name = "TN/2026P", path = "/mnt/g/Tennessee/2026P" },
+			{ name = "AccTest/Drop", path = "/mnt/c/Users/jmeyer/Documents/Hotfolders/export-handler/Kentucky" },
+			{
+				name = "AccTest/AdditionalText",
+				path = "/mnt/c/Users/jmeyer/Documents/Hotfolders/export-handler/additionaltext",
+			},
+			{
+				name = "AccTest/DuoReport",
+				path = "/mnt/c/Users/jmeyer/Documents/Hotfolders/export-handler/duoreport",
+			},
+		},
 		work = {
 			{ name = "portal", path = "~/projects/portal/" },
 			{ name = "portal/admin", path = "~/projects/portal/adminserver/" },

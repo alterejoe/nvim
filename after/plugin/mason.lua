@@ -1,49 +1,51 @@
+-- /home/jmeyer/.config/nvim/after/plugin/mason.lua FINAL
 local function parse_yaml(path)
-    local raw = vim.fn.system({ "yq", "-o=json", ".", path })
-    if vim.v.shell_error ~= 0 then
-        vim.notify("mason.lua: failed to parse " .. path, vim.log.levels.ERROR)
-        return nil
-    end
-    local ok, result = pcall(vim.fn.json_decode, raw)
-    if not ok then
-        vim.notify("mason.lua: failed to decode json: " .. tostring(result), vim.log.levels.ERROR)
-        return nil
-    end
-    return result
+	local raw = vim.fn.system({ "yq", "-o=json", ".", path })
+	if vim.v.shell_error ~= 0 then
+		vim.notify("mason.lua: failed to parse " .. path, vim.log.levels.ERROR)
+		return nil
+	end
+	local ok, result = pcall(vim.fn.json_decode, raw)
+	if not ok then
+		vim.notify("mason.lua: failed to decode json: " .. tostring(result), vim.log.levels.ERROR)
+		return nil
+	end
+	return result
 end
 
 local function collect_mason_packages(languages)
-    local packages = {}
-    for _, config in pairs(languages) do
-        if config.mason then
-            for _, pkg in ipairs(config.mason) do
-                table.insert(packages, pkg)
-            end
-        end
-    end
-    return packages
+	local packages = {}
+	for _, config in pairs(languages) do
+		if config.mason then
+			for _, pkg in ipairs(config.mason) do
+				table.insert(packages, pkg)
+			end
+		end
+	end
+	return packages
 end
 
 local data = parse_yaml(vim.fn.stdpath("config") .. "/languages.yaml")
 if not data then
-    return
+	return
 end
 
-require("mason").setup()
+-- mason.setup() already called by lazy.nvim via lua/plugins/mason.lua
+-- This file only handles auto-installing packages from languages.yaml
 
 local registry = require("mason-registry")
 local packages = collect_mason_packages(data.languages)
 
 registry.refresh(function()
-    local seen = {}
-    for _, pkg_name in ipairs(packages) do
-        if not seen[pkg_name] then
-            seen[pkg_name] = true
-            local ok, pkg = pcall(registry.get_package, pkg_name)
-            if ok and not pkg:is_installed() then
-                vim.notify("mason: installing " .. pkg_name, vim.log.levels.INFO)
-                pkg:install()
-            end
-        end
-    end
+	local seen = {}
+	for _, pkg_name in ipairs(packages) do
+		if not seen[pkg_name] then
+			seen[pkg_name] = true
+			local ok, pkg = pcall(registry.get_package, pkg_name)
+			if ok and not pkg:is_installed() then
+				vim.notify("mason: installing " .. pkg_name, vim.log.levels.INFO)
+				pkg:install()
+			end
+		end
+	end
 end)

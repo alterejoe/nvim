@@ -23,6 +23,7 @@ require("air")
 require("browser")
 require("keymaps")
 require("clipboard").setup()
+require("csvgen").setup()
 require("opencode-ext")
 
 vim.api.nvim_create_autocmd("VimEnter", {
