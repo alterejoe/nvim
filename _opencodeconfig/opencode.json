@@ -1,0 +1,162 @@
+// /home/jmeyer/.config/opencode/opencode.json FINAL
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode-go/deepseek-v4-flash",
+  "autoupdate": true,
+  "default_agent": "oracle",
+
+  "provider": {
+    "opencode": {
+      "models": {
+        "minimax-m2.5-free": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        },
+        "big-pickle": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          },
+          "variants": {
+            "low": {
+              "reasoningEffort": "low",
+              "textVerbosity": "low",
+              "reasoningSummary": "auto"
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "textVerbosity": "low",
+              "reasoningSummary": "auto"
+            }
+          }
+        },
+        "glm-5": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        },
+        "glm-5.1": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        },
+        "kimi-k2.5": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        },
+        "kimi-k2.6": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        },
+        "mimo-v2.5": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        },
+        "mimo-v2.5-pro": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        },
+        "minimax-m2.5": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        },
+        "minimax-m2.7": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        },
+        "qwen3.5-plus": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        },
+        "qwen3.6-plus": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        },
+        "deepseek-v4-pro": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        },
+        "deepseek-v4-flash": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low"
+          }
+        }
+      }
+    }
+  },
+
+  "agent": {
+    "build": {
+      "maxIterations": 2
+    },
+    "plan": {
+      "maxIterations": 1
+    },
+    "chat": {
+      "maxIterations": 1
+    }
+  },
+
+  "permission": {
+    "read": "ask",
+    "edit": "deny",
+    "write": "deny",
+    "bash": "deny",
+    "task": "deny",
+    "webfetch": "allow",
+    "doom_loop": "deny",
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.pem": "deny",
+      "*.key": "deny",
+      "envs/**": "deny",
+      "**/envs/**": "deny"
+    }
+  },
+  "plugin": [
+    "opencode-ignore",
+    "opencode-mem",
+    "oh-my-openagent",
+    "opencode-plugin-openspec"
+  ],
+
+  "instructions": [
+    "AGENTS.md",
+    "/home/jmeyer/.config/opencode/prepends/output-formatting.md",
+    "/home/jmeyer/.config/opencode/prepends/convention-tracker.md",
+    "/home/jmeyer/.config/opencode/prepends/consultation-first.md"
+  ],
+
+  "snapshot": true,
+  "share": "manual",
+
+  "server": {
+    "port": 4096,
+    "hostname": "localhost"
+  }
+}

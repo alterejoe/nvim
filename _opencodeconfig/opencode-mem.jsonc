@@ -1,0 +1,26 @@
+{
+  "opencodeProvider": "opencode",
+  "opencodeModel": "minimax-m2.5-free",
+
+  "embeddingModel": "Xenova/nomic-embed-text-v1",
+  "storagePath": "~/.opencode-mem/data",
+
+  "autoCaptureEnabled": true,
+  "maxMemories": 5,
+  "webServerEnabled": true,
+  "webServerPort": 4747,
+
+  "memory": {
+    "defaultScope": "project",
+  },
+  "compaction": {
+    "enabled": true,
+    "memoryLimit": 10,
+  },
+  "chatMessage": {
+    "enabled": true,
+    "maxMemories": 3,
+    "excludeCurrentSession": true,
+    "injectOn": "first",
+  },
+}

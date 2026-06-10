@@ -1,0 +1,98 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Primary model
+  "model": "anthropic/claude-sonnet-4-20250514",
+
+  // Smaller model for titles/summaries (cheaper)
+  "small_model": "anthropic/claude-haiku-4-5",
+
+  // Auto-update behavior: true | false | "notify"
+  "autoupdate": true,
+
+  // Default agent: "build" or "plan"
+  "default_agent": "build",
+
+  // Provider and variant config - THIS IS WHERE YOU CONTROL THINKING
+  "provider": {
+    "anthropic": {
+      "models": {
+        "claude-sonnet-4-20250514": {
+          "variants": {
+            // Low thinking budget - less overthinking
+            "low": {
+              "thinking": {
+                "type": "enabled",
+                "budgetTokens": 4000
+              }
+            },
+            // High thinking budget (OpenCode default)
+            "high": {
+              "thinking": {
+                "type": "enabled",
+                "budgetTokens": 16000
+              }
+            },
+            // Max thinking budget
+            "max": {
+              "thinking": {
+                "type": "enabled",
+                "budgetTokens": 32000
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+
+  // Limit how many agentic iterations before it must respond
+  // Lower = less wandering off track
+  "agent": {
+    "build": {
+      "maxIterations": 15
+    },
+    "plan": {
+      "maxIterations": 10
+    }
+  },
+
+  // Permissions: "allow" | "ask" | "deny"
+  "permission": {
+    "edit": "allow",
+    "bash": {
+      "*": "allow",
+      "rm -rf *": "deny",
+      "sudo *": "ask"
+    }
+  },
+
+  // Instruction files loaded into context
+  "instructions": [
+    "AGENTS.md"
+    // Add project-specific rules here, e.g.:
+    // "CONTRIBUTING.md",
+    // ".opencode/rules/*.md"
+  ],
+
+  // TUI settings
+  "tui": {
+    "scroll_speed": 3,
+    "diff_style": "auto"
+  },
+
+  // Snapshot (undo/redo tracking) - disable for large repos
+  "snapshot": true,
+
+  // Share mode: "manual" | "auto"
+  "share": "manual",
+
+  // Server settings (for `opencode serve` / `opencode web`)
+  "server": {
+    "port": 4096,
+    "hostname": "localhost"
+  }
+
+  // MCP servers go here if needed:
+  // "mcp": { ... }
+}
