@@ -1,3 +1,5 @@
+-- /home/jmeyer/.config/nvim/after/plugin/which-key.lua FINAL
+
 -- after/plugin/which-key.lua
 -- Group labels and descriptions for all keymaps.
 
@@ -26,12 +28,13 @@ wk.add({
 	{ "<leader>:", desc = "Grapple slot 8" },
 	{ "<leader>A", desc = "Grapple add/toggle" },
 
-	-- autoroot project slots
-	{ "<leader>1", desc = "Project root 1" },
-	{ "<leader>2", desc = "Project root 2" },
-	{ "<leader>3", desc = "Project root 3" },
-	{ "<leader>4", desc = "Project root 4" },
-	{ "<leader>5", desc = "Project root 5" },
+	-- cd to directories
+	{ "<leader>1", desc = "CD to ~" },
+	{ "<leader>2", desc = "CD to project root" },
+	{ "<leader>3", desc = "CD to file's dir" },
+	{ "<leader>4", desc = "CD up one dir" },
+	{ "<leader>5", desc = "CD to go.work root" },
+	{ "<leader>6", desc = "CD to tmux root" },
 
 	-- find
 	{ "<leader>ff", desc = "Find files" },
@@ -150,6 +153,7 @@ wk.add({
 	-- splits / shell
 	{ "<leader>st", desc = "Terminal (tab)" },
 	{ "<leader>sh", desc = "Terminal (horizontal)" },
+	{ "<leader>T", desc = "Terminal at project root" },
 
 	-- ai
 	{ "<leader>cc", desc = "AI chat" },

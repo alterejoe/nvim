@@ -8,15 +8,6 @@ tmux.setup({
 			{ name = "portal/admin", path = "~/projects/portal/adminserver/" },
 			{ name = "portal/client", path = "~/projects/portal/clientserver/" },
 			{ name = "portal/auth0", path = "~/projects/portal/auth0server/" },
-			{ name = "tools/forge-templates-portal", path = "~/tools/forge_templates_portal" },
-			{ name = "tools/primitive-templates", path = "~/tools/primitives-templates" },
-			{ name = "tools/primitives", path = "~/tools/primitive" },
-			{ name = "tools/forge-templates", path = "~/tools/forge_templates" },
-			{ name = "portal/docs", path = "~/projects/portal/docs/" },
-			{ name = "portal/static/form-behaviors", path = "~/projects/portal/static/js/form-behavior/" },
-			{ name = "portal/static", path = "~/projects/portal/static/" },
-			{ name = "portal/shared", path = "~/projects/portal/shared/" },
-			{ name = "portal/gencomponents", path = "~/projects/portal/gencomponents/" },
 		},
 		workWtools = {
 			{ name = "portal/admin", path = "~/projects/portal/adminserver/" },
@@ -50,7 +41,6 @@ tmux.setup({
 	},
 	default = {
 		{ name = "ide/nvim", path = "~/.config/nvim" },
-		{ name = "ide/nvim-old", path = "~/.config/nvim-old" },
 	},
 })
 
