@@ -39,10 +39,8 @@ function M_sub.setup(M)
 			vim.notify("Not in tmux", vim.log.levels.WARN)
 			return
 		end
+		-- /home/jmeyer/.config/nvim/lua/tmux_projects/sessions.lua:42 FINAL
 		local scan = require("plenary.scandir")
-		local cwd = vim.fn.getcwd()
-		local home_projects = vim.fn.expand("~/projects")
-		local tools = vim.fn.expand("~/tools")
 		local dirs = {}
 		local seen = {}
 		local function add(d)
@@ -51,18 +49,31 @@ function M_sub.setup(M)
 				table.insert(dirs, d)
 			end
 		end
+
+		-- Priority directories (scan subdirs, depth 1)
+		for _, root in ipairs({ "/projects", "/portal" }) do
+			if vim.fn.isdirectory(root) == 1 then
+				add(root)
+				for _, d in ipairs(scan.scan_dir(root, { depth = 1, only_dirs = true, silent = true })) do
+					add(d)
+				end
+			end
+		end
+
+		-- Also scan ~/projects and ~/tools if they exist
+		for _, root in ipairs({ vim.fn.expand("~/projects"), vim.fn.expand("~/tools") }) do
+			if vim.fn.isdirectory(root) == 1 then
+				add(root)
+				for _, d in ipairs(scan.scan_dir(root, { depth = 1, only_dirs = true, silent = true })) do
+					add(d)
+				end
+			end
+		end
+
+		-- Add cwd and its immediate subdirs last
+		local cwd = vim.fn.getcwd()
 		add(cwd)
-		if vim.fn.isdirectory(home_projects) == 1 then
-			for _, d in ipairs(scan.scan_dir(home_projects, { depth = 1, only_dirs = true, silent = true })) do
-				add(d)
-			end
-		end
-		if vim.fn.isdirectory(tools) == 1 then
-			for _, d in ipairs(scan.scan_dir(tools, { depth = 1, only_dirs = true, silent = true })) do
-				add(d)
-			end
-		end
-		for _, d in ipairs(scan.scan_dir(cwd, { only_dirs = true, silent = true })) do
+		for _, d in ipairs(scan.scan_dir(cwd, { depth = 1, only_dirs = true, silent = true })) do
 			add(d)
 		end
 		require("telescope.pickers")

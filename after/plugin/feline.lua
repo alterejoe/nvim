@@ -1,15 +1,18 @@
+-- /home/jmeyer/.config/nvim/after/plugin/feline.lua FINAL
 -- Modern color scheme with better visibility
 local hl_active = {
 	cwd = { fg = "#1e293b", bg = "#93c5fd", style = "bold" },
 	root = { fg = "#1e293b", bg = "#c4b5fd", style = "NONE" },
 	file = { fg = "#1e293b", bg = "#6ee7b7", style = "bold" },
 	gowork = { fg = "#1e293b", bg = "#fde047", style = "NONE" },
+	recording = { fg = "#1e293b", bg = "#f87171", style = "bold" },
 }
 local hl_inactive = {
 	cwd = { fg = "#6b7280", bg = "#374151" },
 	root = { fg = "#6b7280", bg = "#374151" },
 	file = { fg = "#6b7280", bg = "#374151" },
 	gowork = { fg = "#6b7280", bg = "#374151" },
+	recording = { fg = "#6b7280", bg = "#374151" },
 }
 local function hl_pick(a, b)
 	local this = vim.fn.win_getid()
@@ -59,6 +62,21 @@ end
 local sep_style = {
 	left = " ",
 	right = " ",
+}
+-- Macro recording indicator (persistent, only visible while recording)
+local recording_component = {
+	provider = function()
+		local reg = vim.fn.reg_recording()
+		if reg == "" then
+			return ""
+		end
+		return " ● @" .. reg .. " "
+	end,
+	hl = function()
+		return hl_pick(hl_active.recording, hl_inactive.recording)
+	end,
+	left_sep = sep_style.left,
+	right_sep = sep_style.right,
 }
 -- Components used for BOTH active + inactive
 local left_components = {
@@ -141,14 +159,33 @@ local right_components = {
 		right_sep = sep_style.right,
 	},
 }
-require("feline").setup({
+-- /home/jmeyer/.config/nvim/after/plugin/feline.lua:144-152 FINAL-2
+-- Banner lives in the winbar (top of each window) so the bottom stays clear
+-- winbar.setup() skips global init (colors/separators/providers), so prime it
+-- via the regular setup() path first, then hand the statusline back to Neovim.
+require("feline").setup({})
+require("feline").winbar.setup({
 	components = {
-		active = { left_components, {}, right_components },
-		inactive = { left_components, {}, right_components },
+		active = { recording_component, left_components, {}, right_components },
+		inactive = { recording_component, left_components, {}, right_components },
 	},
 	force_inactive = {
 		filetypes = {},
 		buftypes = {},
 		bufnames = {},
 	},
+})
+vim.o.statusline = ""
+-- Macro start/stop -> noice toasts, plus force the winbar to re-evaluate
+vim.api.nvim_create_autocmd("RecordingEnter", {
+	callback = function()
+		vim.notify("● recording @" .. vim.fn.reg_recording())
+		vim.cmd("redrawstatus!")
+	end,
+})
+vim.api.nvim_create_autocmd("RecordingLeave", {
+	callback = function()
+		vim.notify("recording stopped")
+		vim.cmd("redrawstatus!")
+	end,
 })
