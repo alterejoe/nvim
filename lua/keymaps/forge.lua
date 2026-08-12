@@ -9,7 +9,7 @@ map("n", "gt", nav.toggle, { desc = "Forge: toggle handler/templ" })
 map("n", "gs", nav.goto_sqlc, { desc = "Forge: goto sqlc" })
 
 -- Pickers
-map("n", "<leader>ff", nav.pick, { desc = "Forge: pick entry" })
+-- map("n", "<leader>ff", nav.pick, { desc = "Forge: pick entry" })
 map("n", "<leader>fh", function()
 	nav.pick_type("handler")
 end, { desc = "Forge: pick handler" })
