@@ -1,11 +1,11 @@
--- /home/jmeyer/.config/nvim/lua/opencode-ext/viewer.lua FINAL
 -- One-keybind, full-chat buffer.  No scratchbuf, no 3-hop navigation.
 --
 -- Flow:
 --   <leader>ae  → opens latest conversation from latest CWD session directly
 --   <leader>am  → same for main session
---   In buffer:  [] cycle blocks, <A-[> <A-]> cycle conversations
---               c copy block, C copy+navigate, m copy markdown, M md+navigate,
+--   In buffer:  [] cycle files (this conversation), <A-[> <A-]> cycle conversations
+--               a apply block (stages; :w commits), c copy block,
+--               C copy+navigate, m copy markdown, M md+navigate,
 --               Y yank all, r refresh, ? help, q close, s picker
 
 local db = require("opencode-ext.db")
@@ -73,38 +73,83 @@ local function extract_path_from_line(line)
 	return path, lineno
 end
 
--- Find all code/markdown blocks using depth-aware fence matching.
--- Tracks nested fences via a stack so ```md containers with embedded
--- ```go blocks are parsed correctly — the outer close is the one that
--- matches the outer opener, not the first bare ``` encountered.
+-- Find all code/markdown blocks using CommonMark fence matching by
+-- backtick count: a fence of N backticks closes only with N+ backticks.
+--
+--   - 3-tick fences (```go, ```markdown): the common delivery form.
+--   - 4-tick fences (````markdown ... ````): used when a markdown file
+--     CONTAINS inner ``` fences — the inner 3-tick lines are literal
+--     content of the 4-tick container (never structural), so applying
+--     preserves them verbatim. Unambiguous; no heuristic needed.
+--   - A tagged fence inside an open fence is content (added to parents).
+--   - A bare fence with FEWER ticks than the open fence is content.
+--
+-- Fence lines themselves are KEPT in parent containers (so applying a
+-- markdown file with embedded code blocks preserves the fences) but
+-- excluded from the leaf block they delimit.
 -- Returns: { lang, start_line, end_line, lines }[]
 --   Inner blocks appear first, outer containers last.
 local function find_code_blocks(lines)
 	local blocks = {}
-	local stack = {} -- { lang, start_line, lines }
+	local stack = {} -- { lang, ticks, start_line, lines }
+
+	local function open_block(lang, ticks, start_line)
+		table.insert(stack, {
+			lang = lang,
+			ticks = ticks,
+			start_line = start_line,
+			lines = {},
+		})
+	end
 
 	for i = 1, #lines do
-		local open_match = lines[i]:match("^```(.+)")
-		local is_bare = lines[i]:match("^```%s*$")
+		local line = lines[i]
+		local open_ticks, lang = line:match("^(%`+)[ \t]*(%S.*)$")
+		local bare_ticks = line:match("^(%`+)[ \t]*$")
 
-		if open_match then
-			-- Opening fence with language tag (```go, ```md, ```py, etc.)
-			table.insert(stack, {
-				lang = vim.trim(open_match),
-				start_line = i,
-				lines = {},
-			})
-		elseif is_bare and #stack > 0 then
-			-- Closing fence: pop innermost open block
-			local block = table.remove(stack)
-			block.end_line = i
-			table.insert(blocks, block)
+		if open_ticks then
+			-- Tagged fence: opens a block only at top level; inside an open
+			-- fence it's literal content (e.g. ```go inside a 4-tick md container)
+			if #stack == 0 then
+				open_block(vim.trim(lang), #open_ticks, i)
+			else
+				for _, b in ipairs(stack) do
+					table.insert(b.lines, line)
+				end
+			end
+		elseif bare_ticks then
+			local n = #bare_ticks
+			local top = stack[#stack]
+			if not top then
+				-- Stray bare fence at top level: lang-less opener
+				open_block("", n, i)
+			elseif top.ticks <= n then
+				-- Closes the innermost open fence (CommonMark: closing fence
+				-- needs >= the opening fence's backtick count)
+				local block = table.remove(stack)
+				for _, b in ipairs(stack) do
+					table.insert(b.lines, line)
+				end
+				block.end_line = i
+				table.insert(blocks, block)
+			else
+				-- Fewer ticks than the open fence: literal content
+				for _, b in ipairs(stack) do
+					table.insert(b.lines, line)
+				end
+			end
 		else
 			-- Regular content line: add to all currently open blocks
 			for _, b in ipairs(stack) do
-				table.insert(b.lines, lines[i])
+				table.insert(b.lines, line)
 			end
 		end
+	end
+
+	-- Finalize unclosed blocks (unbalanced input) — lines are already complete.
+	for _, b in ipairs(stack) do
+		b.end_line = #lines
+		table.insert(blocks, b)
 	end
 
 	return blocks
@@ -198,35 +243,98 @@ local function find_block_at_line(lnum, block_positions, blocks)
 	return nil, nil
 end
 
---- Find the outermost ```md container block containing the given line.
---- Returns nil if the cursor is not inside a markdown block.
+--- Find the outermost ```md or ```markdown container block containing the
+--- given line. Returns nil if the cursor is not inside a markdown block.
 local function find_md_container(lnum, blocks)
 	local result = nil
 	for _, block in ipairs(blocks) do
-		if vim.trim(block.lang):sub(1, 2) == "md" and lnum >= block.start_line and lnum <= block.end_line then
+		local lang = vim.trim(block.lang)
+		local is_md = lang:sub(1, 2) == "md" or lang == "markdown"
+		if is_md and lnum >= block.start_line and lnum <= block.end_line then
 			result = block
 		end
 	end
 	return result
 end
 
--- Navigate to the next or previous code block.
-local function navigate_block(direction, lnum, blocks, block_positions)
-	local current_bi = block_positions[lnum]
-	local target_bi
-	if direction == "next" then
-		target_bi = current_bi and (current_bi + 1) or 1
-		if target_bi > #blocks then
-			return
-		end
-	else
-		target_bi = current_bi and (current_bi - 1) or #blocks
-		if target_bi < 1 then
-			return
+-- Tolerant file-block detection: a block is a FILE block if ANY of its
+-- first 3 lines carries a path comment (the path comment may be preceded
+-- by a blank line or fence noise). Uses the battle-tested extractor that
+-- `C`/`M` navigation already relies on.
+--- @param block table
+--- @return string|nil  the detected path, or nil
+local function block_file_path(block)
+	for i = 1, math.min(3, #(block.lines or {})) do
+		local path = extract_path_from_line(block.lines[i] or "")
+		if path then
+			return path
 		end
 	end
-	local target = blocks[target_bi]
-	vim.api.nvim_win_set_cursor(0, { target.start_line, 0 })
+	return nil
+end
+
+-- Navigate between blocks in the CURRENT conversation only. Primary target:
+-- FILE blocks (blocks whose first few lines carry a path comment — whole
+-- delivered files, incl. markdown containers). If classification finds none,
+-- FALL BACK to all blocks so [ ] always navigates something. `[` first jumps
+-- to the current block's start if mid-block; `]` jumps to the next. WRAPS.
+-- @param direction string  "next" | "prev"
+-- @param lnum number  current line
+-- @param file_blocks table  blocks sorted by start_line (may be empty)
+-- @param all_blocks table  every block (fallback)
+local function navigate_block(direction, lnum, file_blocks, all_blocks)
+	local nav = file_blocks
+	if #nav == 0 then
+		nav = all_blocks
+	end
+	if #nav == 0 then
+		vim.notify("❌ No code blocks in this conversation", vim.log.levels.WARN)
+		return
+	end
+
+	-- Find the block containing the cursor
+	local current_idx = nil
+	for i, b in ipairs(nav) do
+		if lnum >= b.start_line and lnum <= b.end_line then
+			current_idx = i
+			break
+		end
+	end
+
+	local target
+	if direction == "next" then
+		if current_idx and current_idx < #nav then
+			target = nav[current_idx + 1]
+		elseif current_idx == #nav then
+			target = nav[1] -- wrap to first
+		elseif not current_idx then
+			target = nav[1]
+		end
+	else -- "prev"
+		if current_idx and lnum > nav[current_idx].start_line then
+			-- Mid-block: first jump to the start of the current block
+			target = nav[current_idx]
+		elseif current_idx and current_idx > 1 then
+			target = nav[current_idx - 1]
+		elseif current_idx == 1 then
+			target = nav[#nav] -- wrap to last
+		elseif not current_idx then
+			target = nav[#nav]
+		end
+	end
+
+	if target then
+		vim.api.nvim_win_set_cursor(0, { target.start_line, 0 })
+		local path = block_file_path(target)
+		local label = path or ("(" .. (target.lang or "?") .. " block)")
+		local shown = current_idx or 1
+		if direction == "next" then
+			shown = current_idx and math.min(current_idx + 1, #nav) or 1
+		else
+			shown = current_idx and math.max(current_idx - 1, 1) or 1
+		end
+		vim.notify(string.format("→ %d/%d %s", shown, #nav, label), vim.log.levels.INFO)
+	end
 end
 
 --- Navigate to a resolved file path in a non-viewer window.
@@ -470,6 +578,240 @@ local function navigate_to_function(raw_path, func_name, project_path, viewer_bu
 	return true
 end
 
+--- Parse an apply target from a block's path comment (line 1).
+--- Handles: // path, // path:42, // path:42-58 — plus # / -- / ; styles
+--- for markdown and other comment languages. FINAL/FINAL-N suffixes ignored.
+--- Returns path, start_line, end_line (nil when absent).
+--- @param line string
+--- @return string|nil, number|nil, number|nil
+local function parse_apply_path(line)
+	local trimmed = vim.trim(line)
+	local path, start_s, end_s = trimmed:match("^//%s*([%w_%-/%.~]+%.[%w_]+):?(%d*)%-?(%d*)")
+		or trimmed:match("^#%s*([%w_%-/%.~]+%.[%w_]+):?(%d*)%-?(%d*)")
+		or trimmed:match("^%-%-%s*([%w_%-/%.~]+%.[%w_]+):?(%d*)%-?(%d*)")
+		or trimmed:match("^;%s*([%w_%-/%.~]+%.[%w_]+):?(%d*)%-?(%d*)")
+	if not path then
+		return nil, nil, nil
+	end
+	local start_line = tonumber(start_s) or nil
+	local end_line = tonumber(end_s) or nil
+	return path, start_line, end_line
+end
+
+-- Locate the fence-delimited block around the cursor DIRECTLY FROM THE
+-- BUFFER (parser-independent). Scans up for the nearest tagged opener
+-- (```lang) and down for the matching bare closer (N+ backticks, CommonMark
+-- tick rule). Returns { start_line, end_line, content_lines }.
+-- @param viewer_buf integer  rendered conversation buffer
+-- @param lnum number  cursor line
+local function block_from_buffer(viewer_buf, lnum)
+	local total = vim.api.nvim_buf_line_count(viewer_buf)
+	local function getline(n)
+		return vim.api.nvim_buf_get_lines(viewer_buf, n - 1, n, false)[1] or ""
+	end
+
+	-- Scan up for the nearest tagged opening fence
+	for open = lnum, 1, -1 do
+		local text = getline(open)
+		local ticks, lang = text:match("^(%`+)[ \t]*(%S.*)$")
+		if ticks then
+			-- Scan down for the matching bare closer (>= opener tick count)
+			for close = open + 1, total do
+				local ctext = getline(close)
+				local cticks = ctext:match("^(%`+)[ \t]*$")
+				if cticks and #cticks >= #ticks then
+					local content = vim.api.nvim_buf_get_lines(viewer_buf, open, close - 1, false)
+					-- content = 1-based lines open+1 .. close-1
+					return { start_line = open, end_line = close, lang = vim.trim(lang), lines = content }
+				end
+			end
+			return nil -- opener with no matching close
+		end
+	end
+	return nil
+end
+
+--- LSP-verify a staged buffer: wait briefly for the server to re-publish
+--- diagnostics after the replace, then report the error count. Never writes.
+--- Skips silently when no LSP client is attached to the buffer (e.g. md/yaml).
+--- @param buf integer  target buffer
+--- @param resolved string  absolute path (for the notify message)
+local function lsp_check_staged(buf, resolved)
+	local clients = vim.lsp.get_clients({ bufnr = buf })
+	if #clients == 0 then
+		return
+	end
+
+	vim.defer_fn(function()
+		if not vim.api.nvim_buf_is_valid(buf) then
+			return
+		end
+		local diags = vim.diagnostic.get(buf)
+		local errs = vim.tbl_filter(function(d)
+			return d.severity and d.severity <= vim.diagnostic.severity.ERROR
+		end, diags)
+		if #errs == 0 then
+			vim.notify(string.format("LSP: %d diagnostic(s), 0 errors", #diags), vim.log.levels.INFO)
+		else
+			local d = errs[1]
+			local sev = vim.diagnostic.severity[d.severity] or "?"
+			vim.notify(
+				string.format("⚠ LSP: %d error(s) — first %s at %d:%d", #errs, sev, d.lnum + 1, d.col + 1),
+				vim.log.levels.WARN
+			)
+		end
+	end, 400)
+end
+
+--- Apply the block under the cursor to its target file.
+--- Content is read DIRECTLY FROM THE VIEWER BUFFER via block_from_buffer —
+--- never from the parser's lines array, which has repeatedly truncated
+--- content. Stages in the target buffer only — NO write. The user reviews,
+--- then :w commits or u undoes. Full-file blocks replace the whole buffer;
+--- path:42-58 blocks replace that line range.
+--- Reports explicit success ("✅ Staged N lines → path") or failure
+--- ("❌ <reason>") notifications.
+--- @param lnum number  cursor line in the viewer
+--- @param project_path string  CWD for relative path resolution
+--- @param viewer_buf integer  viewer buffer handle
+local function apply_block(lnum, project_path, viewer_buf)
+	local viewer_win = vim.api.nvim_get_current_win()
+
+	-- 1. Read the block content straight from the buffer (parser-independent)
+	local blk = block_from_buffer(viewer_buf, lnum)
+	if not blk then
+		vim.notify("❌ Not inside a fenced code block", vim.log.levels.WARN)
+		return
+	end
+
+	-- 2. Find the path comment among the first few content lines
+	local path_line = nil
+	local raw_path, start_line, end_line
+	for i = 1, math.min(3, #blk.lines) do
+		local p, s, e = parse_apply_path(blk.lines[i] or "")
+		if p then
+			path_line = i
+			raw_path, start_line, end_line = p, s, e
+			break
+		end
+	end
+	if not raw_path then
+		vim.notify("❌ No file path in this block — not a file block (use c to copy)", vim.log.levels.WARN)
+		return
+	end
+
+	-- 3. Resolve to absolute
+	local resolved
+	if raw_path:sub(1, 1) == "/" then
+		resolved = raw_path
+	else
+		resolved = vim.fn.resolve(project_path .. "/" .. raw_path)
+	end
+
+	-- 4. Content = buffer lines minus the path-comment line
+	local content = {}
+	for i = 1, #blk.lines do
+		if i ~= path_line then
+			table.insert(content, blk.lines[i])
+		end
+	end
+	if #content == 0 then
+		vim.notify("❌ Block is empty — nothing to apply", vim.log.levels.WARN)
+		return
+	end
+
+	-- 5. File existence check with create prompt (mkdir parents).
+	--    When the parent directory doesn't exist, ask explicitly and show
+	--    the FULL path that would be created.
+	local exists = vim.fn.filereadable(resolved) == 1
+	if not exists then
+		local parent = vim.fn.fnamemodify(resolved, ":h")
+		local dir_exists = vim.fn.isdirectory(parent) == 1
+		local msg
+		if dir_exists then
+			msg = "Create file?\n  " .. resolved
+		else
+			msg = "Directory doesn't exist:\n  " .. parent .. "\n\nCreate it and the file?\n  " .. resolved
+		end
+		local create = vim.fn.confirm(msg, "&Yes\n&No", 1)
+		if create ~= 1 then
+			vim.notify("❌ Cancelled — file not created", vim.log.levels.INFO)
+			return
+		end
+		if not dir_exists then
+			vim.fn.mkdir(parent, "p")
+		end
+	end
+
+	-- 6. Find target window (not the viewer), vsplit if needed
+	local target_win = nil
+	for _, w in ipairs(vim.api.nvim_list_wins()) do
+		local wbuf = vim.api.nvim_win_get_buf(w)
+		if wbuf ~= viewer_buf and vim.api.nvim_buf_is_valid(wbuf) then
+			target_win = w
+			break
+		end
+	end
+	if not target_win then
+		vim.cmd("vsplit")
+		for _, w in ipairs(vim.api.nvim_list_wins()) do
+			local wbuf = vim.api.nvim_win_get_buf(w)
+			if wbuf ~= viewer_buf then
+				target_win = w
+				break
+			end
+		end
+		if not target_win then
+			vim.notify("❌ Failed to create split", vim.log.levels.ERROR)
+			return
+		end
+	end
+
+	-- 7. Open the file and stage the replacement
+	vim.api.nvim_set_current_win(target_win)
+	local ok, err = pcall(vim.cmd, "edit " .. vim.fn.fnameescape(resolved))
+	if not ok then
+		vim.notify("❌ Failed to open: " .. tostring(err), vim.log.levels.ERROR)
+		vim.api.nvim_set_current_win(viewer_win)
+		return
+	end
+	local buf = vim.api.nvim_get_current_buf()
+	if not vim.bo[buf].modifiable then
+		vim.notify("❌ Buffer is not modifiable — won't apply", vim.log.levels.ERROR)
+		vim.api.nvim_set_current_win(viewer_win)
+		return
+	end
+
+	local total = vim.api.nvim_buf_line_count(buf)
+	if start_line then
+		-- Range replacement: validate against current buffer
+		local finish = end_line or start_line
+		if start_line < 1 or finish < start_line then
+			vim.notify("❌ Invalid range " .. start_line .. "-" .. finish, vim.log.levels.ERROR)
+			vim.api.nvim_set_current_win(viewer_win)
+			return
+		end
+		if start_line > total then
+			vim.notify(string.format("❌ Start %d beyond EOF (%d lines)", start_line, total), vim.log.levels.ERROR)
+			vim.api.nvim_set_current_win(viewer_win)
+			return
+		end
+		finish = math.min(finish, total)
+		vim.api.nvim_buf_set_lines(buf, start_line - 1, finish, false, content)
+		vim.api.nvim_win_set_cursor(target_win, { start_line, 0 })
+	else
+		-- Full-file replacement
+		vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
+		vim.api.nvim_win_set_cursor(target_win, { 1, 0 })
+	end
+
+	vim.notify(
+		string.format("✅ Staged %d lines → %s — :w to commit, u to undo", #content, resolved),
+		vim.log.levels.INFO
+	)
+	lsp_check_staged(buf, resolved)
+end
+
 --- Help float ----------------------------------------------------------------
 
 local help_win = nil
@@ -477,10 +819,11 @@ local help_win = nil
 local HELP_LINES = {
 	"── Keymaps ────────────────────────────────────────────────",
 	"",
-	"[               previous code block",
-	"]               next code block",
+	"[               previous file (this conversation)",
+	"]               next file (this conversation)",
 	"<A-[>           previous conversation",
 	"<A-]>           next conversation",
+	"a               apply block to file (stages; :w to commit)",
 	"c               copy code block",
 	"C               copy + navigate (to func decl if cursor on one)",
 	"m               copy markdown file",
@@ -554,6 +897,24 @@ local function open_chat_buffer(conv, project_path, all_convs, conv_idx, raw)
 		return
 	end
 
+	-- File-level blocks: blocks whose first few lines carry a path comment
+	-- (whole delivered files, incl. markdown containers). Inner code blocks
+	-- inside containers have no path comment and are excluded, so [ ]
+	-- navigation lands on file starts first. Sorted by start_line.
+	local file_blocks = {}
+	for _, b in ipairs(blocks) do
+		if block_file_path(b) then
+			table.insert(file_blocks, b)
+		end
+	end
+	table.sort(file_blocks, function(a, b)
+		return a.start_line < b.start_line
+	end)
+	vim.notify(
+		string.format("Viewer: %d file block(s), %d total — %s", #file_blocks, #blocks, get_title_line(conv)),
+		vim.log.levels.INFO
+	)
+
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, content_lines)
 	vim.bo[buf].buftype = "nofile"
@@ -572,7 +933,7 @@ local function open_chat_buffer(conv, project_path, all_convs, conv_idx, raw)
 	vim.wo[win].winbar = title
 
 	-- Minimal statusline with most-used keymaps
-	vim.wo[win].statusline = "c copy C nav m md M md+nav [ ] <A-[> <A-]> conv ? help"
+	vim.wo[win].statusline = "a apply c copy C nav m md M md+nav [ ] <A-[> <A-]> conv ? help"
 
 	local km_opts = { buffer = buf, nowait = true, noremap = true }
 
@@ -584,13 +945,15 @@ local function open_chat_buffer(conv, project_path, all_convs, conv_idx, raw)
 		end
 	end
 
-	-- Block navigation
+	-- File navigation: [ ] jumps between file starts IN THIS CONVERSATION
+	-- only (falls back to all blocks when no file blocks are detected, so
+	-- it never dead-ends). Conversation switching stays on <A-[> / <A-]>.
 	vim.keymap.set("n", "]", function()
-		navigate_block("next", vim.fn.line("."), blocks, block_positions)
+		navigate_block("next", vim.fn.line("."), file_blocks, blocks)
 	end, km_opts)
 
 	vim.keymap.set("n", "[", function()
-		navigate_block("prev", vim.fn.line("."), blocks, block_positions)
+		navigate_block("prev", vim.fn.line("."), file_blocks, blocks)
 	end, km_opts)
 
 	-- Conversation navigation
@@ -704,6 +1067,12 @@ local function open_chat_buffer(conv, project_path, all_convs, conv_idx, raw)
 		navigate_to_path(raw_path, lineno, project_path, buf)
 	end, km_opts)
 
+	-- Apply the block under the cursor (reads content from the buffer,
+	-- parser-independent; stages in target; :w commits, u undoes)
+	vim.keymap.set("n", "a", function()
+		apply_block(vim.fn.line("."), project_path, buf)
+	end, km_opts)
+
 	-- Yank all conversation text
 	vim.keymap.set("n", "Y", function()
 		local all = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
@@ -773,7 +1142,6 @@ end
 
 --- Session picker (telescope, fallback) --------------------------------
 
--- /home/jmeyer/.config/nvim/lua/opencode-ext/viewer.lua:549 FINAL
 pick_session = function()
 	local sessions, err = db.fetch_sessions()
 	if not sessions then

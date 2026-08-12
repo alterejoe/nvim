@@ -1,3 +1,4 @@
+-- /home/altjoe/.config/nvim/lua/plugins/tools.lua
 return {
 	{ "feline-nvim/feline.nvim" }, -- status bar
 	{ "gabrielpoca/replacer.nvim" },
@@ -27,7 +28,7 @@ return {
 			views = {
 				mini = {
 					position = {
-						row = -2,
+						row = 2,
 						col = 0,
 					},
 					border = {
@@ -43,6 +44,10 @@ return {
 				{
 					filter = { event = "notify", find = "No information available" },
 					opts = { skip = true },
+				},
+				{
+					filter = { event = "msg_show", find = "recording" },
+					view = "mini",
 				},
 				{
 					filter = {

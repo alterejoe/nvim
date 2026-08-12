@@ -1,3 +1,4 @@
+-- /home/altjoe/.config/nvim/after/plugin/feline.lua
 -- Modern color scheme with better visibility
 local hl_active = {
 	cwd = { fg = "#1e293b", bg = "#93c5fd", style = "bold" },
@@ -141,11 +142,27 @@ local right_components = {
 		right_sep = sep_style.right,
 	},
 }
+local feline_components = {
+	active = { left_components, {}, right_components },
+	inactive = { left_components, {}, right_components },
+}
+
+-- setup() must run first: it initializes the theme colors that the
+-- generator needs (winbar.setup() alone leaves feline.colors nil).
 require("feline").setup({
-	components = {
-		active = { left_components, {}, right_components },
-		inactive = { left_components, {}, right_components },
+	components = feline_components,
+	force_inactive = {
+		filetypes = {},
+		buftypes = {},
+		bufnames = {},
 	},
+})
+
+-- Bar moves to the TOP (winbar); the bottom statusline is hidden so the
+-- macro "recording @q" message row is the last row and never covered.
+vim.opt.laststatus = 0
+require("feline").winbar.setup({
+	components = feline_components,
 	force_inactive = {
 		filetypes = {},
 		buftypes = {},
