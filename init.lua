@@ -24,6 +24,7 @@ require("browser")
 require("keymaps")
 require("clipboard").setup()
 require("opencode-ext")
+require("opencode-manage")
 
 vim.api.nvim_create_autocmd("VimEnter", {
 	callback = function()

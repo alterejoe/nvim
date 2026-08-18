@@ -1,0 +1,103 @@
+# /home/altjoe/docs/opencode/manage-plugin/17-impact-registry.md FINAL
+---
+title: 17 — Impact Registry (M1i)
+status: proposed
+links: [03-proposals, 04-rules-file, 14-build-order]
+---
+
+# Impact Registry — shared code awareness (M1i)
+
+The gate stops the AI from *writing*; M1i stops it from writing **blind**.
+When a proposal targets a registered shared module, it must first prove —
+via LSP — what that change affects.
+
+## Why
+
+- Duplicated logic grows when the model re-implements what a central module
+  already provides. The registry names the canonical implementations so
+  reuse is visible, not accidental.
+- "I changed the shared thing and something else broke" happens when the
+  change was proposed without knowing its consumers. The impact list forces
+  that knowledge into every proposal touching shared code.
+- Flip-flop breakage is a review-time problem: with `impact` recorded on the
+  proposal, the nvim side shows *what the change touches* before you apply.
+
+## The registry file (`.opencode/manage.registry.json`)
+
+Fail-open: **no registry file = no impact requirement.** Projects opt in.
+
+```json
+{
+  "shared": [
+    {
+      "path": "internal/store/store.go",
+      "symbols": ["Save", "Load"],
+      "fragile": true,
+      "constraints": "Do not change function signatures; additive changes only"
+    }
+  ],
+  "canonical": [
+    {
+      "concept": "time formatting",
+      "path": "internal/timefmt/format.go",
+      "symbols": ["FormatDuration"]
+    }
+  ]
+}
+```
+
+- `shared`: central modules. A proposal whose `path` equals a shared path —
+  or lives inside one — **must** carry `impact`.
+- `fragile`: marks the entry as high-risk; the summary shows `[FRAGILE]` so
+  the model treats it with care.
+- `constraints`: rules the model sees before proposing (no signature
+  changes, additive only, etc.).
+- `canonical`: "for this concept, reuse this implementation" — the dedup
+  map. Model-facing only; no structural gate.
+
+## The impact requirement
+
+`emit_proposal` on a shared path with a missing/empty/invalid `impact` throws
+a **requirements error** (⚠️, not ❌):
+
+- missing → "run lsp_find_references on the symbols you are changing"
+- unparseable / wrong shape → "must be a JSON array of {path, symbol, relation}"
+- path not on disk → "impact must come from real LSP results, not invention"
+
+This is the ONE deliberate exception to DENIAL IS TERMINAL: the model must
+retry with evidence, not give up. The proposal is not recorded until `impact`
+is valid.
+
+## What impact looks like on a proposal
+
+```json
+{
+  "ts": 1780000000000,
+  "path": "internal/store/store.go",
+  "impact": [
+    { "path": "internal/game/game.go", "symbol": "Save", "relation": "calls" },
+    { "path": "internal/score/score.go", "symbol": "Load", "relation": "reads" }
+  ],
+  "reuses": [
+    { "path": "internal/timefmt/format.go", "symbol": "FormatDuration" }
+  ]
+}
+```
+
+- `impact`: consumers of the changed symbols — gathered via LSP, verified to
+  exist on disk.
+- `reuses`: canonical implementations the change reuses — proof of no
+  duplication.
+
+## Cost
+
+- Gate: one extra tiny sync read per tool call (~0.1ms) — imperceptible.
+- Only proposals touching registered shared paths pay the LSP cost (1-3
+  extra calls, seconds) — which is the verification you asked for.
+- No registry file = current behavior, unchanged.
+
+## Related
+
+- [03-proposals](03-proposals.md) — the `impact`/`reuses` fields
+- [04-rules-file](04-rules-file.md) — fail-closed sibling of this fail-open file
+- [14-build-order](14-build-order.md) — M1i placement

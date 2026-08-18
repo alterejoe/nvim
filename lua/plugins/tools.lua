@@ -29,7 +29,7 @@ return {
 				mini = {
 					position = {
 						row = 2,
-						col = 0,
+						col = -1, -- negative = right-aligned → top-right
 					},
 					border = {
 						style = "rounded",

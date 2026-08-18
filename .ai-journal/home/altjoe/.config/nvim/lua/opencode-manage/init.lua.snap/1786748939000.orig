@@ -1,0 +1,25 @@
+-- opencode-manage — the review console for the opencode manage plugin.
+-- Proposal review (accept/reject with snapshots) + change journal timeline.
+-- Completely separate from opencode-ext (the chat viewer) — no overlap.
+--
+-- ONE viewer for proposals (<leader>ap / <leader>ac → reviewview), one for
+-- the journal (<leader>aj → journalview) — both persistent two-pane
+-- viewers with live previews, no bland pickers.
+
+local review = require("opencode-manage.review")
+local reviewview = require("opencode-manage.reviewview")
+local journalview = require("opencode-manage.journalview")
+
+-- Keymaps
+vim.keymap.set("n", "<leader>ap", reviewview.open, { desc = "Manage: review proposals" })
+vim.keymap.set("n", "<leader>ac", reviewview.open, { desc = "Manage: review proposals (merged)" })
+vim.keymap.set("n", "<leader>aj", journalview.open, { desc = "Manage: journal viewer" })
+
+-- API surface for scripting / later integration
+return {
+	review = review,
+	reviewview = reviewview,
+	journalview = journalview,
+	proposals = require("opencode-manage.proposals"),
+	journal = require("opencode-manage.journal"),
+}

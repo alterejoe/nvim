@@ -1,0 +1,337 @@
+/**
+ * Manage — OpenCode Management Plugin (M1 + M1g + M1i: airlock gate + proposals + groups + impact)
+ *
+ * Core principle: STRUCTURAL, not heuristic. There is no path from the AI
+ * to the filesystem. The gate denies the mutation tools outright; the AI's
+ * only "write" channel is emit_proposal, which writes nothing to disk.
+ * The user applies proposals manually (or via the nvim side later).
+ *
+ * Fail-closed: if the project's `.opencode/manage.rules.json` is missing,
+ * the airlock defaults to ON (all mutations denied). A rules file can
+ * whitelist specific tools.
+ *
+ * Rules file shape (per project, .opencode/manage.rules.json):
+ * {
+ *   "deny": ["bash", "edit", "write", "patch"],   // default if absent
+ *   "allow": []                                    // exact tool names that override deny
+ * }
+ *
+ * NOTE: `bash` is denied even when a rules file forgets it — it can write
+ * files directly (echo >, rm, mv) and no hook can see inside its effects.
+ *
+ * group (M1g): every proposal carries a short slug tying it to one logical
+ * change across N files ("add-metrics-service"). Groups enable grouped
+ * review and revert-by-group in the nvim side. See
+ * ~/docs/opencode/manage-plugin/03-proposals.md.
+ *
+ * impact (M1i): every proposal targeting a registered SHARED module must
+ * carry an `impact` list — real consumers/symbols gathered via LSP before
+ * proposing — so changing central logic never happens blind. Shared modules
+ * live in the per-project `.opencode/manage.registry.json` (fail-open: no
+ * registry file = no impact requirement). See
+ * ~/docs/opencode/manage-plugin/17-impact-registry.md.
+ *
+ * DENIAL IS TERMINAL: the throw messages below explicitly tell the model
+ * not to retry or work around a denied tool. Retry-thrash (deny → retry →
+ * deny) burns model rounds and drifts the conversation; the message kills
+ * it at the source. The impact requirement is the ONE deliberate exception:
+ * its error is a REQUIREMENTS retry — the model must run LSP and re-emit,
+ * not give up.
+ */
+
+import { type Plugin, tool } from "@opencode-ai/plugin";
+import { mkdirSync, appendFileSync, readFileSync, existsSync } from "fs";
+import { join, dirname, isAbsolute } from "path";
+
+// ── Gate: deny mutation tools at the hook level ────────────────────────────
+
+// Default deny-list when no rules file exists (fail-closed airlock).
+const DEFAULT_DENY = ["bash", "edit", "write", "patch", "apply_patch"];
+
+function loadRules(directory: string): { deny: string[]; allow: string[] } {
+  const rulesPath = join(directory, ".opencode", "manage.rules.json");
+  try {
+    const parsed = JSON.parse(readFileSync(rulesPath, "utf8"));
+    return {
+      deny: Array.isArray(parsed.deny) ? parsed.deny : DEFAULT_DENY,
+      allow: Array.isArray(parsed.allow) ? parsed.allow : [],
+    };
+  } catch {
+    // No rules file (or unreadable) → fail closed to the default airlock.
+    return { deny: DEFAULT_DENY, allow: [] };
+  }
+}
+
+// ── Registry: shared-logic awareness (M1i, fail-open) ─────────────────────
+
+interface RegistryEntry {
+  path?: string;
+  symbols?: string[];
+  fragile?: boolean;
+  constraints?: string;
+}
+
+interface CanonicalEntry {
+  concept?: string;
+  path?: string;
+  symbols?: string[];
+}
+
+function loadRegistry(directory: string): { shared: RegistryEntry[]; canonical: CanonicalEntry[] } {
+  const registryPath = join(directory, ".opencode", "manage.registry.json");
+  try {
+    const parsed = JSON.parse(readFileSync(registryPath, "utf8"));
+    return {
+      shared: Array.isArray(parsed.shared) ? parsed.shared : [],
+      canonical: Array.isArray(parsed.canonical) ? parsed.canonical : [],
+    };
+  } catch {
+    // No registry file → fail open: no shared modules registered.
+    return { shared: [], canonical: [] };
+  }
+}
+
+// Exact path match, or anything nested under the shared path.
+function matchesSharedPath(shared: RegistryEntry[], targetPath: string): RegistryEntry | null {
+  const norm = targetPath.replace(/^\.\//, "");
+  for (const entry of shared) {
+    if (!entry.path) continue;
+    const p = entry.path.replace(/^\.\//, "").replace(/\/+$/, "");
+    if (norm === p || norm.startsWith(p + "/")) return entry;
+  }
+  return null;
+}
+
+function buildRegistrySummary(directory: string): string {
+  const { shared, canonical } = loadRegistry(directory);
+  const lines: string[] = [];
+  for (const s of shared) {
+    const symbols = s.symbols && s.symbols.length ? s.symbols.join(", ") : "shared logic";
+    const fragile = s.fragile ? " [FRAGILE]" : "";
+    const constraints = s.constraints ? ` constraints: ${s.constraints}` : "";
+    lines.push(`- ${s.path}${fragile} — ${symbols};${constraints}`);
+  }
+  for (const c of canonical) {
+    const symbols = c.symbols && c.symbols.length ? ` (${c.symbols.join(", ")})` : "";
+    lines.push(`- ${c.concept}: reuse ${c.path}${symbols} — do not reimplement`);
+  }
+  if (!lines.length) return "";
+  return "\n\nProject shared-logic registry (.opencode/manage.registry.json):\n" + lines.join("\n");
+}
+
+// ── Impact: structural requirement before touching shared code ─────────────
+
+interface ImpactEntry {
+  path: string;
+  symbol: string;
+  relation: string;
+}
+
+function parseImpact(directory: string, raw: string): ImpactEntry[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `[manage] ⚠️ "impact" must be a JSON array of {"path","symbol","relation"} objects — ` +
+        `it failed to parse. Run lsp_find_references on the symbols you are changing and re-emit.`,
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(
+      `[manage] ⚠️ "impact" must be a JSON array — got ${typeof parsed}. Re-emit with a valid impact list.`,
+    );
+  }
+  const entries: ImpactEntry[] = [];
+  for (const item of parsed) {
+    if (!item || typeof item.path !== "string" || typeof item.symbol !== "string") {
+      throw new Error(
+        `[manage] ⚠️ Every "impact" entry needs a string "path" and a string "symbol". Re-emit.`,
+      );
+    }
+    const target = isAbsolute(item.path) ? item.path : join(directory, item.path);
+    if (!existsSync(target)) {
+      throw new Error(
+        `[manage] ⚠️ Impact path "${item.path}" does not exist on disk — impact must come from real ` +
+          `lsp_find_references results, not invention. Re-run the LSP queries and re-emit.`,
+      );
+    }
+    entries.push({
+      path: item.path,
+      symbol: item.symbol,
+      relation: typeof item.relation === "string" ? item.relation : "referenced-by",
+    });
+  }
+  return entries;
+}
+
+function impactRequiredMessage(path: string): string {
+  return (
+    `[manage] ⚠️ Proposal for "${path}" touches a registered SHARED module, so it needs a valid ` +
+    `"impact" list. Run lsp_find_references (and lsp_goto_definition) on the symbols you are ` +
+    `changing, then re-emit emit_proposal with "impact" as a JSON array of ` +
+    `{"path","symbol","relation"} entries. Every path must exist on disk. ` +
+    `This is a REQUIREMENTS retry — the proposal is NOT recorded until impact is valid.`
+  );
+}
+
+// ── Proposals: the AI's only "write" channel ───────────────────────────────
+
+function proposalsFile(directory: string, sessionID: string): string {
+  return join(directory, ".ai-proposals", `${sessionID}.jsonl`);
+}
+
+function appendProposal(
+  directory: string,
+  sessionID: string,
+  proposal: unknown,
+) {
+  const file = proposalsFile(directory, sessionID);
+  mkdirSync(dirname(file), { recursive: true });
+  appendFileSync(file, JSON.stringify(proposal) + "\n", "utf8");
+}
+
+export const ManagePlugin: Plugin = async ({ directory }) => {
+  return {
+    // ── Airlock gate: runs before EVERY tool call ────────────────────────
+    "tool.execute.before": async (input) => {
+      const rules = loadRules(directory);
+      const toolName = input.tool;
+
+      // Explicit allow wins.
+      if (rules.allow.includes(toolName)) {
+        return;
+      }
+      if (rules.deny.includes(toolName)) {
+        throw new Error(
+          `[manage] ❌ Tool "${toolName}" is DENIED by the airlock — ` +
+            `permanently, do not retry it or attempt a workaround. ` +
+            `The AI cannot mutate the filesystem. Use emit_proposal instead.`,
+        );
+      }
+      // bash is denied by default even if a rules file forgot it.
+      if (toolName === "bash" && !rules.allow.includes("bash")) {
+        throw new Error(
+          `[manage] ❌ bash is DENIED by the airlock — permanently, do not ` +
+            `retry it or attempt a workaround. The AI cannot run shell ` +
+            `commands. Propose changes with emit_proposal; the user runs commands.`,
+        );
+      }
+    },
+
+    // ── The only write channel: structured proposal, nothing written ──────
+    tool: {
+      emit_proposal: tool({
+        description:
+          "Propose a file change for the user to review and apply manually. " +
+          "This tool writes NOTHING to disk — it records a structured proposal " +
+          "the user accepts or rejects. This is your ONLY write channel: " +
+          "bash/edit/write/patch are permanently denied, so do not attempt them. " +
+          "For a task touching multiple files, call this once per file and give " +
+          "every call the same `group` slug so the change stays reviewable and " +
+          "revertible as one unit. " +
+          "Before proposing changes to any shared/central module, run " +
+          "lsp_find_references on the symbols you will change and populate " +
+          "`impact` with the real consumers." +
+          buildRegistrySummary(directory),
+        args: {
+          path: tool.schema
+            .string()
+            .describe("Absolute or project-relative file path to change"),
+          operation: tool.schema
+            .string()
+            .describe(
+              "Type of change: 'create' (new file), 'replace' (full-file), " +
+                "'edit_range' (replace lines start_line..end_line), 'delete'",
+            ),
+          content: tool.schema
+            .string()
+            .describe(
+              "Full new file content (for create/replace) or the replacement block",
+            ),
+          reason: tool.schema
+            .string()
+            .describe("Why this change — so the user can review intent"),
+          group: tool.schema
+            .string()
+            .describe(
+              "Short slug tying this proposal to one logical change across files " +
+                "(e.g. 'add-metrics-service'). All files of one task share one group.",
+            ),
+          start_line: tool.schema
+            .string()
+            .describe(
+              "For edit_range: first line to replace (1-based). Empty string if unused.",
+            ),
+          end_line: tool.schema
+            .string()
+            .describe(
+              "For edit_range: last line to replace (1-based). Empty string if unused.",
+            ),
+          impact: tool.schema
+            .string()
+            .describe(
+              'JSON array of impact entries — REQUIRED when the target path is a ' +
+                'registered shared module. Each entry: {"path": string, "symbol": string, ' +
+                '"relation": string}. Gather via lsp_find_references / ' +
+                "lsp_goto_definition before proposing. Every path must exist on disk.",
+            ),
+          reuses: tool.schema
+            .string()
+            .describe(
+              'Optional: canonical implementations this change reuses, to prove no ' +
+                'duplication. JSON array of {"path": string, "symbol": string}. ' +
+                "Prefer the registry's canonical entries over reimplementing.",
+            ),
+        },
+        async execute(args, context) {
+          const sessionID = context.sessionID;
+          const registry = loadRegistry(directory);
+          const sharedHit = matchesSharedPath(registry.shared, args.path);
+
+          // Structural impact requirement: touching a shared module without
+          // evidence of what it affects is a REQUIREMENTS error, not a denial.
+          let impact: ImpactEntry[] = [];
+          if (sharedHit && (!args.impact || args.impact.trim() === "")) {
+            throw new Error(impactRequiredMessage(args.path));
+          }
+          if (args.impact && args.impact.trim() !== "") {
+            impact = parseImpact(directory, args.impact);
+          }
+
+          const proposal = {
+            ts: Date.now(),
+            sessionID,
+            group: args.group || "misc",
+            path: args.path,
+            operation: args.operation,
+            reason: args.reason,
+            start_line: args.start_line ? parseInt(args.start_line, 10) : null,
+            end_line: args.end_line ? parseInt(args.end_line, 10) : null,
+            content: args.content,
+            impact,
+            reuses: args.reuses || null,
+            status: "pending", // pending | accepted | rejected (user/nvim sets this)
+          };
+          appendProposal(directory, sessionID, proposal);
+          return JSON.stringify(
+            {
+              ok: true,
+              message:
+                `Proposal recorded (${args.operation}) for ${args.path} ` +
+                `[group: ${proposal.group}, impact: ${impact.length} ` +
+                `${impact.length === 1 ? "entry" : "entries"}]. ` +
+                `Nothing was written. The user must apply it manually.`,
+              proposal_id: proposal.ts,
+              manifest: proposalsFile(directory, sessionID),
+            },
+            null,
+            2,
+          );
+        },
+      }),
+    },
+  };
+};
+
+export default ManagePlugin;
