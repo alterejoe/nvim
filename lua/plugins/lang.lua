@@ -1,3 +1,4 @@
+-- /home/jmeyer/.config/nvim/lua/plugins/lang.lua FINAL
 return {
 	{
 		"neovim/nvim-lspconfig",
@@ -5,10 +6,29 @@ return {
 	},
 	{
 		"nvim-treesitter/nvim-treesitter",
-		branch = "master",
-		commit = "4916d65",
-		build = ":TSUpdate",
 		lazy = false,
+		build = function(plugin)
+			local luapath = plugin.dir .. "/lua"
+			package.path = package.path .. ";" .. luapath .. "/?.lua;" .. luapath .. "/?/init.lua"
+
+			local install = require("nvim-treesitter.install")
+
+			local langs = {}
+			local ok, lang_mod = pcall(require, "lang")
+			if ok and lang_mod.grammars then
+				langs = lang_mod.grammars()
+			end
+			if #langs == 0 then
+				-- Fallback: common languages
+				langs =
+					{ "python", "lua", "go", "javascript", "typescript", "html", "css", "json", "yaml", "toml", "sql" }
+			end
+
+			local task = install.install(langs)
+			if task and task.wait then
+				task:wait(180000)
+			end
+		end,
 	},
 	{
 		"stevearc/conform.nvim",
@@ -17,5 +37,5 @@ return {
 	},
 	{ "mfussenegger/nvim-dap" },
 	{ "nvim-neotest/nvim-nio" },
-	{ "igorlfs/nvim-dap-view" }, -- your existing preference over dap-ui
+	{ "igorlfs/nvim-dap-view" },
 }

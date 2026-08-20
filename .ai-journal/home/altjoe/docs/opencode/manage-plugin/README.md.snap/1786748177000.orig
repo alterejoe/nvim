@@ -1,0 +1,49 @@
+# /home/altjoe/docs/opencode/manage-plugin/README.md FINAL
+---
+title: Manage — OpenCode Management Plugin (Index)
+status: proposed
+links: [01-core-principle, 02-airlock-gate, 03-proposals, 04-rules-file, 05-snapshots-journal, 06-preferences, 07-knowledge-prompts, 08-session-search, 09-tag-context, 10-skills-gating, 11-nvim-companion, 12-hooks-stability, 13-honest-limits, 14-build-order, 15-open-questions, 16-out-of-scope, 17-impact-registry]
+---
+
+# Manage — OpenCode Management Plugin
+
+A modular opencode plugin acting as an **airlock between the AI and the
+filesystem**, plus session/preferences/knowledge management. The user is the
+only writer; the AI proposes, the user applies.
+
+## The one-sentence contract
+
+**The AI cannot touch your filesystem, ever. Its only output is structured
+proposals. You are the only writer.**
+
+## Document map
+
+| Doc | Point |
+|---|---|
+| [01-core-principle](01-core-principle.md) | Structural, not heuristic — why this design |
+| [02-airlock-gate](02-airlock-gate.md) | Deny bash/edit/write/patch at the hook level |
+| [03-proposals](03-proposals.md) | `emit_proposal` — the only write channel; `group` field for multi-file changes; `impact`/`reuses` for shared-code changes |
+| [04-rules-file](04-rules-file.md) | Fail-closed per-project configuration |
+| [05-snapshots-journal](05-snapshots-journal.md) | Undotree-style safety net, no git; group revert |
+| [06-preferences](06-preferences.md) | Auto-inject your preferences every session |
+| [07-knowledge-prompts](07-knowledge-prompts.md) | Pluggable evaluation scenarios + tagged notes |
+| [08-session-search](08-session-search.md) | Find sessions, search content, AI recall |
+| [09-tag-context](09-tag-context.md) | Tag-based context filtering (stretch) |
+| [10-skills-gating](10-skills-gating.md) | Registry-gated skill loading (stretch) |
+| [11-nvim-companion](11-nvim-companion.md) | The review console: diffs, journal, picker |
+| [12-hooks-stability](12-hooks-stability.md) | Which hooks, and how stable they are |
+| [13-honest-limits](13-honest-limits.md) | What this does and doesn't do |
+| [14-build-order](14-build-order.md) | Milestones with a kill switch |
+| [15-open-questions](15-open-questions.md) | Decisions still to make |
+| [16-out-of-scope](16-out-of-scope.md) | Deliberately not doing |
+| [17-impact-registry](17-impact-registry.md) | Shared-code awareness: LSP-backed impact requirement before touching central logic |
+
+## Status legend
+
+- **M1** = gate + proposals (Short) — the airlock
+- **M1g** = `group` field + grouped review + group revert (Short, builds on M1)
+- **M1i** = impact registry — LSP-backed impact requirement on shared-code proposals (Short, builds on M1g)
+- **M2** = prefs (Quick)
+- **M3** = snapshots + journal (Medium) — the safety net
+- **M4** = knowledge + session search (Medium)
+- **Stretch** = tags, skills, control panel (Large)

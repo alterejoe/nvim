@@ -1,3 +1,4 @@
+-- /home/altjoe/.config/nvim/lua/settings.lua
 vim.opt.guicursor = ""
 
 vim.o.splitright = true

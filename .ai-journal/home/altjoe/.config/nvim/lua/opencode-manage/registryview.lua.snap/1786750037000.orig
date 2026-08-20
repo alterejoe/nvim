@@ -1,0 +1,487 @@
+-- opencode-manage.registryview — the persistent registry review viewer.
+-- Top = pending/merged registry entries (from .opencode/manage.registry.pending.jsonl).
+-- Below: TWO side-by-side preview windows — ENTRY DETAILS (left) vs the
+-- MERGED BLOCK (right, exactly what da appends to manage.registry.json).
+-- One column beside your buffer (mirrors reviewview/journalview).
+--   j/k      move selection in the list (preview pair follows)
+--   [ / ]    scroll BOTH preview windows together (diff-style)
+--   da       merge into the registry (confirm — the right pane shows what
+--            will be appended; summary MD regenerates)
+--   dr       reject (status flip only, row stays marked rejected)
+--   r        refresh
+--   o        open the project's manage.registry.json in your buffer
+--   Q        kill the viewer (buffer-local; your global Q untouched)
+-- The LIST window's winbar is a permanent legend: color swatches (same
+-- highlight groups as the rows) + every keybind.
+-- Row colors: red=shared · blue=canonical · yellow=modularize ·
+-- magenta=consolidations · dim green=merged · dim strike=rejected
+-- MERGED ROWS STAY: the list shows pending + merged rows; merged ones
+-- render dim-green [merged] so the review history is explicit.
+--
+-- DEFENSE IN DEPTH: every field rendered through s()/join() — a userdata
+-- (cjson null sentinel from a stale decode), table, or number can never
+-- crash a concatenation. Display-only; the merge path in registry.lua is
+-- the one that must never see non-strings (it decodes with luanil).
+
+local registry = require("opencode-manage.registry")
+
+local M = {}
+
+local state = {
+	items = {},
+	idx = 1,
+	row_info = {}, -- item index -> { tag = string, hl = string }
+	list_buf = nil,
+	cur_buf = nil,
+	after_buf = nil,
+	list_win = nil,
+	cur_win = nil,
+	after_win = nil,
+	outer_win = nil,
+	origin_win = nil,
+	origin_buf = nil,
+	autocmd = nil,
+}
+
+local KIND_HL = {
+	shared = "ManageRegShared",
+	canonical = "ManageRegCanonical",
+	modularize = "ManageRegModularize",
+	consolidations = "ManageRegConsolidate",
+}
+
+local KIND_TAG = {
+	shared = "shared",
+	canonical = "canon",
+	modularize = "modular",
+	consolidations = "consol",
+}
+
+--- Render ANY field value safely — never crash on weird types.
+--- @param v any
+--- @param fallback string
+--- @return string
+local function s(v, fallback)
+	if v == nil then
+		return fallback or "—"
+	end
+	local t = type(v)
+	if t == "string" then
+		return v
+	end
+	if t == "number" or t == "boolean" then
+		return tostring(v)
+	end
+	return vim.inspect(v)
+end
+
+--- Join a list of values safely (each coerced via s()).
+--- @param vals any
+--- @param sep string
+--- @return string
+local function join(vals, sep)
+	sep = sep or ", "
+	if type(vals) ~= "table" then
+		return ""
+	end
+	local parts = {}
+	for _, v in ipairs(vals) do
+		parts[#parts + 1] = s(v)
+	end
+	return table.concat(parts, sep)
+end
+
+--- Define the row highlight groups once.
+local function define_hls()
+	local hl = vim.api.nvim_set_hl
+	hl(0, "ManageRegShared", { fg = "#f44747" }) -- red: shared (central)
+	hl(0, "ManageRegCanonical", { fg = "#569cd6" }) -- blue: canonical
+	hl(0, "ManageRegModularize", { fg = "#dcdcaa" }) -- yellow: modularize
+	hl(0, "ManageRegConsolidate", { fg = "#c586c0" }) -- magenta: consolidations
+	hl(0, "ManageRegMerged", { fg = "#6a9955" }) -- dim green: merged
+	hl(0, "ManageRegRejected", { fg = "#808080", strikethrough = true }) -- dim: rejected
+end
+
+--- Permanent legend in the LIST window's winbar: color swatches (rendered
+--- with the same highlight groups the rows use) + every keybind.
+local function set_legend()
+	if not state.list_win or not vim.api.nvim_win_is_valid(state.list_win) then
+		return
+	end
+	vim.wo[state.list_win].winbar = table.concat({
+		"%#ManageRegShared#██%*shared  %#ManageRegCanonical#██%*canonical  "
+			.. "%#ManageRegModularize#██%*modularize  %#ManageRegConsolidate#██%*consolidate  "
+			.. "%#ManageRegMerged#██%*merged  %#ManageRegRejected#██%*rejected",
+		"j/k move · gg/G jump · [/] scroll · da merge · dr reject · r refresh · o registry · Q kill",
+	}, "\n")
+end
+
+--- Precompute per-row display info. Called once per refresh.
+local function compute_row_info()
+	state.row_info = {}
+	for i, e in ipairs(state.items) do
+		local st = e.status or "pending"
+		local tag, hl
+		if st == "merged" then
+			tag, hl = "merged", "ManageRegMerged"
+		elseif st == "rejected" then
+			tag, hl = "rejected", "ManageRegRejected"
+		else
+			tag = KIND_TAG[e.kind] or s(e.kind, "?")
+			hl = KIND_HL[e.kind] or "ManageRegShared"
+		end
+		state.row_info[i] = { tag = tag, hl = hl }
+	end
+end
+
+--- Render ENTRY DETAILS (left) and the MERGED BLOCK (right) side by side.
+local function render_previews()
+	local e = state.items[state.idx]
+	if not e then
+		return
+	end
+
+	local D = {}
+	D[#D + 1] = "KIND: " .. s(e.kind, "?") .. (e.fragile and " [FRAGILE]" or "")
+	D[#D + 1] = "PROJECT: " .. s(e._project, "?")
+	if e.kind == "consolidations" then
+		D[#D + 1] = "PATHS: " .. join(e.paths)
+	else
+		D[#D + 1] = "PATH: " .. s(e.path, "?")
+	end
+	if e.symbols and #e.symbols > 0 then
+		D[#D + 1] = "SYMBOLS: " .. join(e.symbols)
+	end
+	if e.concept then
+		D[#D + 1] = "CONCEPT: " .. s(e.concept)
+	end
+	D[#D + 1] = "RATIONALE: " .. s(e.rationale, "—")
+	if e.constraints then
+		D[#D + 1] = "CONSTRAINTS: " .. s(e.constraints)
+	end
+	if e.suggested_target then
+		D[#D + 1] = "SUGGESTED TARGET: " .. s(e.suggested_target)
+	end
+	if e.refs and #e.refs > 0 then
+		D[#D + 1] = "REFS:"
+		for _, r in ipairs(e.refs) do
+			local rel = r.relation and (" (" .. s(r.relation) .. ")") or ""
+			D[#D + 1] = "  - " .. s(r.path) .. rel
+		end
+	end
+	D[#D + 1] = "GROUP: " .. s(e.group, "misc")
+	D[#D + 1] = "SESSION: " .. s(e.sessionID, "?")
+	D[#D + 1] = "STATUS: " .. s(e.status, "pending")
+
+	-- LEFT: entry details — read-only
+	if vim.bo[state.cur_buf].modifiable == false then
+		vim.bo[state.cur_buf].modifiable = true
+	end
+	vim.api.nvim_buf_set_lines(state.cur_buf, 0, -1, false, D)
+	vim.bo[state.cur_buf].bufhidden = "wipe"
+	vim.bo[state.cur_buf].filetype = "managelist"
+	vim.api.nvim_buf_set_name(state.cur_buf, "ENTRY: " .. s(e._rel))
+	vim.bo[state.cur_buf].modifiable = false
+
+	-- RIGHT: the exact JSON block da appends — read-only preview
+	if vim.bo[state.after_buf].modifiable == false then
+		vim.bo[state.after_buf].modifiable = true
+	end
+	local block_lines = vim.split(registry.preview_block(e), "\n", { plain = true })
+	if block_lines[#block_lines] == "" then
+		table.remove(block_lines)
+	end
+	vim.api.nvim_buf_set_lines(state.after_buf, 0, -1, false, block_lines)
+	vim.bo[state.after_buf].bufhidden = "wipe"
+	vim.bo[state.after_buf].filetype = "json"
+	vim.api.nvim_buf_set_name(state.after_buf, "MERGED BLOCK: " .. s(e._rel))
+	vim.bo[state.after_buf].modifiable = false
+
+	-- Winbars: what each side is, and that da merges the right one
+	if state.cur_win and vim.api.nvim_win_is_valid(state.cur_win) then
+		vim.wo[state.cur_win].winbar = string.format(
+			"ENTRY DETAILS  [%s · %s]",
+			s(e.kind, "?"),
+			s(e._project, "?")
+		)
+	end
+	if state.after_win and vim.api.nvim_win_is_valid(state.after_win) then
+		vim.wo[state.after_win].winbar = "MERGED BLOCK — da appends this to manage.registry.json"
+	end
+
+	-- Reset both views to the top
+	for _, w in ipairs({ state.cur_win, state.after_win }) do
+		if w and vim.api.nvim_win_is_valid(w) then
+			vim.api.nvim_win_set_cursor(w, { 1, 0 })
+		end
+	end
+end
+
+--- Scroll BOTH preview windows together (diff-style).
+--- @param delta number  lines to scroll (negative = up)
+local function scroll_previews(delta)
+	local amount = delta * 8
+	for _, w in ipairs({ state.cur_win, state.after_win }) do
+		if w and vim.api.nvim_win_is_valid(w) then
+			local topline = vim.api.nvim_win_call(w, function()
+				return vim.fn.line("w0")
+			end)
+			vim.api.nvim_win_set_cursor(w, { math.max(1, topline + amount), 0 })
+		end
+	end
+end
+
+local function render_list()
+	if not state.list_buf or not vim.api.nvim_buf_is_valid(state.list_buf) then
+		return
+	end
+	local lines = {}
+	local row_of = {} -- display line -> highlight group name
+	for i, e in ipairs(state.items) do
+		local marker = (i == state.idx) and ">" or " "
+		local ts = type(e.ts) == "number" and e.ts or 0
+		local when = os.date("%H:%M:%S", math.floor(ts / 1000))
+		local info = state.row_info[i] or {}
+		lines[i] = string.format(
+			"%s %s  %-9s [%-8s] %-32s %s",
+			marker,
+			when,
+			info.tag or "?",
+			s(e._project, "?"),
+			s(e._rel, "?"),
+			s(e.rationale, ""):sub(1, 26)
+		)
+		row_of[i] = info.hl or "ManageRegShared"
+	end
+	if vim.bo[state.list_buf].modifiable == false then
+		vim.bo[state.list_buf].modifiable = true
+	end
+	vim.api.nvim_buf_set_lines(state.list_buf, 0, -1, false, lines)
+	vim.bo[state.list_buf].modifiable = false
+
+	local ns = vim.api.nvim_create_namespace("manage-reg-rows")
+	vim.api.nvim_buf_clear_namespace(state.list_buf, ns, 0, -1)
+	for ln, hl in pairs(row_of) do
+		vim.api.nvim_buf_add_highlight(state.list_buf, ns, hl, ln - 1, 2, -1)
+	end
+
+	if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
+		pcall(vim.api.nvim_win_set_cursor, state.list_win, { state.idx, 0 })
+	end
+end
+
+local function move(delta)
+	local n = #state.items
+	if n == 0 then
+		return
+	end
+	state.idx = math.max(1, math.min(n, state.idx + delta))
+	render_list()
+	render_previews()
+end
+
+local function merge_current()
+	local e = state.items[state.idx]
+	if not e then
+		return
+	end
+	if (e.status or "pending") ~= "pending" then
+		vim.notify("ℹ️ Already " .. s(e.status), vim.log.levels.INFO)
+		return
+	end
+	local choice = vim.fn.confirm(
+		"Merge into the registry?\n  "
+			.. s(e.kind, "?")
+			.. ": "
+			.. s(e.path or table.concat(e.paths or {}, " + "))
+			.. "\n\nRegistry file gets the entry; summary MD regenerates. (Reversible via journal.)",
+		"&Yes\n&No",
+		1
+	)
+	if choice == 1 then
+		registry.accept(e)
+	end
+	refresh_items()
+end
+
+local function reject_current()
+	local e = state.items[state.idx]
+	if not e then
+		return
+	end
+	registry.reject(e)
+	refresh_items()
+end
+
+local function open_registry()
+	local e = state.items[state.idx]
+	if not e or not e._file then
+		return
+	end
+	local target = vim.fn.fnamemodify(e._file, ":h") .. "/manage.registry.json"
+	local origin = state.origin_win
+	if origin and vim.api.nvim_win_is_valid(origin) then
+		vim.api.nvim_set_current_win(origin)
+		vim.cmd("edit " .. vim.fn.fnameescape(target))
+		vim.notify("📍 Opened " .. target, vim.log.levels.INFO)
+	end
+end
+
+local function refresh_items()
+	local items = registry.list_visible()
+	state.items = items
+	compute_row_info()
+	if #items == 0 then
+		vim.notify("No registry entries — queue is empty (.opencode/manage.registry.pending.jsonl)", vim.log.levels.INFO)
+		kill_viewer()
+		return
+	end
+	state.idx = math.max(1, math.min(state.idx, #items))
+	render_list()
+	render_previews()
+end
+
+local function kill_viewer()
+	for _, b in ipairs({ state.list_buf, state.cur_buf, state.after_buf, state.origin_buf }) do
+		if b and vim.api.nvim_buf_is_valid(b) then
+			pcall(vim.keymap.del, "n", "Q", { buffer = b })
+		end
+	end
+	if state.autocmd then
+		pcall(vim.api.nvim_del_autocmd, state.autocmd)
+		state.autocmd = nil
+	end
+	local seen = {}
+	for _, w in ipairs({ state.list_win, state.cur_win, state.after_win, state.outer_win }) do
+		if w and not seen[w] then
+			seen[w] = true
+			if vim.api.nvim_win_is_valid(w) then
+				vim.api.nvim_win_close(w, true)
+			end
+		end
+	end
+	state.items = {}
+	state.row_info = {}
+	state.list_buf = nil
+	state.cur_buf = nil
+	state.after_buf = nil
+	state.list_win = nil
+	state.cur_win = nil
+	state.after_win = nil
+	state.outer_win = nil
+	state.origin_win = nil
+	state.origin_buf = nil
+	vim.notify("🗑️ Registry viewer closed", vim.log.levels.INFO)
+end
+
+local function set_q_kill(buf)
+	vim.keymap.set("n", "Q", kill_viewer, { buffer = buf, nowait = true, noremap = true, silent = true })
+end
+
+local function make_window(buf, split, ref_win)
+	local opts = {
+		relative = "",
+		split = split,
+	}
+	if ref_win then
+		opts.win = ref_win
+	end
+	return vim.api.nvim_open_win(buf, false, opts)
+end
+
+function M.open()
+	local items = registry.list_visible()
+	if #items == 0 then
+		vim.notify("No registry entries — queue is empty (.opencode/manage.registry.pending.jsonl)", vim.log.levels.INFO)
+		return
+	end
+	-- Re-entry guard: replace an existing viewer instead of stacking
+	if state.outer_win and vim.api.nvim_win_is_valid(state.outer_win) then
+		kill_viewer()
+	end
+	define_hls()
+	state.items = items
+	compute_row_info()
+	state.idx = 1
+	state.origin_win = vim.api.nvim_get_current_win()
+	state.origin_buf = vim.api.nvim_get_current_buf()
+
+	-- List buffer: new column to the RIGHT of the origin buffer
+	state.list_buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[state.list_buf].bufhidden = "wipe"
+	vim.bo[state.list_buf].filetype = "managelist"
+	state.outer_win = make_window(state.list_buf, "right")
+	state.list_win = state.outer_win
+	set_legend()
+
+	-- DETAILS preview: below the list (left side of the lower pair)
+	state.cur_buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[state.cur_buf].bufhidden = "wipe"
+	vim.bo[state.cur_buf].modifiable = false
+	state.cur_win = make_window(state.cur_buf, "below", state.list_win)
+
+	-- MERGED BLOCK preview: to the RIGHT of DETAILS (side by side)
+	state.after_buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[state.after_buf].bufhidden = "wipe"
+	vim.bo[state.after_buf].modifiable = false
+	state.after_win = make_window(state.after_buf, "right", state.cur_win)
+
+	vim.api.nvim_set_current_win(state.list_win)
+
+	set_q_kill(state.list_buf)
+	set_q_kill(state.cur_buf)
+	set_q_kill(state.after_buf)
+	set_q_kill(state.origin_buf)
+
+	state.autocmd = vim.api.nvim_create_autocmd("WinEnter", {
+		callback = function()
+			local cur = vim.api.nvim_get_current_win()
+			if
+				state.list_win
+				and vim.api.nvim_win_is_valid(state.list_win)
+				and (cur == state.cur_win or cur == state.after_win or cur == state.list_win)
+			then
+				vim.api.nvim_set_current_win(state.list_win)
+			end
+		end,
+	})
+
+	local opts = { buffer = state.list_buf, nowait = true, noremap = true, silent = true }
+	vim.keymap.set("n", "j", function()
+		move(1)
+	end, opts)
+	vim.keymap.set("n", "k", function()
+		move(-1)
+	end, opts)
+	vim.keymap.set("n", "<C-n>", function()
+		move(1)
+	end, opts)
+	vim.keymap.set("n", "<C-p>", function()
+		move(-1)
+	end, opts)
+	vim.keymap.set("n", "gg", function()
+		state.idx = 1
+		render_list()
+		render_previews()
+	end, opts)
+	vim.keymap.set("n", "G", function()
+		state.idx = #state.items
+		render_list()
+		render_previews()
+	end, opts)
+	vim.keymap.set("n", "]", function()
+		scroll_previews(1)
+	end, opts)
+	vim.keymap.set("n", "[", function()
+		scroll_previews(-1)
+	end, opts)
+	vim.keymap.set("n", "da", merge_current, opts)
+	vim.keymap.set("n", "dr", reject_current, opts)
+	vim.keymap.set("n", "r", refresh_items, opts)
+	vim.keymap.set("n", "o", open_registry, opts)
+
+	render_list()
+	render_previews()
+end
+
+return M

@@ -1,122 +1,79 @@
--- /home/jmeyer/.config/nvim/lua/opencode-ext/viewer.lua FINAL
--- One-keybind, full-chat buffer.  No scratchbuf, no 3-hop navigation.
---
--- Flow:
---   <leader>ae  → opens latest conversation from latest CWD session directly
---   <leader>am  → same for main session
---   In buffer:  [] cycle blocks, <A-[> <A-]> cycle conversations
---               c copy block, C copy+navigate, m copy markdown, M md+navigate,
---               Y yank all, r refresh, ? help, q close, s picker
-
+-- /home/jmeyer/.config/nvim/lua/opencode-ext/viewer.lua FINAL-10
 local db = require("opencode-ext.db")
 local model = require("opencode-ext.model")
-
 local M = {}
 
--- Valid file extensions for path detection
-local VALID_EXTS = {
-	go = true,
-	templ = true,
-	js = true,
-	ts = true,
-	jsx = true,
-	tsx = true,
-	sql = true,
-	py = true,
-	rb = true,
-	rs = true,
-	lua = true,
-	md = true,
-	yaml = true,
-	yml = true,
-	json = true,
-	xml = true,
-	css = true,
-	scss = true,
-	html = true,
-	htm = true,
-	sh = true,
-	bash = true,
-	zsh = true,
-	toml = true,
-	cfg = true,
-	conf = true,
-	env = true,
-	gitignore = true,
-	dockerfile = true,
-	mjs = true,
-	cjs = true,
-	mts = true,
-	cts = true,
-	dart = true,
-	kt = true,
-	swift = true,
-	c = true,
-	cpp = true,
-	h = true,
-	hpp = true,
-}
+local viewer_win = nil
 
--- Extract a file path with optional line number from a comment-styled line.
--- Handles: // path, # path, -- path, ; path
--- Also: // path:42 for line-number
-local function extract_path_from_line(line)
-	local trimmed = vim.trim(line)
-	local path, lineno = trimmed:match("^//%s*([%w_%-/%.~]+%.[%w_]+):?(%d*)")
-		or trimmed:match("^#%s*([%w_%-/%.~]+%.[%w_]+):?(%d*)")
-		or trimmed:match("^%-%-%s*([%w_%-/%.~]+%.[%w_]+):?(%d*)")
-		or trimmed:match("^;%s*([%w_%-/%.~]+%.[%w_]+):?(%d*)")
-	if not path then
-		return nil, nil
+-- Last-session-per-CWD store. Persists to disk across nvim restarts.
+local LAST_SESSION_FILE = vim.fn.stdpath("config") .. "/.opencode-last-session.json"
+
+local function load_last_sessions()
+	local f = io.open(LAST_SESSION_FILE, "r")
+	if not f then
+		return {}
 	end
-	lineno = tonumber(lineno) or nil
-	return path, lineno
+	local raw = f:read("*a")
+	f:close()
+	if not raw or raw == "" then
+		return {}
+	end
+	local ok, data = pcall(vim.fn.json_decode, raw)
+	return ok and data or {}
 end
 
--- Find all code/markdown blocks using depth-aware fence matching.
--- Tracks nested fences via a stack so ```md containers with embedded
--- ```go blocks are parsed correctly — the outer close is the one that
--- matches the outer opener, not the first bare ``` encountered.
--- Returns: { lang, start_line, end_line, lines }[]
---   Inner blocks appear first, outer containers last.
+local function save_last_session(cwd, session_id)
+	local sessions = load_last_sessions()
+	sessions[cwd] = session_id
+	local f = io.open(LAST_SESSION_FILE, "w")
+	if f then
+		f:write(vim.fn.json_encode(sessions))
+		f:close()
+	end
+	vim.notify("[ae] SAVE last-session: cwd=" .. cwd .. " sid=" .. session_id, vim.log.levels.INFO)
+end
+
+local function get_last_session(cwd)
+	local sessions = load_last_sessions()
+	local sid = sessions[cwd]
+	vim.notify("[ae] LOOKUP last-session: cwd=" .. cwd .. " found=" .. (sid or "nil"), vim.log.levels.INFO)
+	return sid
+end
+
+local function extract_path_from_line(line)
+	local t = vim.trim(line)
+	local p, n = t:match("^//%s*([%w_%-/%.~]+%.[%w_]+):?(%d*)")
+		or t:match("^#%s*([%w_%-/%.~]+%.[%w_]+):?(%d*)")
+		or t:match("^%-%-%s*([%w_%-/%.~]+%.[%w_]+):?(%d*)")
+		or t:match("^;%s*([%w_%-/%.~]+%.[%w_]+):?(%d*)")
+	return p and p or nil, tonumber(n)
+end
+
 local function find_code_blocks(lines)
-	local blocks = {}
-	local stack = {} -- { lang, start_line, lines }
-
+	local blocks, stack = {}, {}
 	for i = 1, #lines do
-		local open_match = lines[i]:match("^```(.+)")
-		local is_bare = lines[i]:match("^```%s*$")
-
-		if open_match then
-			-- Opening fence with language tag (```go, ```md, ```py, etc.)
-			table.insert(stack, {
-				lang = vim.trim(open_match),
-				start_line = i,
-				lines = {},
-			})
-		elseif is_bare and #stack > 0 then
-			-- Closing fence: pop innermost open block
-			local block = table.remove(stack)
-			block.end_line = i
-			table.insert(blocks, block)
+		local m = lines[i]:match("^```(.+)")
+		if m then
+			table.insert(stack, { lang = vim.trim(m), start_line = i, lines = {} })
+		elseif lines[i]:match("^```%s*$") and #stack > 0 then
+			local b = table.remove(stack)
+			b.end_line = i
+			table.insert(blocks, b)
 		else
-			-- Regular content line: add to all currently open blocks
 			for _, b in ipairs(stack) do
 				table.insert(b.lines, lines[i])
 			end
 		end
 	end
-
 	return blocks
 end
 
---- Ensure every element is a true single line (no embedded \n).
 local function sanitize_lines(arr)
 	local out = {}
 	for _, s in ipairs(arr or {}) do
 		if type(s) == "string" and s:find("\n") then
-			for _, part in ipairs(vim.split(s, "\n", { plain = true })) do
-				table.insert(out, part)
+			for _, p in ipairs(vim.split(s, "\n", { plain = true })) do
+				table.insert(out, p)
 			end
 		else
 			table.insert(out, s or "")
@@ -125,233 +82,98 @@ local function sanitize_lines(arr)
 	return out
 end
 
--- Render conversation content (no title — that's in the winbar).
--- Returns: { content_lines, blocks, block_positions }
---   content_lines[1..n]  — flat array with sections and fences intact
---   blocks[1..m]         — { lang, start_line, end_line, lines }
---   block_positions[l]   — block index for line l, or nil
---   Block positions: inner blocks (inserted first) override outer containers,
---   so `c` on a line inside a nested ```go copies only that block's lines.
 local function render_content(conv)
-	local lines = {}
-	local blocks = {}
-	local block_positions = {}
-
+	local lines, blocks, bp = {}, {}, {}
 	if conv.user_lines then
 		for _, l in ipairs(sanitize_lines(conv.user_lines)) do
 			table.insert(lines, l)
 		end
 	end
-
 	for _, asst in ipairs(conv.asst_sections or {}) do
 		local src = sanitize_lines(asst.all_lines or asst.text_lines)
-		if not src or #src == 0 then
-			goto next_asst
+		if src and #src > 0 then
+			table.insert(
+				lines,
+				(
+					(asst.label or ""):sub(1, 60) ~= "" and "─── " .. asst.label .. " ───"
+					or "─── Assistant ───"
+				)
+			)
+			local bf = #lines + 1
+			for _, l in ipairs(src) do
+				table.insert(lines, l)
+			end
+			for _, blk in ipairs(find_code_blocks(src)) do
+				blk.start_line = blk.start_line + bf - 1
+				blk.end_line = blk.end_line + bf - 1
+				table.insert(blocks, blk)
+			end
 		end
-		local asst_label = (asst.label or ""):sub(1, 60)
-		if asst_label ~= "" then
-			table.insert(lines, "─── " .. asst_label .. " ───")
-		else
-			table.insert(lines, "─── Assistant ───")
-		end
-		local before = #lines + 1
-		for _, l in ipairs(src) do
-			table.insert(lines, l)
-		end
-		local section_blocks = find_code_blocks(src)
-		for _, block in ipairs(section_blocks) do
-			block.start_line = block.start_line + before - 1
-			block.end_line = block.end_line + before - 1
-			table.insert(blocks, block)
-		end
-		::next_asst::
 	end
-
-	-- Reverse iteration: inner blocks (first in list) win over outer containers
 	for bi = #blocks, 1, -1 do
-		local block = blocks[bi]
-		for l = block.start_line, block.end_line do
-			block_positions[l] = bi
+		for l = blocks[bi].start_line, blocks[bi].end_line do
+			bp[l] = bi
 		end
 	end
-
-	return lines, blocks, block_positions
+	return lines, blocks, bp
 end
 
--- One-line title for the winbar (first user message, decorated).
-local function get_title_line(conv)
-	local conv_label = (conv.label or ""):sub(1, 70)
-	if conv_label ~= "" then
-		return "─── " .. conv_label .. " ───"
-	else
-		return "─── User ───"
+local function navigate_block(dir, lnum, blocks, bp)
+	local bi = bp[lnum]
+	local t = dir == "next" and (bi and bi + 1 or 1) or (bi and bi - 1 or #blocks)
+	if t >= 1 and t <= #blocks then
+		vim.api.nvim_win_set_cursor(0, { blocks[t].start_line, 0 })
 	end
 end
 
--- Find the block under the cursor (uses block_positions, so returns
--- the innermost block at that line).
-local function find_block_at_line(lnum, block_positions, blocks)
-	local bi = block_positions[lnum]
-	if bi then
-		return blocks[bi], bi
+local function nav_path(rp, ln, pp, vb)
+	if not rp then
+		return
 	end
-	return nil, nil
-end
-
---- Find the outermost ```md container block containing the given line.
---- Returns nil if the cursor is not inside a markdown block.
-local function find_md_container(lnum, blocks)
-	local result = nil
-	for _, block in ipairs(blocks) do
-		if vim.trim(block.lang):sub(1, 2) == "md" and lnum >= block.start_line and lnum <= block.end_line then
-			result = block
-		end
-	end
-	return result
-end
-
--- Navigate to the next or previous code block.
-local function navigate_block(direction, lnum, blocks, block_positions)
-	local current_bi = block_positions[lnum]
-	local target_bi
-	if direction == "next" then
-		target_bi = current_bi and (current_bi + 1) or 1
-		if target_bi > #blocks then
-			return
-		end
-	else
-		target_bi = current_bi and (current_bi - 1) or #blocks
-		if target_bi < 1 then
-			return
-		end
-	end
-	local target = blocks[target_bi]
-	vim.api.nvim_win_set_cursor(0, { target.start_line, 0 })
-end
-
---- Navigate to a resolved file path in a non-viewer window.
---- Handles absolute/relative resolution, basename fallback search,
---- file-not-found prompts, and window management (reuse existing split
---- or create new vsplit). Returns true if navigation was attempted.
-local function navigate_to_path(raw_path, lineno, project_path, viewer_buf)
-	if not raw_path then
-		return false
-	end
-
-	-- Resolve to absolute
-	local resolved
-	if raw_path:sub(1, 1) == "/" then
-		resolved = raw_path
-	else
-		resolved = vim.fn.resolve(project_path .. "/" .. raw_path)
-	end
-
-	-- Find target window (not the viewer)
-	local target_win = nil
+	local res = rp:sub(1, 1) == "/" and rp or vim.fn.resolve(pp .. "/" .. rp)
+	local tw = nil
 	for _, w in ipairs(vim.api.nvim_list_wins()) do
-		local wbuf = vim.api.nvim_win_get_buf(w)
-		if wbuf ~= viewer_buf and vim.api.nvim_buf_is_valid(wbuf) then
-			target_win = w
+		if vim.api.nvim_win_get_buf(w) ~= vb and vim.api.nvim_buf_is_valid(vim.api.nvim_win_get_buf(w)) then
+			tw = w
 			break
 		end
 	end
-	if not target_win then
-		vim.notify("No other window — vsplitting", vim.log.levels.INFO)
+	if not tw then
 		vim.cmd("vsplit")
 		for _, w in ipairs(vim.api.nvim_list_wins()) do
-			local wbuf = vim.api.nvim_win_get_buf(w)
-			if wbuf ~= viewer_buf then
-				target_win = w
+			if vim.api.nvim_win_get_buf(w) ~= vb then
+				tw = w
 				break
 			end
 		end
-		if not target_win then
-			vim.notify("Failed to create split", vim.log.levels.ERROR)
-			return true
+	end
+	if not tw then
+		return
+	end
+	if vim.fn.filereadable(res) ~= 1 then
+		if vim.fn.confirm("Create file?\n  " .. res, "&Yes\n&No", 1) ~= 1 then
+			return
+		end
+		local ph = vim.fn.fnamemodify(res, ":h")
+		if vim.fn.isdirectory(ph) == 0 then
+			vim.fn.mkdir(ph, "p")
 		end
 	end
-
-	-- Navigate with file-not-found fallback
-	local open_path = resolved
-	if vim.fn.filereadable(resolved) ~= 1 then
-		local basename = vim.fn.fnamemodify(resolved, ":t")
-		local resolved_dir = vim.fn.fnamemodify(resolved, ":h")
-		local search_dirs = { resolved_dir }
-		local up = resolved_dir
-		for _ = 1, 4 do
-			local parent = vim.fn.fnamemodify(up, ":h")
-			if parent == up then
-				break
-			end
-			table.insert(search_dirs, parent)
-		end
-		local found = ""
-		for _, d in ipairs(search_dirs) do
-			local m = vim.fn.findfile(d .. "/" .. basename)
-			if m ~= "" then
-				for _, candidate in ipairs(vim.split(m, "\n")) do
-					local full = vim.fn.resolve(candidate)
-					if vim.fn.filereadable(full) == 1 then
-						found = full
-						break
-					end
-				end
-			end
-			if found ~= "" then
-				break
-			end
-		end
-		if found ~= "" then
-			local choice = vim.fn.confirm(
-				"Not found at:\n  " .. resolved .. "\n\nOpen instead:\n  " .. found .. "?",
-				"&Yes\n&No",
-				1
-			)
-			if choice == 1 then
-				open_path = found
-			else
-				return true
-			end
-		else
-			local create = vim.fn.confirm("Create file?\n  " .. resolved, "&Yes\n&No", 1)
-			if create ~= 1 then
-				return true
-			end
-			local parent = vim.fn.fnamemodify(resolved, ":h")
-			if vim.fn.isdirectory(parent) == 0 then
-				vim.fn.mkdir(parent, "p")
-			end
-		end
+	local vw = vim.api.nvim_get_current_win()
+	vim.api.nvim_set_current_win(tw)
+	vim.cmd("edit " .. vim.fn.fnameescape(res))
+	if ln then
+		vim.api.nvim_win_set_cursor(tw, { ln, 0 })
 	end
-
-	local viewer_win = vim.api.nvim_get_current_win()
-	vim.api.nvim_set_current_win(target_win)
-	vim.cmd("edit " .. vim.fn.fnameescape(open_path))
-	if lineno then
-		vim.api.nvim_win_set_cursor(target_win, { lineno, 0 })
-	end
-	vim.api.nvim_set_current_win(viewer_win)
-	return true
+	vim.api.nvim_set_current_win(vw)
 end
 
---- Extract a function name from a single line of code, based on its block
---- language tag. Returns the name string, or nil if the line isn't a
---- function/component declaration.
---- @param line string
---- @param lang string
---- @return string|nil
 local function extract_func_name(line, lang)
 	if not line or not lang then
 		return nil
 	end
 	if lang == "go" then
-		-- Method: func (r *Receiver) MethodName(
-		local name = line:match("^%s*func%s+%([^)]*%)%s+(%w+)%s*%(")
-		if name then
-			return name
-		end
-		-- Regular: func FuncName(
-		return line:match("^%s*func%s+(%w+)%s*%(")
+		return line:match("^%s*func%s+%([^)]*%)%s+(%w+)%s*%(") or line:match("^%s*func%s+(%w+)%s*%(")
 	end
 	if lang == "templ" then
 		return line:match("^%s*templ%s+(%w+)%s*%(")
@@ -369,77 +191,47 @@ local function extract_func_name(line, lang)
 		return line:match("^%s*function%s+(%w+)%s*%(")
 	end
 	if lang == "ruby" or lang == "rb" then
-		return line:match("^%s*def%s+(%w+)%s*[%(]")
+		return line:match("^%s*def%s+(%w+)%s[%(]")
 	end
-	return nil
 end
 
---- Navigate to a specific function in the source file. Opens the file,
---- searches for the function declaration with a language-appropriate
---- pattern, and highlights all matches.
---- @param raw_path string  path from block's first line
---- @param func_name string  extracted function name
---- @param project_path string  CWD for relative resolution
---- @param viewer_buf integer  viewer buffer handle
---- @param lang string  block language tag
---- @return boolean  true if navigation was attempted
-local function navigate_to_function(raw_path, func_name, project_path, viewer_buf, lang)
-	if not raw_path or not func_name then
-		return false
+local function nav_func(rp, fn, pp, vb, lang)
+	if not rp or not fn then
+		return
 	end
-
-	-- Resolve to absolute
-	local resolved
-	if raw_path:sub(1, 1) == "/" then
-		resolved = raw_path
-	else
-		resolved = vim.fn.resolve(project_path .. "/" .. raw_path)
-	end
-
-	-- Find target window (not the viewer)
-	local target_win = nil
+	local res = rp:sub(1, 1) == "/" and rp or vim.fn.resolve(pp .. "/" .. rp)
+	local tw = nil
 	for _, w in ipairs(vim.api.nvim_list_wins()) do
-		local wbuf = vim.api.nvim_win_get_buf(w)
-		if wbuf ~= viewer_buf and vim.api.nvim_buf_is_valid(wbuf) then
-			target_win = w
+		if vim.api.nvim_win_get_buf(w) ~= vb and vim.api.nvim_buf_is_valid(vim.api.nvim_win_get_buf(w)) then
+			tw = w
 			break
 		end
 	end
-	if not target_win then
-		vim.notify("No other window — vsplitting", vim.log.levels.INFO)
+	if not tw then
 		vim.cmd("vsplit")
 		for _, w in ipairs(vim.api.nvim_list_wins()) do
-			local wbuf = vim.api.nvim_win_get_buf(w)
-			if wbuf ~= viewer_buf then
-				target_win = w
+			if vim.api.nvim_win_get_buf(w) ~= vb then
+				tw = w
 				break
 			end
 		end
-		if not target_win then
-			vim.notify("Failed to create split", vim.log.levels.ERROR)
-			return true
+	end
+	if not tw then
+		return
+	end
+	if vim.fn.filereadable(res) ~= 1 then
+		if vim.fn.confirm("Create file?\n  " .. res, "&Yes\n&No", 1) ~= 1 then
+			return
+		end
+		local ph = vim.fn.fnamemodify(res, ":h")
+		if vim.fn.isdirectory(ph) == 0 then
+			vim.fn.mkdir(ph, "p")
 		end
 	end
-
-	-- File existence check with create prompt
-	if vim.fn.filereadable(resolved) ~= 1 then
-		local create = vim.fn.confirm("Create file?\n  " .. resolved, "&Yes\n&No", 1)
-		if create ~= 1 then
-			return true
-		end
-		local parent = vim.fn.fnamemodify(resolved, ":h")
-		if vim.fn.isdirectory(parent) == 0 then
-			vim.fn.mkdir(parent, "p")
-		end
-	end
-
-	-- Open file then search for the function declaration
-	local viewer_win = vim.api.nvim_get_current_win()
-	vim.api.nvim_set_current_win(target_win)
-	vim.cmd("edit " .. vim.fn.fnameescape(resolved))
-
-	-- Build language-appropriate declaration search pattern and highlight
-	local decl_keywords = {
+	local vw = vim.api.nvim_get_current_win()
+	vim.api.nvim_set_current_win(tw)
+	vim.cmd("edit " .. vim.fn.fnameescape(res))
+	local kw = {
 		go = "func",
 		templ = "templ",
 		py = "def",
@@ -454,26 +246,15 @@ local function navigate_to_function(raw_path, func_name, project_path, viewer_bu
 		rb = "def",
 		ruby = "def",
 	}
-	local keyword = decl_keywords[lang]
-	local decl_pattern
-	if keyword then
-		decl_pattern = "\\v" .. keyword .. "\\s+" .. vim.pesc(func_name) .. "\\s*\\("
-	else
-		decl_pattern = "\\v" .. vim.pesc(func_name) .. "\\s*\\("
-	end
-
-	vim.fn.setreg("/", decl_pattern)
+	local pat = kw[lang] and ("\\v" .. kw[lang] .. "\\s+" .. vim.pesc(fn) .. "\\s*\\(")
+		or "\\v" .. vim.pesc(fn) .. "\\s*\\("
+	vim.fn.setreg("/", pat)
 	vim.opt.hlsearch = true
-	vim.fn.search(decl_pattern, "w")
-
-	vim.api.nvim_set_current_win(viewer_win)
-	return true
+	vim.fn.search(pat, "w")
+	vim.api.nvim_set_current_win(vw)
 end
 
---- Help float ----------------------------------------------------------------
-
 local help_win = nil
-
 local HELP_LINES = {
 	"── Keymaps ────────────────────────────────────────────────",
 	"",
@@ -482,10 +263,10 @@ local HELP_LINES = {
 	"<A-[>           previous conversation",
 	"<A-]>           next conversation",
 	"c               copy code block",
-	"C               copy + navigate (to func decl if cursor on one)",
+	"C               copy + navigate",
 	"m               copy markdown file",
-	"M               copy markdown + navigate to file",
-	"r               refresh (re-read session)",
+	"M               copy markdown + navigate",
+	"r               refresh",
 	"Y               yank all conversation text",
 	"?               toggle this help",
 	"s               open session picker",
@@ -493,44 +274,34 @@ local HELP_LINES = {
 	"",
 	"Press ? or q to close",
 }
-
 local function close_help()
 	if help_win and vim.api.nvim_win_is_valid(help_win) then
 		vim.api.nvim_win_close(help_win, true)
 		help_win = nil
 	end
 end
-
 local function open_help()
 	close_help()
-
-	local buf = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, HELP_LINES)
-	vim.bo[buf].modifiable = false
-	vim.bo[buf].bufhidden = "wipe"
-
-	local width = 52
-	local height = #HELP_LINES
+	local b = vim.api.nvim_create_buf(false, true)
+	vim.api.nvim_buf_set_lines(b, 0, -1, false, HELP_LINES)
+	vim.bo[b].modifiable = false
+	vim.bo[b].bufhidden = "wipe"
+	local w, h = 52, #HELP_LINES
 	local ui = vim.api.nvim_list_uis()[1]
-	local row = math.floor((ui.height - height) / 2)
-	local col = math.floor((ui.width - width) / 2)
-
-	help_win = vim.api.nvim_open_win(buf, true, {
+	help_win = vim.api.nvim_open_win(b, true, {
 		relative = "editor",
-		width = width,
-		height = height,
-		row = row,
-		col = col,
+		width = w,
+		height = h,
+		row = math.floor((ui.height - h) / 2),
+		col = math.floor((ui.width - w) / 2),
 		style = "minimal",
 		border = "rounded",
 	})
-
-	local opts = { buffer = buf, nowait = true, noremap = true, silent = true }
-	vim.keymap.set("n", "q", close_help, opts)
-	vim.keymap.set("n", "?", close_help, opts)
-	vim.keymap.set("n", "<Esc>", close_help, opts)
+	local o = { buffer = b, nowait = true, noremap = true, silent = true }
+	vim.keymap.set("n", "q", close_help, o)
+	vim.keymap.set("n", "?", close_help, o)
+	vim.keymap.set("n", "<Esc>", close_help, o)
 end
-
 local function toggle_help()
 	if help_win and vim.api.nvim_win_is_valid(help_win) then
 		close_help()
@@ -539,320 +310,490 @@ local function toggle_help()
 	end
 end
 
---- Main viewer ---------------------------------------------------------------
-
--- Open a full-chat buffer with title in winbar, hints in statusline, ? for full legend.
--- raw is the DB fetch result used to build convs — needed for `r` refresh keymap.
 local function open_chat_buffer(conv, project_path, all_convs, conv_idx, raw)
 	if not conv then
 		return
 	end
-
-	local content_lines, blocks, block_positions = render_content(conv)
-	if #content_lines == 0 then
+	if viewer_win and vim.api.nvim_win_is_valid(viewer_win) then
+		vim.api.nvim_win_close(viewer_win, true)
+		viewer_win = nil
+	end
+	local cl, blocks, bp = render_content(conv)
+	if #cl == 0 then
 		vim.notify("No content in this conversation", vim.log.levels.WARN)
 		return
 	end
-
-	local buf = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, content_lines)
-	vim.bo[buf].buftype = "nofile"
-	vim.bo[buf].bufhidden = "wipe"
-	vim.bo[buf].swapfile = false
-	vim.bo[buf].modifiable = false
-	vim.bo[buf].filetype = "markdown"
-
+	local b = vim.api.nvim_create_buf(false, true)
+	vim.api.nvim_buf_set_lines(b, 0, -1, false, cl)
+	vim.bo[b].buftype = "nofile"
+	vim.bo[b].bufhidden = "wipe"
+	vim.bo[b].swapfile = false
+	vim.bo[b].modifiable = false
+	vim.bo[b].filetype = "markdown"
 	vim.cmd("vsplit")
-	local win = vim.api.nvim_get_current_win()
-	vim.api.nvim_win_set_buf(win, buf)
+	local w = vim.api.nvim_get_current_win()
+	vim.api.nvim_win_set_buf(w, b)
 	vim.cmd("stopinsert")
-
-	-- Sticky title bar at top of the window
-	local title = get_title_line(conv):gsub("%%", "%%%%")
-	vim.wo[win].winbar = title
-
-	-- Minimal statusline with most-used keymaps
-	vim.wo[win].statusline = "c copy C nav m md M md+nav [ ] <A-[> <A-]> conv ? help"
-
-	local km_opts = { buffer = buf, nowait = true, noremap = true }
-
-	-- Close the vsplit window (restores original layout)
-	local function close_view()
+	viewer_win = w
+	local label = (conv.label or ""):sub(1, 70)
+	vim.wo[w].winbar = (label ~= "" and "─── " .. label .. " ───" or "─── User ───"):gsub(
+		"%%",
+		"%%%%"
+	)
+	vim.wo[w].statusline = "c copy C nav m md M md+nav [ ] <A-[> <A-]> conv ? help"
+	local km = { buffer = b, nowait = true, noremap = true }
+	local function cv()
 		close_help()
-		if vim.api.nvim_win_is_valid(win) then
-			vim.api.nvim_win_close(win, true)
+		viewer_win = nil
+		if vim.api.nvim_win_is_valid(w) then
+			vim.api.nvim_win_close(w, true)
 		end
 	end
-
-	-- Block navigation
 	vim.keymap.set("n", "]", function()
-		navigate_block("next", vim.fn.line("."), blocks, block_positions)
-	end, km_opts)
-
+		navigate_block("next", vim.fn.line("."), blocks, bp)
+	end, km)
 	vim.keymap.set("n", "[", function()
-		navigate_block("prev", vim.fn.line("."), blocks, block_positions)
-	end, km_opts)
-
-	-- Conversation navigation
+		navigate_block("prev", vim.fn.line("."), blocks, bp)
+	end, km)
 	if all_convs then
 		vim.keymap.set("n", "<A-[>", function()
 			if conv_idx > 1 then
-				close_view()
+				cv()
 				open_chat_buffer(all_convs[conv_idx - 1], project_path, all_convs, conv_idx - 1, nil)
 			end
-		end, km_opts)
-
+		end, km)
 		vim.keymap.set("n", "<A-]>", function()
 			if conv_idx < #all_convs then
-				close_view()
+				cv()
 				open_chat_buffer(all_convs[conv_idx + 1], project_path, all_convs, conv_idx + 1, nil)
 			end
-		end, km_opts)
+		end, km)
 	end
-
-	-- Copy code block under cursor
 	vim.keymap.set("n", "c", function()
-		local block, bi = find_block_at_line(vim.fn.line("."), block_positions, blocks)
-		if not block then
+		local blk = bp[vim.fn.line(".")]
+		blk = blk and blocks[blk] or nil
+		if not blk then
 			vim.notify("Not inside a code block", vim.log.levels.WARN)
 			return
 		end
-		local text = table.concat(block.lines, "\n")
-		vim.fn.setreg("+", text)
-		vim.fn.setreg('"', text)
-		vim.notify(string.format("Copied block %d (%d chars)", bi, #text), vim.log.levels.INFO)
-	end, km_opts)
-
-	-- Copy code block + navigate to file (or to function if on a decl line)
+		local t = table.concat(blk.lines, "\n")
+		vim.fn.setreg("+", t)
+		vim.fn.setreg('"', t)
+		vim.notify(string.format("Copied block %d chars", #t), vim.log.levels.INFO)
+	end, km)
 	vim.keymap.set("n", "C", function()
-		local block, bi = find_block_at_line(vim.fn.line("."), block_positions, blocks)
-		if not block then
+		local blk = bp[vim.fn.line(".")]
+		blk = blk and blocks[blk] or nil
+		if not blk then
 			vim.notify("Not inside a code block", vim.log.levels.WARN)
 			return
 		end
-
-		-- 1. Copy
-		local text = table.concat(block.lines, "\n")
-		vim.fn.setreg("+", text)
-		vim.fn.setreg('"', text)
-		vim.notify(string.format("Copied block %d (%d chars)", bi, #text), vim.log.levels.INFO)
-
-		-- 2. Extract path
-		local raw_path, lineno = extract_path_from_line(block.lines[1] or "")
-		if not raw_path then
+		local t = table.concat(blk.lines, "\n")
+		vim.fn.setreg("+", t)
+		vim.fn.setreg('"', t)
+		vim.notify(string.format("Copied block %d chars", #t), vim.log.levels.INFO)
+		local rp, ln = extract_path_from_line(blk.lines[1] or "")
+		if not rp then
 			vim.notify("No file path in this block", vim.log.levels.WARN)
 			return
 		end
-
-		-- 3. Check if cursor is on a function declaration — if so, navigate
-		--    to that specific function instead of the file root + highlight it
-		local cursor_line = vim.fn.getline(".")
-		local lang = vim.trim(block.lang)
-		local func_name = extract_func_name(cursor_line, lang)
-
-		if func_name then
-			navigate_to_function(raw_path, func_name, project_path, buf, lang)
+		local fn = extract_func_name(vim.fn.getline("."), vim.trim(blk.lang))
+		if fn then
+			nav_func(rp, fn, project_path, b, vim.trim(blk.lang))
 		else
-			navigate_to_path(raw_path, lineno, project_path, buf)
+			nav_path(rp, ln, project_path, b)
 		end
-	end, km_opts)
-
-	-- Copy markdown file content
+	end, km)
+	local function fm(lnum)
+		for _, blk in ipairs(blocks) do
+			if vim.trim(blk.lang):sub(1, 2) == "md" and lnum >= blk.start_line and lnum <= blk.end_line then
+				return blk
+			end
+		end
+	end
 	vim.keymap.set("n", "m", function()
-		local lnum = vim.fn.line(".")
-		local md_block = find_md_container(lnum, blocks)
-		if not md_block then
+		local md = fm(vim.fn.line("."))
+		if not md then
 			vim.notify("Not inside a markdown block", vim.log.levels.WARN)
 			return
 		end
-		-- Skip first line (path comment like # path/to/file.md FINAL)
-		local content = {}
-		for i = 2, #md_block.lines do
-			table.insert(content, md_block.lines[i])
+		local c = {}
+		for i = 2, #md.lines do
+			table.insert(c, md.lines[i])
 		end
-		local text = table.concat(content, "\n")
-		vim.fn.setreg("+", text)
-		vim.fn.setreg('"', text)
-		vim.notify(string.format("Copied markdown file (%d chars)", #text), vim.log.levels.INFO)
-	end, km_opts)
-
-	-- Copy markdown file content + navigate to file
+		local t = table.concat(c, "\n")
+		vim.fn.setreg("+", t)
+		vim.fn.setreg('"', t)
+		vim.notify(string.format("Copied markdown file (%d chars)", #t), vim.log.levels.INFO)
+	end, km)
 	vim.keymap.set("n", "M", function()
-		local lnum = vim.fn.line(".")
-		local md_block = find_md_container(lnum, blocks)
-		if not md_block then
+		local md = fm(vim.fn.line("."))
+		if not md then
 			vim.notify("Not inside a markdown block", vim.log.levels.WARN)
 			return
 		end
-
-		-- 1. Copy (skip path comment line)
-		local content = {}
-		for i = 2, #md_block.lines do
-			table.insert(content, md_block.lines[i])
+		local c = {}
+		for i = 2, #md.lines do
+			table.insert(c, md.lines[i])
 		end
-		local text = table.concat(content, "\n")
-		vim.fn.setreg("+", text)
-		vim.fn.setreg('"', text)
-		vim.notify(string.format("Copied markdown file (%d chars)", #text), vim.log.levels.INFO)
-
-		-- 2. Extract path from first line + navigate
-		local raw_path, lineno = extract_path_from_line(md_block.lines[1] or "")
-		if not raw_path then
+		local t = table.concat(c, "\n")
+		vim.fn.setreg("+", t)
+		vim.fn.setreg('"', t)
+		vim.notify(string.format("Copied markdown file (%d chars)", #t), vim.log.levels.INFO)
+		local rp, ln = extract_path_from_line(md.lines[1] or "")
+		if not rp then
 			vim.notify("No file path in markdown block", vim.log.levels.WARN)
 			return
 		end
-		navigate_to_path(raw_path, lineno, project_path, buf)
-	end, km_opts)
-
-	-- Yank all conversation text
+		nav_path(rp, ln, project_path, b)
+	end, km)
 	vim.keymap.set("n", "Y", function()
-		local all = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-		local text = table.concat(all, "\n")
-		vim.fn.setreg("+", text)
-		vim.fn.setreg('"', text)
-		vim.notify(string.format("Yanked conversation (%d chars)", #text), vim.log.levels.INFO)
-	end, km_opts)
-
-	-- Refresh: re-read session from DB, rebuild, re-open same conv
+		local t = table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
+		vim.fn.setreg("+", t)
+		vim.fn.setreg('"', t)
+		vim.notify(string.format("Yanked conversation (%d chars)", #t), vim.log.levels.INFO)
+	end, km)
 	vim.keymap.set("n", "r", function()
 		if not raw then
 			return
 		end
-		close_view()
-		local fresh = model.build(raw)
-		if #fresh == 0 then
+		cv()
+		local f = model.build(raw)
+		if #f == 0 then
 			vim.notify("No conversations after refresh", vim.log.levels.WARN)
 			return
 		end
-		local idx = math.min(conv_idx, #fresh)
-		open_chat_buffer(fresh[idx], project_path, fresh, idx, raw)
-	end, km_opts)
-
-	-- Toggle help float
-	vim.keymap.set("n", "?", toggle_help, km_opts)
-
-	-- Close viewer
-	vim.keymap.set("n", "q", close_view, km_opts)
-
-	-- Session picker
+		open_chat_buffer(f[math.min(conv_idx, #f)], project_path, f, conv_idx, raw)
+	end, km)
+	vim.keymap.set("n", "?", toggle_help, km)
+	vim.keymap.set("n", "q", cv, km)
 	vim.keymap.set("n", "s", function()
-		close_view()
+		cv()
 		pick_session()
-	end, km_opts)
+	end, km)
 end
 
---- Entry: open latest conversation from latest CWD session -----------
+-- ── Entry points ───────────────────────────────────────────────────────────
 
 function M.toggle()
-	local raw, err = db.fetch_all()
-	if not raw or not raw.sid or raw.sid == vim.NIL then
-		pick_session()
+	local cwd = vim.fn.getcwd()
+	local oscwd = vim.fn.systemlist("tmux display-message -p '#{pane_current_path}' 2>/dev/null") or {}
+	local tmux_dir = vim.trim(oscwd[1] or "not-in-tmux")
+	vim.notify("[ae] TOGGLE nvim_cwd=" .. cwd .. " tmux_pane_dir=" .. tmux_dir, vim.log.levels.INFO)
+
+	-- 1. Check last-picked session for this CWD (highest priority)
+	local last_sid = get_last_session(cwd)
+	if last_sid then
+		local raw = db.fetch_session(last_sid)
+		if raw and raw.sid and raw.sid ~= vim.NIL then
+			local convs = model.build(raw)
+			if #convs > 0 then
+				local project_dir = db.fetch_session_project(last_sid) or "?"
+				vim.notify(
+					"[ae] PICKED last-session: sid="
+						.. last_sid
+						.. " project="
+						.. project_dir
+						.. " label="
+						.. (raw.label or ""),
+					vim.log.levels.INFO
+				)
+				open_chat_buffer(convs[#convs], cwd, convs, #convs, raw)
+				return
+			end
+		end
+		vim.notify("[ae] last-session expired, falling through", vim.log.levels.INFO)
+	end
+
+	-- 2. Gather candidates from all lookup paths, pick newest
+	local candidates = {}
+
+	local exact = db.fetch_by_worktree(cwd)
+	if exact and exact.sid and exact.sid ~= vim.NIL then
+		local p = db.fetch_session_project(exact.sid) or "?"
+		vim.notify(
+			"[ae] CANDIDATE exact-match: sid="
+				.. exact.sid
+				.. " project="
+				.. p
+				.. " time="
+				.. (exact.time_updated or "?")
+				.. " label="
+				.. (exact.label or ""),
+			vim.log.levels.INFO
+		)
+		table.insert(candidates, exact)
+	else
+		vim.notify("[ae] CANDIDATE exact-match: none", vim.log.levels.INFO)
+	end
+
+	local parent = db.fetch_all(cwd)
+	if parent and parent.sid and parent.sid ~= vim.NIL then
+		local dup = false
+		for _, c in ipairs(candidates) do
+			if c.sid == parent.sid then
+				dup = true
+				break
+			end
+		end
+		if not dup then
+			local p = db.fetch_session_project(parent.sid) or "?"
+			vim.notify(
+				"[ae] CANDIDATE parent-walk: sid="
+					.. parent.sid
+					.. " project="
+					.. p
+					.. " time="
+					.. (parent.time_updated or "?")
+					.. " label="
+					.. (parent.label or ""),
+				vim.log.levels.INFO
+			)
+			table.insert(candidates, parent)
+		end
+	else
+		vim.notify("[ae] CANDIDATE parent-walk: none", vim.log.levels.INFO)
+	end
+
+	local global = db.fetch_global_by_directory(cwd)
+	if global and global.sid and global.sid ~= vim.NIL then
+		local dup = false
+		for _, c in ipairs(candidates) do
+			if c.sid == global.sid then
+				dup = true
+				break
+			end
+		end
+		if not dup then
+			local p = db.fetch_session_project(global.sid) or "?"
+			vim.notify(
+				"[ae] CANDIDATE global-dir: sid="
+					.. global.sid
+					.. " project="
+					.. p
+					.. " time="
+					.. (global.time_updated or "?")
+					.. " label="
+					.. (global.label or ""),
+				vim.log.levels.INFO
+			)
+			table.insert(candidates, global)
+		end
+	else
+		vim.notify("[ae] CANDIDATE global-dir: none", vim.log.levels.INFO)
+	end
+
+	if #candidates == 0 then
+		vim.notify("[ae] NO CANDIDATES for cwd=" .. cwd, vim.log.levels.WARN)
+		vim.notify("opencode: no session under " .. cwd, vim.log.levels.WARN)
 		return
 	end
-	local conversations = model.build(raw)
-	if #conversations == 0 then
+
+	table.sort(candidates, function(a, b)
+		return (a.time_updated or 0) > (b.time_updated or 0)
+	end)
+
+	local chosen = candidates[1]
+	local chosen_project = db.fetch_session_project(chosen.sid) or "?"
+	vim.notify(
+		"[ae] CHOSEN sid="
+			.. chosen.sid
+			.. " project="
+			.. chosen_project
+			.. " time="
+			.. (chosen.time_updated or "?")
+			.. " label="
+			.. (chosen.label or ""),
+		vim.log.levels.INFO
+	)
+
+	local convs = model.build(chosen)
+	if #convs == 0 then
 		vim.notify("No messages in this session", vim.log.levels.WARN)
 		return
 	end
-	open_chat_buffer(conversations[#conversations], vim.fn.getcwd(), conversations, #conversations, raw)
+	open_chat_buffer(convs[#convs], cwd, convs, #convs, chosen)
 end
 
 function M.toggle_for_dir(dir)
-	local raw, err = db.fetch_all(dir)
-	if not raw or not raw.sid or raw.sid == vim.NIL then
-		vim.notify(err or "No session for this directory", vim.log.levels.WARN)
+	local candidates = {}
+
+	local exact = db.fetch_by_worktree(dir)
+	if exact and exact.sid and exact.sid ~= vim.NIL then
+		table.insert(candidates, exact)
+	end
+
+	local parent = db.fetch_all(dir)
+	if parent and parent.sid and parent.sid ~= vim.NIL then
+		local dup = false
+		for _, c in ipairs(candidates) do
+			if c.sid == parent.sid then
+				dup = true
+				break
+			end
+		end
+		if not dup then
+			table.insert(candidates, parent)
+		end
+	end
+
+	local global = db.fetch_global_by_directory(dir)
+	if global and global.sid and global.sid ~= vim.NIL then
+		local dup = false
+		for _, c in ipairs(candidates) do
+			if c.sid == global.sid then
+				dup = true
+				break
+			end
+		end
+		if not dup then
+			table.insert(candidates, global)
+		end
+	end
+
+	if #candidates == 0 then
+		vim.notify("No session for this directory", vim.log.levels.WARN)
 		return
 	end
-	local conversations = model.build(raw)
-	if #conversations == 0 then
+
+	table.sort(candidates, function(a, b)
+		return (a.time_updated or 0) > (b.time_updated or 0)
+	end)
+
+	local raw = candidates[1]
+	local convs = model.build(raw)
+	if #convs == 0 then
 		vim.notify("No messages in this session", vim.log.levels.WARN)
 		return
 	end
-	open_chat_buffer(conversations[#conversations], dir, conversations, #conversations, raw)
+	open_chat_buffer(convs[#convs], dir, convs, #convs, raw)
 end
 
---- Session picker (telescope, fallback) --------------------------------
-
--- /home/jmeyer/.config/nvim/lua/opencode-ext/viewer.lua:549 FINAL
-pick_session = function()
-	local sessions, err = db.fetch_sessions()
-	if not sessions then
-		vim.notify(err or "No sessions", vim.log.levels.WARN)
-		return
+function M.open_by_id(sid, display_dir)
+	local raw = db.fetch_session(sid)
+	if not raw or not raw.sid or raw.sid == vim.NIL then
+		vim.notify("opencode: session not found", vim.log.levels.WARN)
+		return false
 	end
-	if #sessions == 0 then
+	local convs = model.build(raw)
+	if #convs == 0 then
+		vim.notify("No messages in this session", vim.log.levels.WARN)
+		return false
+	end
+	open_chat_buffer(convs[#convs], display_dir or vim.fn.getcwd(), convs, #convs, raw)
+	return true
+end
+
+pick_session = function()
+	local sessions = db.fetch_sessions()
+	if not sessions or #sessions == 0 then
 		vim.notify("No opencode sessions found", vim.log.levels.WARN)
 		return
 	end
-
+	vim.notify("[s-picker] opened with " .. #sessions .. " sessions, nvim_cwd=" .. vim.fn.getcwd(), vim.log.levels.INFO)
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
 	local conf = require("telescope.config").values
 	local actions = require("telescope.actions")
-	local action_state = require("telescope.actions.state")
-
-	local function format_time(ts)
+	local state = require("telescope.actions.state")
+	local function ft(ts)
 		if not ts then
 			return "?"
 		end
-		local diff = os.time() - ts
-		if diff < 60 then
+		local d = os.time() - ts
+		if d < 60 then
 			return "now"
-		elseif diff < 3600 then
-			return math.floor(diff / 60) .. "m"
-		elseif diff < 86400 then
-			return math.floor(diff / 3600) .. "h"
-		elseif diff < 604800 then
-			return math.floor(diff / 86400) .. "d"
+		elseif d < 3600 then
+			return math.floor(d / 60) .. "m"
+		elseif d < 86400 then
+			return math.floor(d / 3600) .. "h"
+		elseif d < 604800 then
+			return math.floor(d / 86400) .. "d"
 		end
 		return os.date("%b %d", ts)
 	end
-
-	local function make_entry(s)
-		local title = (s.title or ""):gsub("\n", " "):sub(1, 60)
-		if title == "" then
-			title = "(untitled)"
-		end
-		local proj = s.project or ""
-		local proj_short = ""
-		if proj ~= "" then
-			local p = vim.split(proj, "/")
-			proj_short = #p >= 2 and p[#p - 1] .. "/" .. p[#p] or p[#p]
-		end
-		return {
-			value = s,
-			display = string.format(
-				"%-60s %-28s %6s  %d msgs",
-				title,
-				proj_short,
-				format_time(s.time_updated),
-				s.msg_count or 0
-			),
-			ordinal = title .. " " .. proj,
-		}
-	end
-
 	pickers
 		.new({}, {
-			prompt_title = "Opencode Sessions",
-			finder = finders.new_table({ results = sessions, entry_maker = make_entry }),
+			prompt_title = "Opencode Sessions  (R=reassign)",
+			finder = finders.new_table({
+				results = sessions,
+				entry_maker = function(s)
+					local t = (s.title or ""):gsub("\n", " "):sub(1, 60)
+					if t == "" then
+						t = "(untitled)"
+					end
+					local p = s.project or ""
+					local ps = ""
+					if p ~= "" then
+						local sp = vim.split(p, "/")
+						ps = #sp >= 2 and sp[#sp - 1] .. "/" .. sp[#sp] or sp[#sp]
+					end
+					local preview_raw = s.preview
+					if preview_raw == vim.NIL then
+						preview_raw = nil
+					end
+					local preview = (preview_raw or ""):gsub("\n", " "):sub(1, 80)
+					return {
+						value = s,
+						display = string.format(
+							"%-55s %-25s %5s  %2d msgs",
+							t,
+							ps,
+							ft(s.time_updated),
+							s.msg_count or 0
+						),
+						ordinal = t .. " " .. p .. " " .. preview,
+					}
+				end,
+			}),
 			sorter = conf.generic_sorter({}),
-			attach_mappings = function(prompt_bufnr, _)
+			attach_mappings = function(pb)
 				actions.select_default:replace(function()
-					local s = action_state.get_selected_entry()
-					actions.close(prompt_bufnr)
-					if s and s.value then
-						local raw, err = db.fetch_session(s.value.id)
+					local sel = state.get_selected_entry()
+					actions.close(pb)
+					if sel and sel.value then
+						vim.notify(
+							"[s-picker] SELECTED id="
+								.. sel.value.id
+								.. " title="
+								.. (sel.value.title or "untitled"):gsub("\n", " "):sub(1, 40)
+								.. " project="
+								.. (sel.value.project or "nil")
+								.. " nvim_cwd="
+								.. vim.fn.getcwd(),
+							vim.log.levels.INFO
+						)
+						save_last_session(vim.fn.getcwd(), sel.value.id)
+						local raw = db.fetch_session(sel.value.id)
 						if raw then
-							local convs = model.build(raw)
-							if #convs > 0 then
-								open_chat_buffer(convs[#convs], s.value.project or vim.fn.getcwd(), convs, #convs, raw)
+							local c = model.build(raw)
+							if #c > 0 then
+								open_chat_buffer(c[#c], sel.value.project or vim.fn.getcwd(), c, #c, raw)
 							end
 						else
-							vim.notify(err or "Failed to load session", vim.log.levels.WARN)
+							vim.notify("Failed to load session", vim.log.levels.WARN)
 						end
 					end
 				end)
+				vim.keymap.set("n", "R", function()
+					local sel = state.get_selected_entry()
+					if not sel or not sel.value then
+						return
+					end
+					local s = sel.value
+					local title = (s.title or "session"):gsub("\n", " "):sub(1, 40)
+					local new_dir = vim.fn.input("Reassign [" .. title .. "] to dir: ", s.project or "", "dir")
+					if new_dir == "" or new_dir == s.project then
+						return
+					end
+					local ok, err = db.reassign_session(s.id, new_dir)
+					if ok then
+						vim.notify("Reassigned to " .. new_dir, vim.log.levels.INFO)
+						actions.close(pb)
+					else
+						vim.notify("Reassign failed: " .. (err or "unknown"), vim.log.levels.ERROR)
+					end
+				end, { buffer = pb, nowait = true, noremap = true })
 				return true
 			end,
 		})

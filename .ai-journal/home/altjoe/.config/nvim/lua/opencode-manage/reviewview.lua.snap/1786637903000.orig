@@ -1,0 +1,787 @@
+-- opencode-manage.reviewview — the persistent review viewer.
+-- Top = grouped proposal list, bottom = live EDITABLE preview. One column
+-- beside your buffer (picker on top, preview below).
+--   j/k      move selection (display order: groups by their NEWEST
+--            proposal, proposals newest-first within a group)
+--   gg / G   jump to FIRST / LAST row (display position, not item index)
+--   f        cycle the scope filter (4 states, see below)
+--   r        refresh (re-read every manifest from disk)
+--   o / <CR> open the target file in the origin buffer (cursor STAYS in
+--            the picker)
+--   da       accept current file (snapshot -> write YOUR edited preview);
+--            guarded on rerun rows — confirms before overwriting newer work
+--   dr       reject current file (status flip, nothing written)
+--   rr       rerun: open the file in origin — the proposal predates file
+--            changes, so re-ask the AI against current state
+--   y        copy+open — snapshots the current file first (journaled, so
+--            even manual pastes are revertible); on DELETE rows, prompts
+--            Move to _old? like da
+--   Q        kill the viewer (buffer-local; your global Q untouched)
+-- ALL keys are mapped on BOTH the list and the preview buffer, so they
+-- work no matter which window has focus.
+-- SCOPE FILTER (f cycles; every press reports all four counts):
+--   ALL      = every pending proposal from every discovered manifest
+--   SESSION  = proposals from sessions reachable from cwd
+--   FILES    = proposals whose AFFECTED FILE is inside the cwd
+--   NEITHER  = neither — foreign session AND foreign file (e.g. another
+--              project's session touching files outside this cwd)
+-- The LIST window's winbar shows the current scope + the four counts,
+-- plus a permanent legend: color swatches (same highlight groups as the
+-- rows) and every keybind.
+-- Row colors: green=NEW · blue=EDIT · magenta=RERUN · red=DELETE ·
+-- dim=APPLIED · strike=REJECTED · yellow=MISMATCH
+-- Rows: project tag · operation · state · path relative to the project
+-- root · short session id.
+-- Returning to the viewer defaults to the PICKER, position preserved.
+--
+-- PERF: row_state() (filereadable + readfile + fs_stat) is computed ONCE
+-- per item at refresh time and cached in state.row_states. Rendering reads
+-- the cache only — no filesystem syscalls between keystrokes, so j/k and
+-- the queued Q stay instant.
+
+local proposals = require("opencode-manage.proposals")
+
+local M = {}
+
+local FILTER_CYCLE = { "all", "session", "files", "neither" }
+
+local FILTER_LABELS = {
+	all = "🌐 ALL",
+	session = "🗂 SESSION (in cwd)",
+	files = "📄 FILES (in cwd)",
+	neither = "🚫 NEITHER (foreign session+files)",
+}
+
+local state = {
+	items = {},
+	idx = 1,
+	filter = "all", -- "all" | "session" | "files" | "neither"
+	row_states = {}, -- item index -> derived state, computed at refresh
+	list_buf = nil,
+	preview_buf = nil,
+	list_win = nil,
+	preview_win = nil,
+	outer_win = nil,
+	origin_win = nil,
+	origin_buf = nil,
+	autocmd = nil,
+}
+
+--- Resolve a proposal path to absolute.
+--- @param p table
+--- @return string
+local function resolve_path(p)
+	if p.path:sub(1, 1) == "/" then
+		return p.path
+	end
+	if p._file then
+		return vim.fn.fnamemodify(p._file, ":h:h") .. "/" .. p.path
+	end
+	return vim.fn.getcwd() .. "/" .. p.path
+end
+
+--- Does the file on disk already contain exactly what the proposal wants?
+--- Trailing-newline-insensitive. Only meaningful for create/replace
+--- (full-content ops); edit_range blocks can't be compared this way.
+--- @param p table
+--- @param path string
+--- @return boolean
+local function content_matches(p, path)
+	if not p.content then
+		return false
+	end
+	if vim.fn.filereadable(path) ~= 1 then
+		return false
+	end
+	local disk = table.concat(vim.fn.readfile(path), "\n"):gsub("\n+$", "")
+	local proposed = p.content:gsub("\n+$", "")
+	return disk == proposed
+end
+
+--- Was the target file modified AFTER the proposal was created?
+--- Content equality is checked BEFORE this (see row_state), so a manual
+--- apply with exact proposal content never flags rerun. Second-granularity:
+--- ext4 mtime resolution is 1s; equal-second is ambiguous and treated as
+--- not-modified (conservative).
+--- @param p table
+--- @param path string
+--- @return boolean
+local function file_modified_since(p, path)
+	if not p.ts or p.ts == 0 then
+		return false
+	end
+	local stat = vim.loop.fs_stat(path)
+	if not stat then
+		return false
+	end
+	return stat.mtime.sec > math.floor(p.ts / 1000)
+end
+
+--- Define the row highlight groups once.
+local function define_hls()
+	local hl = vim.api.nvim_set_hl
+	hl(0, "ManageNew", { fg = "#4ec9b0", bold = true }) -- green: new file
+	hl(0, "ManageEdit", { fg = "#569cd6" }) -- blue: edit needed
+	hl(0, "ManageRerun", { fg = "#c586c0" }) -- magenta: context stale
+	hl(0, "ManageDelete", { fg = "#f44747" }) -- red: delete/move
+	hl(0, "ManageApplied", { fg = "#6a9955" }) -- dim green: already applied
+	hl(0, "ManageRejected", { fg = "#808080", strikethrough = true }) -- dim: rejected
+	hl(0, "ManageMismatch", { fg = "#dcdcaa", bold = true }) -- yellow: mismatch
+	hl(0, "ManageGroup", { fg = "#808080", italic = true }) -- group headers
+end
+
+--- Counts per scope from a single scan — cheap, one read of the manifests.
+--- @return table<string, number>
+local function scope_counts()
+	local items = proposals.list_pending("all")
+	local c = { all = #items, session = 0, files = 0, neither = 0 }
+	for _, p in ipairs(items) do
+		if p._cwd then
+			c.session = c.session + 1
+		end
+		if p._cwd_file then
+			c.files = c.files + 1
+		end
+		if not p._cwd and not p._cwd_file then
+			c.neither = c.neither + 1
+		end
+	end
+	return c
+end
+
+--- Permanent legend in the LIST window's winbar: scope + the four counts +
+--- color swatches (rendered with the same highlight groups the rows use)
+--- + every keybind. Multi-line winbar requires nvim 0.10+.
+local function set_legend()
+	if not state.list_win or not vim.api.nvim_win_is_valid(state.list_win) then
+		return
+	end
+	local c = scope_counts()
+	local line2 = string.format(
+		"%s · %d/%d shown · f: all=%d session=%d files=%d neither=%d · j/k gg/G o/CR da dr rr y r Q",
+		FILTER_LABELS[state.filter],
+		#state.items,
+		c.all,
+		c.all,
+		c.session,
+		c.files,
+		c.neither
+	)
+	vim.wo[state.list_win].winbar = table.concat({
+		"%#ManageNew#██%*new  %#ManageEdit#██%*edit  %#ManageRerun#██%*rerun  %#ManageDelete#██%*delete  "
+			.. "%#ManageApplied#██%*applied  %#ManageRejected#██%*rejected  %#ManageMismatch#██%*mismatch",
+		line2,
+	}, "\n")
+end
+
+--- Classify a proposal's state by comparing the proposal against the ACTUAL
+--- file on disk: content first (bytes are truth), then mtime (context
+--- staleness), then existence/op structure.
+--- @param p table
+--- @return string  "new" | "edit" | "rerun" | "delete" | "applied" | "rejected" | "mismatch"
+local function row_state(p)
+	local st = p.status or "pending"
+
+	-- Explicitly rejected is final, regardless of disk
+	if st == "rejected" then
+		return "rejected"
+	end
+
+	local path = resolve_path(p)
+	local exists = vim.fn.filereadable(path) == 1
+
+	-- delete/move: applied once the file is gone (moved to _old/)
+	if p.operation == "delete" then
+		if exists then
+			return "delete"
+		end
+		return "applied" -- already moved / gone
+	end
+
+	-- create/replace: content equality is the ground truth
+	if p.operation == "create" or p.operation == "replace" then
+		if exists and content_matches(p, path) then
+			return "applied" -- the file already IS the proposal
+		end
+		if exists then
+			if p.operation == "create" then
+				return "mismatch" -- create on an existing file that differs
+			end
+			-- replace: file exists and differs — context staleness decides
+			if file_modified_since(p, path) then
+				return "rerun" -- file changed after the proposal was authored
+			end
+			return "edit"
+		end
+		if p.operation == "create" then
+			return "new"
+		end
+		return "mismatch" -- replace on a missing file
+	end
+
+	-- edit_range: can't content-compare a partial block; existence + mtime.
+	-- The mtime gate matters MORE here — it's the only staleness signal.
+	if exists then
+		if file_modified_since(p, path) then
+			return "rerun"
+		end
+		return "edit"
+	end
+	return "mismatch"
+end
+
+--- Precompute the derived state for every item. Called once per refresh —
+--- the ONLY place row_state runs. Rendering reads state.row_states.
+local function compute_row_states()
+	state.row_states = {}
+	for i, p in ipairs(state.items) do
+		state.row_states[i] = row_state(p)
+	end
+end
+
+--- Human-readable tag for a derived state (shown in the row's [tag]).
+--- @param st string
+--- @return string
+local function state_tag(st)
+	local tags = {
+		applied = "applied",
+		edit = "edit",
+		rerun = "rerun",
+		new = "new",
+		delete = "delete",
+		rejected = "rejected",
+		mismatch = "mismatch",
+	}
+	return tags[st] or st
+end
+
+--- The highlight group for a row state.
+--- @param st string
+--- @return string
+local function hl_for(st)
+	return "Manage" .. st:sub(1, 1):upper() .. st:sub(2)
+end
+
+local function short_sid(sid)
+	if not sid then
+		return "?"
+	end
+	return sid:sub(-8)
+end
+
+local function render_preview()
+	if not state.preview_buf or not vim.api.nvim_buf_is_valid(state.preview_buf) then
+		return
+	end
+	local p = state.items[state.idx]
+	if not p then
+		return
+	end
+	local is_delete = p.operation == "delete"
+	local path = resolve_path(p)
+	local lines
+	if is_delete and vim.fn.filereadable(path) == 1 then
+		lines = vim.fn.readfile(path)
+	else
+		lines = vim.split(p.content or "", "\n", { plain = true })
+		if lines[#lines] == "" then
+			table.remove(lines)
+		end
+	end
+
+	if vim.bo[state.preview_buf].modifiable == false then
+		vim.bo[state.preview_buf].modifiable = true
+	end
+	vim.api.nvim_buf_set_lines(state.preview_buf, 0, -1, false, lines)
+	vim.bo[state.preview_buf].bufhidden = "wipe"
+	vim.bo[state.preview_buf].filetype = vim.filetype.match({ filename = p.path }) or ""
+	vim.api.nvim_buf_set_name(state.preview_buf, "preview: " .. p.path)
+
+	-- Winbar shows the STATE (content/time-based), not just the op
+	local st = state.row_states[state.idx] or row_state(p)
+	local st_label = st:upper()
+	if st == "applied" then
+		st_label = "ALREADY APPLIED"
+	elseif st == "rejected" then
+		st_label = "REJECTED"
+	elseif st == "mismatch" then
+		st_label = "MISMATCH"
+	elseif st == "rerun" then
+		st_label = "RERUN — FILE CHANGED"
+	elseif st == "new" then
+		st_label = "NEW FILE"
+	end
+
+	if state.preview_win and vim.api.nvim_win_is_valid(state.preview_win) then
+		vim.wo[state.preview_win].winbar = string.format(
+			"%s %s  [%s]  ·  da accept  dr reject  rr rerun  o open  y copy  Q kill",
+			st_label,
+			p.path,
+			p.operation
+		)
+	end
+end
+
+--- Display-order indices: groups ordered by their NEWEST proposal's time
+--- (descending), proposals within a group newest-first. Proposals without
+--- a ts (0/nil) sink to the bottom of their group.
+--- @return number[]
+local function display_order()
+	local order = {}
+	local group_newest = {}
+	for i, p in ipairs(state.items) do
+		order[i] = i
+		local g = p.group or "misc"
+		group_newest[g] = math.max(group_newest[g] or 0, p.ts or 0)
+	end
+	table.sort(order, function(a, b)
+		local ia, ib = state.items[a], state.items[b]
+		local ga, gb = ia.group or "misc", ib.group or "misc"
+		if ga ~= gb then
+			return (group_newest[ga] or 0) > (group_newest[gb] or 0)
+		end
+		return (ia.ts or 0) > (ib.ts or 0)
+	end)
+	return order
+end
+
+--- Item index at display position `pos` (1-based), clamped.
+--- @param order number[]
+--- @param pos number
+--- @return number item index
+local function item_at(order, pos)
+	local n = #order
+	if n == 0 then
+		return nil
+	end
+	pos = math.max(1, math.min(n, pos))
+	return order[pos]
+end
+
+local function render_list()
+	if not state.list_buf or not vim.api.nvim_buf_is_valid(state.list_buf) then
+		return
+	end
+	local order = display_order()
+	local lines = {}
+	local row_of = {} -- display line -> state string
+	local last_group = nil
+	local cursor_line = 1
+	for _, si in ipairs(order) do
+		local p = state.items[si]
+		local g = p.group or "misc"
+		if g ~= last_group then
+			last_group = g
+			table.insert(lines, "── " .. g .. " ─────────────────────")
+		end
+		local marker = (si == state.idx) and ">" or " "
+		local st = state.row_states[si] or row_state(p)
+		local tag = state_tag(st)
+		table.insert(
+			lines,
+			string.format(
+				"%s %-12s %-9s [%-8s] %s  (s:%s)",
+				marker,
+				p._project or "?",
+				p.operation,
+				tag,
+				p._rel or p.path,
+				short_sid(p.sessionID)
+			)
+		)
+		row_of[#lines] = st
+		if si == state.idx then
+			cursor_line = #lines
+		end
+	end
+	if #lines == 0 then
+		table.insert(lines, "— no pending proposals in this scope —")
+	end
+	if vim.bo[state.list_buf].modifiable == false then
+		vim.bo[state.list_buf].modifiable = true
+	end
+	vim.api.nvim_buf_set_lines(state.list_buf, 0, -1, false, lines)
+	vim.bo[state.list_buf].modifiable = false
+
+	-- Color each row by its cached state
+	local ns = vim.api.nvim_create_namespace("manage-rows")
+	vim.api.nvim_buf_clear_namespace(state.list_buf, ns, 0, -1)
+	for ln, st in pairs(row_of) do
+		local hl = hl_for(st)
+		if hl ~= "ManageApplied" and hl ~= "ManageRejected" then
+			vim.api.nvim_buf_add_highlight(state.list_buf, ns, hl, ln - 1, 0, -1)
+		else
+			vim.api.nvim_buf_add_highlight(state.list_buf, ns, hl, ln - 1, 2, -1)
+		end
+	end
+
+	if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
+		local total = vim.api.nvim_buf_line_count(state.list_buf)
+		local target = math.max(1, math.min(cursor_line, total))
+		pcall(vim.api.nvim_win_set_cursor, state.list_win, { target, 0 })
+	end
+end
+
+--- Move selection by `delta` DISPLAY positions.
+--- @param delta number  -1 or 1
+local function move(delta)
+	local order = display_order()
+	if #order == 0 then
+		return
+	end
+	local pos = 1
+	for i, si in ipairs(order) do
+		if si == state.idx then
+			pos = i
+			break
+		end
+	end
+	local next_item = item_at(order, pos + delta)
+	if next_item then
+		state.idx = next_item
+		render_list()
+		render_preview()
+	end
+end
+
+--- Jump to the first (top) or last (bottom) DISPLAY row.
+--- @param to_last boolean
+local function jump(to_last)
+	local order = display_order()
+	if #order == 0 then
+		return
+	end
+	state.idx = item_at(order, to_last and #order or 1)
+	render_list()
+	render_preview()
+end
+
+local function ensure_dirs(target)
+	local parent = vim.fn.fnamemodify(target, ":h")
+	if vim.fn.isdirectory(parent) ~= 1 then
+		local create = vim.fn.confirm(
+			"Directory doesn't exist:\n  " .. parent .. "\n\nCreate it and open the file?",
+			"&Yes\n&No",
+			1
+		)
+		if create ~= 1 then
+			vim.notify("❌ Cancelled — target not opened", vim.log.levels.INFO)
+			return false
+		end
+		vim.fn.mkdir(parent, "p")
+	end
+	return true
+end
+
+--- Shared delete handling: confirm Move to _old? then route.
+--- @param p table
+local function handle_delete(p)
+	local target = resolve_path(p)
+	local choice = vim.fn.confirm(
+		"Move to _old?\n  "
+			.. target
+			.. "\n\n"
+			.. "File goes to: "
+			.. vim.fn.fnamemodify(target, ":h")
+			.. "/_old/\n\n"
+			.. "Nothing is permanently deleted — reversible from the journal.",
+		"&Yes\n&No",
+		1
+	)
+	if choice == 1 then
+		proposals.move_to_old(p)
+	else
+		proposals.reject(p)
+	end
+end
+
+--- o / <CR>: open target in the origin window WITHOUT moving the cursor.
+local function open_in_origin()
+	local p = state.items[state.idx]
+	if not p then
+		return
+	end
+	local target = resolve_path(p)
+	if not ensure_dirs(target) then
+		return
+	end
+	local origin = state.origin_win
+	if origin and vim.api.nvim_win_is_valid(origin) then
+		local cur = vim.api.nvim_get_current_win()
+		vim.api.nvim_set_current_win(origin)
+		vim.cmd("edit " .. vim.fn.fnameescape(target))
+		vim.api.nvim_set_current_win(cur)
+		vim.notify("📍 Opened " .. target .. " in your buffer (picker stays focused)", vim.log.levels.INFO)
+	end
+end
+
+--- rr: re-evaluation path — the proposal predates file changes, so open the
+--- file in origin and let the user re-ask the AI against current state.
+--- Status unchanged; this is a context flag, not a verdict.
+local function rerun_open()
+	local p = state.items[state.idx]
+	if not p then
+		return
+	end
+	vim.notify(
+		string.format("🔄 %s — proposal predates file changes; re-ask the AI against current state", p.path),
+		vim.log.levels.WARN
+	)
+	open_in_origin()
+end
+
+local function accept_current()
+	local p = state.items[state.idx]
+	if not p then
+		return
+	end
+	if p.operation == "delete" then
+		handle_delete(p)
+	else
+		-- rerun guard: accepting overwrites work the user did after the
+		-- proposal was authored — confirm before clobbering it
+		if state.row_states[state.idx] == "rerun" then
+			local choice = vim.fn.confirm(
+				"⚠️ File changed since this proposal was written.\n\n"
+					.. "Accepting will OVERWRITE newer work on:\n  "
+					.. resolve_path(p)
+					.. "\n\n"
+					.. "Continue?",
+				"&Yes\n&No",
+				2
+			)
+			if choice ~= 1 then
+				return
+			end
+		end
+		local current = vim.api.nvim_buf_get_lines(state.preview_buf, 0, -1, false)
+		proposals.accept(p, table.concat(current, "\n"))
+	end
+	refresh_items()
+end
+
+local function reject_current()
+	local p = state.items[state.idx]
+	if not p then
+		return
+	end
+	proposals.reject(p)
+	refresh_items()
+end
+
+local function refresh_items()
+	local items = proposals.list_pending(state.filter)
+	state.items = items
+	compute_row_states()
+	-- Empty scopes stay open (placeholder row) — toggling must never close
+	-- the viewer on a zero-count scope like NEITHER.
+	state.idx = math.max(1, math.min(state.idx, math.max(#items, 1)))
+	render_list()
+	render_preview()
+end
+
+--- f: cycle the scope filter ALL → SESSION → FILES → NEITHER → ALL.
+--- Every press reports all four counts so the effect is visible even when
+--- two scopes coincide (e.g. only one project has manifests).
+local function toggle_filter()
+	local c = scope_counts()
+	local cur = 1
+	for i, f in ipairs(FILTER_CYCLE) do
+		if f == state.filter then
+			cur = i
+			break
+		end
+	end
+	state.filter = FILTER_CYCLE[(cur % #FILTER_CYCLE) + 1]
+	state.idx = 1
+	refresh_items()
+	set_legend()
+	vim.notify(
+		string.format(
+			"f: all=%d session=%d files=%d neither=%d — now showing %s",
+			c.all,
+			c.session,
+			c.files,
+			c.neither,
+			FILTER_LABELS[state.filter]
+		),
+		vim.log.levels.INFO
+	)
+end
+
+--- y: on DELETE rows, prompt Move to _old? like da. Otherwise SNAPSHOT the
+--- current file (journaled — manual pastes are revertible), copy content,
+--- and open the target in origin.
+local function copy_and_open()
+	local p = state.items[state.idx]
+	if not p then
+		return
+	end
+	if p.operation == "delete" then
+		handle_delete(p)
+		refresh_items()
+		return
+	end
+	local content = p.content or ""
+	vim.fn.setreg("+", content)
+	vim.fn.setreg('"', content)
+
+	-- Snapshot the CURRENT file BEFORE the user pastes — the manual path
+	-- is now journaled and revertible, same as da.
+	proposals.snapshot_only(p)
+
+	vim.notify(string.format("📋 Copied %d chars (%s) to clipboard", #content, p.path), vim.log.levels.INFO)
+	local target = resolve_path(p)
+	if not ensure_dirs(target) then
+		return
+	end
+	local origin = state.origin_win
+	if origin and vim.api.nvim_win_is_valid(origin) then
+		vim.api.nvim_set_current_win(origin)
+		vim.cmd("edit " .. vim.fn.fnameescape(target))
+	end
+	vim.notify(
+		string.format("📍 Opened %s — clipboard has the new content. Paste + :w to apply.", target),
+		vim.log.levels.INFO
+	)
+end
+
+local function kill_viewer()
+	for _, b in ipairs({ state.list_buf, state.preview_buf, state.origin_buf }) do
+		if b and vim.api.nvim_buf_is_valid(b) then
+			pcall(vim.keymap.del, "n", "Q", { buffer = b })
+		end
+	end
+	if state.autocmd then
+		pcall(vim.api.nvim_del_autocmd, state.autocmd)
+		state.autocmd = nil
+	end
+	local seen = {}
+	for _, w in ipairs({ state.list_win, state.preview_win, state.outer_win }) do
+		if w and not seen[w] then
+			seen[w] = true
+			if vim.api.nvim_win_is_valid(w) then
+				vim.api.nvim_win_close(w, true)
+			end
+		end
+	end
+	state.items = {}
+	state.row_states = {}
+	state.list_buf = nil
+	state.preview_buf = nil
+	state.list_win = nil
+	state.preview_win = nil
+	state.outer_win = nil
+	state.origin_win = nil
+	state.origin_buf = nil
+	vim.notify("🗑️ Review viewer closed", vim.log.levels.INFO)
+end
+
+local function set_q_kill(buf)
+	vim.keymap.set("n", "Q", kill_viewer, { buffer = buf, nowait = true, noremap = true, silent = true })
+end
+
+--- Create a deterministic split window.
+--- @param buf number
+--- @param split string  "right" | "below"
+--- @param ref_win number  window to split (defaults to current)
+--- @return number win
+local function make_window(buf, split, ref_win)
+	local opts = {
+		relative = "",
+		split = split,
+	}
+	if ref_win then
+		opts.win = ref_win
+	end
+	return vim.api.nvim_open_win(buf, false, opts)
+end
+
+--- Map the full key set on one buffer.
+--- @param buf number
+local function map_keys(buf)
+	local opts = { buffer = buf, nowait = true, noremap = true, silent = true }
+	vim.keymap.set("n", "j", function()
+		move(1)
+	end, opts)
+	vim.keymap.set("n", "k", function()
+		move(-1)
+	end, opts)
+	vim.keymap.set("n", "<C-n>", function()
+		move(1)
+	end, opts)
+	vim.keymap.set("n", "<C-p>", function()
+		move(-1)
+	end, opts)
+	vim.keymap.set("n", "gg", function()
+		jump(false)
+	end, opts)
+	vim.keymap.set("n", "G", function()
+		jump(true)
+	end, opts)
+	vim.keymap.set("n", "f", toggle_filter, opts)
+	vim.keymap.set("n", "r", refresh_items, opts)
+	vim.keymap.set("n", "o", open_in_origin, opts)
+	vim.keymap.set("n", "<CR>", open_in_origin, opts)
+	vim.keymap.set("n", "da", accept_current, opts)
+	vim.keymap.set("n", "dr", reject_current, opts)
+	vim.keymap.set("n", "rr", rerun_open, opts)
+	vim.keymap.set("n", "y", copy_and_open, opts)
+	set_q_kill(buf)
+end
+
+function M.open()
+	local items = proposals.list_pending(state.filter)
+	if #items == 0 then
+		vim.notify("No pending proposals", vim.log.levels.INFO)
+		return
+	end
+	-- Re-entry guard: replace an existing viewer instead of stacking
+	if state.outer_win and vim.api.nvim_win_is_valid(state.outer_win) then
+		kill_viewer()
+	end
+	define_hls()
+	state.items = items
+	compute_row_states()
+	state.idx = 1
+	state.origin_win = vim.api.nvim_get_current_win()
+	state.origin_buf = vim.api.nvim_get_current_buf()
+
+	-- List buffer: new column to the RIGHT of the origin buffer
+	state.list_buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[state.list_buf].bufhidden = "wipe"
+	vim.bo[state.list_buf].filetype = "managelist"
+	state.outer_win = make_window(state.list_buf, "right")
+	state.list_win = state.outer_win
+	set_legend()
+
+	-- Preview buffer: split the PICKER's column downward (single viewer unit)
+	state.preview_buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[state.preview_buf].bufhidden = "wipe"
+	vim.bo[state.preview_buf].modifiable = true
+	state.preview_win = make_window(state.preview_buf, "below", state.list_win)
+
+	vim.api.nvim_set_current_win(state.list_win)
+
+	-- Full key set on BOTH windows so nothing is a dead key by focus.
+	map_keys(state.list_buf)
+	map_keys(state.preview_buf)
+
+	state.autocmd = vim.api.nvim_create_autocmd("WinEnter", {
+		callback = function()
+			local cur = vim.api.nvim_get_current_win()
+			if
+				state.list_win
+				and vim.api.nvim_win_is_valid(state.list_win)
+				and (cur == state.preview_win or cur == state.list_win)
+			then
+				vim.api.nvim_set_current_win(state.list_win)
+			end
+		end,
+	})
+
+	render_list()
+	render_preview()
+end
+
+return M
