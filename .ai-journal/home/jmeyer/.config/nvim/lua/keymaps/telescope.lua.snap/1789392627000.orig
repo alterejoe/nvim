@@ -1,6 +1,10 @@
 local telescope = require("telescope")
 local builtin = require("telescope.builtin")
 
+vim.keymap.set("n", "<leader>rf", function()
+	telescope.extensions.recent_files.recent_files({ cwd = vim.fn.getcwd() })
+end, { desc = "Telescope find recent files" })
+
 vim.keymap.set("n", "<leader>ff", function()
 	builtin.find_files({ cwd = vim.fn.getcwd(), hidden = true, max_depth = 3 })
 end, { desc = "Telescope find files" })

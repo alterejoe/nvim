@@ -1,10 +1,10 @@
+-- /home/altjoe/.config/nvim/lua/plugins/tools.lua
 return {
 	{ "feline-nvim/feline.nvim" }, -- status bar
 	{ "gabrielpoca/replacer.nvim" },
 	{ "kevinhwang91/nvim-bqf" }, -- better quickfix list search/replace/prettier
 	{ "mbbill/undotree" },
 	{ "lucamot/chrome-remote.nvim" },
-	{ "mistweaverco/kulala.nvim", ft = "http" },
 
 	{
 		"folke/noice.nvim",

@@ -1,7 +1,13 @@
 -- /home/jmeyer/.config/nvim/lua/keymaps/oilprint.lua FINAL
 local PRINTER = "HP LaserJet Pro M501dn UPD PCL 6"
 local MANUAL_FEED_PRINTER = "HP LaserJet Pro M501dn UPD PCL 6" -- change to your exact printer name
----------------------------------------------------------------------
+
+-- local PRINTER = "Hewlett-Packard HP LaserJet P3010 Series"
+-- local MANUAL_FEED_PRINTER = "Hewlett-Packard HP LaserJet P3010 Series" -- change to your exact printer name
+--
+-- local PRINTER = "Programming Printer"
+-- local MANUAL_FEED_PRINTER = "Programming Printer" -- change to your exact printer name
+-- ---------------------------------------------------------------------
 -- Notifications
 ---------------------------------------------------------------------
 local function info(msg)

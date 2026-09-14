@@ -1,9 +1,4 @@
 -- /home/jmeyer/.config/nvim/after/plugin/which-key.lua FINAL
-<<<<<<< HEAD
-=======
-
--- after/plugin/which-key.lua
->>>>>>> c04461adca7b3c7973a233806d9c9738c8ba1448
 -- Group labels and descriptions for all keymaps.
 
 local wk = require("which-key")
@@ -34,7 +29,6 @@ wk.add({
 	{ "<leader>se", desc = "CSVGen: Excel paste→CSV", mode = "n" },
 	{ "<leader>ec", desc = "CSVGen: Excel→CSV (selection)", mode = "v" },
 	{ "<leader>sk", desc = "CSVGen: show keybinds" },
-	-- /home/jmeyer/.config/nvim/after/plugin/which-key.lua:32 FINAL
 	{ "<leader>sD", desc = "CSVGen: district→precinct by name match" },
 	{ "<leader>sP", desc = "CSVGen: contest→precinct by name match" },
 	{ "<leader>sC", desc = "CSVGen: contest→district by name match" },
