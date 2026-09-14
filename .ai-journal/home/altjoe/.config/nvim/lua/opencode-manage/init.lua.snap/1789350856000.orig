@@ -1,0 +1,43 @@
+-- /home/altjoe/.config/nvim/lua/opencode-manage/init.lua FINAL
+-- opencode-manage — the review console for the opencode manage plugin.
+-- Proposal review + change journal + registry review + verdict store/viewer.
+-- Completely separate from opencode-ext (the chat viewer) — no overlap.
+--
+-- FOUR viewers: proposals (<leader>ap / <leader>ac), journal (<leader>aj),
+-- registry (<leader>ar), verdicts (<leader>av) — all persistent two-pane
+-- viewers with live previews, no bland pickers.
+-- Plus the metrics reader command (:ManageMetrics) — read-only summary of the
+-- C1 context metrics store written by the plugin (doc 19).
+
+local review = require("opencode-manage.review")
+local reviewview = require("opencode-manage.reviewview")
+local journalview = require("opencode-manage.journalview")
+local registryview = require("opencode-manage.registryview")
+local verdictview = require("opencode-manage.verdictview")
+local metrics = require("opencode-manage.metrics")
+
+-- Keymaps
+vim.keymap.set("n", "<leader>ap", reviewview.open, { desc = "Manage: review proposals" })
+vim.keymap.set("n", "<leader>ac", reviewview.open, { desc = "Manage: review proposals (merged)" })
+vim.keymap.set("n", "<leader>aj", journalview.open, { desc = "Manage: journal viewer" })
+vim.keymap.set("n", "<leader>ar", registryview.open, { desc = "Manage: registry entries" })
+vim.keymap.set("n", "<leader>av", verdictview.open, { desc = "Manage: verdict viewer" })
+
+-- Stable verification command for the metrics store (path lives in code).
+vim.api.nvim_create_user_command("ManageMetrics", function()
+	metrics.summary()
+end, { desc = "Manage: metrics store summary" })
+
+-- API surface for scripting / later integration
+return {
+	review = review,
+	reviewview = reviewview,
+	journalview = journalview,
+	registryview = registryview,
+	verdictview = verdictview,
+	metrics = metrics,
+	proposals = require("opencode-manage.proposals"),
+	journal = require("opencode-manage.journal"),
+	registry = require("opencode-manage.registry"),
+	verdicts = require("opencode-manage.verdicts"),
+}

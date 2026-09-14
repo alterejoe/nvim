@@ -5,6 +5,10 @@
 -- No files are ever permanently deleted — they go to _old/ next to them,
 -- which is reversible and auditable.
 -- The JSONL is ground truth: schema-valid tool-call args, never parsed prose.
+-- T2 (10-verdict-capture.md): every accept/reject/move writes a verdict to
+-- the shared SQLite store automatically — accepted | corrected (edited
+-- before da) | rejected | moved_old. The correction diff is recoverable
+-- from proposed_content vs applied_content.
 -- Two per-proposal cwd predicates drive the viewer's 4-state filter:
 --   _cwd       = the proposal's manifest dir is reachable from cwd
 --                ("session in the cwd" — walk-up + glob-down discovery)
@@ -25,6 +29,7 @@
 -- line must never take the whole viewer down.
 
 local journal = require("opencode-manage.journal")
+local verdicts = require("opencode-manage.verdicts")
 
 local M = {}
 
@@ -207,12 +212,17 @@ function M.set_status(proposal, status)
 	end
 end
 
---- Accept a proposal: snapshot → write → journal → status flip.
+--- Accept a proposal: snapshot → write → journal → verdict → status flip.
 --- The write is a USER-initiated action from nvim, never the AI.
+--- T2: editing the buffer before accepting makes the verdict `corrected` —
+--- the diff between INTENDED and applied content is the structural fact.
 --- @param proposal table
 --- @param content_override string|nil  use this instead of proposal.content
 ---   (the user may have edited the proposed content before accepting)
-function M.accept(proposal, content_override)
+--- @param baseline_override string|nil  the full content the proposal intended
+---   to produce. For edit_range this is the after-content, NOT the replacement
+---   fragment — fragment-vs-file comparisons flagged every accept as corrected.
+function M.accept(proposal, content_override, baseline_override)
 	local path = resolve_path(proposal)
 	local snap = journal.snapshot(path)
 
@@ -239,6 +249,33 @@ function M.accept(proposal, content_override)
 		reason = proposal.reason,
 		sessionID = proposal.sessionID,
 	})
+
+	-- T2 verdict capture
+	local verdict = "accepted"
+	-- Trailing whitespace/newlines are not corrections, and edit_range
+	-- baselines are full files — compare applied content against the intended
+	-- baseline, normalized.
+	local function norm_content(s)
+		return (s or ""):gsub("%s+$", "")
+	end
+	local baseline = baseline_override or proposal.content
+	if content_override and norm_content(content_override) ~= norm_content(baseline) then
+		verdict = "corrected"
+	end
+	verdicts.record({
+		ts = os.time() * 1000,
+		session_id = proposal.sessionID,
+		proposal_id = proposal.ts,
+		group_name = proposal.group,
+		path = path,
+		operation = proposal.operation,
+		verdict = verdict,
+		reason = proposal.reason,
+		proposed_content = baseline,
+		applied_content = content,
+	})
+	verdicts.promote_if_cross_project(path, verdict)
+
 	M.set_status(proposal, "accepted")
 	vim.notify("✅ Accepted: " .. path, vim.log.levels.INFO)
 end
@@ -308,15 +345,48 @@ function M.move_to_old(proposal)
 		reason = proposal.reason,
 		sessionID = proposal.sessionID,
 	})
+
+	-- T2 verdict capture
+	verdicts.record({
+		ts = os.time() * 1000,
+		session_id = proposal.sessionID,
+		proposal_id = proposal.ts,
+		group_name = proposal.group,
+		path = path,
+		operation = proposal.operation,
+		verdict = "moved_old",
+		reason = proposal.reason,
+		proposed_content = proposal.content,
+		applied_content = nil,
+	})
+	verdicts.promote_if_cross_project(path, "moved_old")
+
 	M.set_status(proposal, "accepted")
 	vim.notify("📦 Moved to _old: " .. path .. " → " .. dest, vim.log.levels.INFO)
 	return dest
 end
 
---- Reject a proposal: status flip only. Nothing written.
+--- Reject a proposal: status flip + verdict. Nothing written.
 --- @param proposal table
 function M.reject(proposal)
 	M.set_status(proposal, "rejected")
+
+	-- T2 verdict capture
+	local path = resolve_path(proposal)
+	verdicts.record({
+		ts = os.time() * 1000,
+		session_id = proposal.sessionID,
+		proposal_id = proposal.ts,
+		group_name = proposal.group,
+		path = path,
+		operation = proposal.operation,
+		verdict = "rejected",
+		reason = proposal.reason,
+		proposed_content = proposal.content,
+		applied_content = nil,
+	})
+	verdicts.promote_if_cross_project(path, "rejected")
+
 	vim.notify("❌ Rejected: " .. proposal.path, vim.log.levels.INFO)
 end
 

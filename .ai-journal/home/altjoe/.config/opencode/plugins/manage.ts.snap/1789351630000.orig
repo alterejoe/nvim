@@ -1,0 +1,542 @@
+/**
+ * Manage — OpenCode Management Plugin (M1 + M1g + M1i + M1r + M2 + M2.5 + C1 + C2)
+ * Entry point only: hooks + tools, wired from lib/ modules.
+ *
+ * V1 plugin shape (PluginModule): `export default { id, server }` — the
+ * loader's modern path. The legacy function-export path is bypassed.
+ *
+ * Core principle: STRUCTURAL, not heuristic. There is no path from the AI
+ * to the filesystem. The gate denies the mutation tools outright; the AI's
+ * only "write" channels are emit_proposal and registry_propose, which write
+ * nothing to disk — they append to review queues the user applies.
+ *
+ * M2/M2.5: verdict capture (store reads, abort + correction pairing).
+ * C1 (doc 19): context metrics — assistant token usage, tool/skill/proposal
+ * events, all in state.db. Capture only.
+ * C2 (doc 19): user-requested prune. The nvim console writes a
+ * `prune_request` event; on the next user message the plugin claims it,
+ * shapes the compaction via experimental.session.compacting, and triggers
+ * it through client.session.summarize. Verified state survives; exploration
+ * and superseded code go.
+ *
+ * DENIAL IS TERMINAL: the throw messages below explicitly tell the model
+ * not to retry or work around a denied tool. The impact requirement and
+ * registry_propose validation are the ONE deliberate exception: their
+ * errors are REQUIREMENTS retries — fix the input and re-emit, not give up.
+ */
+
+import { type Plugin, tool } from "@opencode-ai/plugin";
+import { existsSync } from "fs";
+import { join, isAbsolute } from "path";
+import { loadRules, DEFAULT_DENY } from "./lib/airlock";
+import { loadRecentVerdicts, recordAbort, attachCorrection } from "./lib/verdicts";
+import { proposalsFile, appendProposal } from "./lib/proposals";
+import {
+  recordTurn,
+  recordEvent,
+  hasPendingPrune,
+  markPruneConsumed,
+} from "./lib/metrics";
+import {
+  loadRegistry,
+  matchesSharedPath,
+  buildRegistrySummary,
+  parseImpact,
+  impactRequiredMessage,
+  parseStringList,
+  parseRefs,
+  entryKey,
+  entryExists,
+  REGISTRY_KINDS,
+  registryPendingFile,
+  appendPending,
+  type ImpactEntry,
+  type RefEntry,
+} from "./lib/registry";
+
+// ── M2.5 conversation verdict state ─────────────────────────────────────────
+// sessionID -> pending abort verdict id (awaiting the user's correction)
+const pendingAborts = new Map<string, number>();
+
+// ── C2 prune state ──────────────────────────────────────────────────────────
+// Sessions whose next compaction is user-requested and should be shaped.
+const pruneShaped = new Set<string>();
+
+/** Extract joined text from a message's text parts (defensive). */
+function messageText(info: any): string {
+  if (!info || !Array.isArray(info.parts)) return "";
+  return info.parts
+    .filter((p: any) => p && p.type === "text" && typeof p.text === "string")
+    .map((p: any) => p.text)
+    .join("\n")
+    .trim();
+}
+
+const ManagePlugin: Plugin = async ({ directory, client }) => {
+  return {
+    // ── Airlock gate: runs before EVERY tool call ────────────────────────
+    "tool.execute.before": async (input, output) => {
+      const rules = loadRules(directory);
+      const toolName = input.tool;
+
+      const explicitlyAllowed = rules.allow.includes(toolName);
+      const explicitlyDenied = rules.deny.includes(toolName);
+
+      // Explicit allow wins over the deny list.
+      if (explicitlyDenied && !explicitlyAllowed) {
+        throw new Error(
+          `[manage] ❌ Tool "${toolName}" is DENIED by the airlock — ` +
+            `permanently, do not retry it or attempt a workaround. ` +
+            `The AI cannot mutate the filesystem. Use emit_proposal instead.`,
+        );
+      }
+      // bash is denied by default even if a rules file forgot it.
+      if (toolName === "bash" && !explicitlyAllowed) {
+        throw new Error(
+          `[manage] ❌ bash is DENIED by the airlock — permanently, do not ` +
+            `retry it or attempt a workaround. The AI cannot run shell ` +
+            `commands. Propose changes with emit_proposal; the user runs commands.`,
+        );
+      }
+
+      // C1: the tool is proceeding — skill loads are context events.
+      if (toolName === "skill") {
+        const name = (output as any)?.args?.name;
+        if (typeof name === "string" && name) {
+          await recordEvent(directory, input.sessionID, "skill_load", name, null);
+        }
+      }
+    },
+
+    // ── C1: tool call capture (name only — no payload bodies) ────────────
+    "tool.execute.after": async (input) => {
+      await recordEvent(directory, input.sessionID, "tool_call", input.tool, null);
+    },
+
+    // ── M2.5 + C1: message events ────────────────────────────────────────
+    event: async ({ event }) => {
+      if (!event || event.type !== "message.updated") return;
+      const props = (event as any).properties;
+      const info = props?.info;
+      if (!info) return;
+      // EventMessageUpdated.properties carries only `info`; sessionID lives
+      // on the message itself.
+      const sessionID = props?.sessionID || info.sessionID;
+
+      // C1: assistant token usage — context growth metrics (doc 19).
+      if (info.role === "assistant") {
+        await recordTurn(directory, info);
+      }
+
+      // M2.5: the escape-kill is a verdict.
+      if (info.error && info.error.name === "MessageAbortedError") {
+        if (!sessionID) return;
+        const killed = messageText(info);
+        const id = await recordAbort(directory, sessionID, killed || "aborted generation");
+        if (id !== null) {
+          pendingAborts.set(sessionID, id);
+        }
+      }
+    },
+
+    // ── M2.5 + C2: new user message ──────────────────────────────────────
+    "chat.message": async (input, output) => {
+      const sessionID = input.sessionID;
+
+      // C2: claim a prune request written by the nvim console, shape the
+      // compaction (hook below), and trigger it. On failure the request is
+      // kept so the next message retries.
+      const reqTs = await hasPendingPrune(directory);
+      if (reqTs !== null && sessionID) {
+        pruneShaped.add(sessionID);
+        try {
+          await (client as any).session.summarize({ path: { id: sessionID } });
+          await markPruneConsumed(directory, sessionID, reqTs);
+        } catch (e) {
+          console.error("[manage] prune: summarize failed (request kept): " + String(e));
+        }
+      }
+
+      // M2.5: pair the user's correction with the pending abort.
+      const pendingId = pendingAborts.get(sessionID);
+      if (pendingId === undefined) return;
+      const correction = (output.parts || [])
+        .filter((p: any) => p && p.type === "text" && typeof p.text === "string")
+        .map((p: any) => p.text)
+        .join("\n")
+        .trim();
+      if (!correction) return;
+      await attachCorrection(directory, pendingId, correction);
+      pendingAborts.delete(sessionID);
+    },
+
+    // ── C2: shape a user-requested compaction ────────────────────────────
+    "experimental.session.compacting": async (input, output) => {
+      const sessionID = (input as any)?.sessionID;
+      if (!sessionID || !pruneShaped.has(sessionID)) return;
+      pruneShaped.delete(sessionID);
+      output.context.push(
+        "[prune] User-requested prune. Keep: verified state, accepted and " +
+          "rejected outcomes, decisions, changed file paths, open questions, " +
+          "the current task and its scope. Drop: exploration and dead ends, " +
+          "superseded code and plans, tool-call noise, resolved discussion " +
+          "already captured above.",
+      );
+      output.prompt =
+        "Summarize this session for continuation after a user-requested prune. " +
+        "Preserve verified facts, decisions, file paths, and the current task; " +
+        "omit exploration, tool output, and superseded code.";
+    },
+
+    // ── M2 verdict injection: loop-breaking at the message boundary ──────
+    "experimental.chat.messages.transform": async (_input, output) => {
+      const verdicts = await loadRecentVerdicts(directory, 5);
+      if (!verdicts.length) return;
+
+      const block =
+        "[verdicts] " +
+        verdicts
+          .map((v) => {
+            const target = v.path || v.reason || "conversation";
+            if (v.verdict === "aborted" && v.applied_content) {
+              return `aborted: ${target} (you said: ${v.applied_content.slice(0, 60)})`;
+            }
+            return `${v.verdict}: ${target}${v.reason ? ` (${v.reason})` : ""}`;
+          })
+          .join(" · ");
+
+      const msgs = output.messages;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (m.info.role === "user") {
+          m.parts.push({
+            id: `verdicts-${Date.now()}`,
+            sessionID: m.info.sessionID,
+            messageID: m.info.id,
+            type: "text",
+            text: block,
+            synthetic: true,
+          });
+          break;
+        }
+      }
+    },
+
+    tool: {
+      // ── The only code write channel: structured proposal ──────────────
+      emit_proposal: tool({
+        description:
+          "Propose a file change for the user to review and apply manually. " +
+          "This tool writes NOTHING to disk — it records a structured proposal " +
+          "the user accepts or rejects. This is your ONLY write channel: " +
+          "bash/edit/write/patch are permanently denied, so do not attempt them. " +
+          "For a task touching multiple files, call this once per file and give " +
+          "every call the same `group` slug so the change stays reviewable and " +
+          "revertible as one unit. " +
+          "Before proposing changes to any shared/central module, run " +
+          "lsp_find_references on the symbols you will change and populate " +
+          "`impact` with the real consumers." +
+          buildRegistrySummary(directory),
+        args: {
+          path: tool.schema
+            .string()
+            .describe("Absolute or project-relative file path to change"),
+          operation: tool.schema
+            .string()
+            .describe(
+              "Type of change: 'create' (new file), 'replace' (full-file), " +
+                "'edit_range' (replace lines start_line..end_line), 'delete'",
+            ),
+          content: tool.schema
+            .string()
+            .describe(
+              "Full new file content (for create/replace) or the replacement block",
+            ),
+          reason: tool.schema
+            .string()
+            .describe("Why this change — so the user can review intent"),
+          group: tool.schema
+            .string()
+            .describe(
+              "Short slug tying this proposal to one logical change across files " +
+                "(e.g. 'add-metrics-service'). All files of one task share one group.",
+            ),
+          start_line: tool.schema
+            .string()
+            .describe(
+              "For edit_range: first line to replace (1-based). Empty string if unused.",
+            ),
+          end_line: tool.schema
+            .string()
+            .describe(
+              "For edit_range: last line to replace (1-based). Empty string if unused.",
+            ),
+          impact: tool.schema
+            .string()
+            .describe(
+              'JSON array of impact entries — REQUIRED when the target path is a ' +
+                'registered shared module. Each entry: {"path": string, "symbol": string, ' +
+                '"relation": string}. Gather via lsp_find_references / ' +
+                "lsp_goto_definition before proposing. Every path must exist on disk.",
+            ),
+          reuses: tool.schema
+            .string()
+            .describe(
+              'Optional: canonical implementations this change reuses, to prove no ' +
+                'duplication. JSON array of {"path": string, "symbol": string}. ' +
+                "Prefer the registry's canonical entries over reimplementing.",
+            ),
+        },
+        async execute(args, context) {
+          const sessionID = context.sessionID;
+          const registry = loadRegistry(directory);
+          const sharedHit = matchesSharedPath(registry.shared, args.path);
+
+          // Structural impact requirement: touching a shared module without
+          // evidence of what it affects is a REQUIREMENTS error, not a denial.
+          let impact: ImpactEntry[] = [];
+          if (sharedHit && (!args.impact || args.impact.trim() === "")) {
+            throw new Error(impactRequiredMessage(args.path));
+          }
+          if (args.impact && args.impact.trim() !== "") {
+            impact = parseImpact(directory, args.impact);
+          }
+
+          const proposal = {
+            ts: Date.now(),
+            sessionID,
+            group: args.group || "misc",
+            path: args.path,
+            operation: args.operation,
+            reason: args.reason,
+            start_line: args.start_line ? parseInt(args.start_line, 10) : null,
+            end_line: args.end_line ? parseInt(args.end_line, 10) : null,
+            content: args.content,
+            impact,
+            reuses: args.reuses || null,
+            status: "pending", // pending | accepted | rejected (user/nvim sets this)
+          };
+          appendProposal(directory, sessionID, proposal);
+          await recordEvent(
+            directory,
+            sessionID,
+            "proposal",
+            `${proposal.group}: ${args.path}`,
+            null,
+          );
+          return JSON.stringify(
+            {
+              ok: true,
+              message:
+                `Proposal recorded (${args.operation}) for ${args.path} ` +
+                `[group: ${proposal.group}, impact: ${impact.length} ` +
+                `${impact.length === 1 ? "entry" : "entries"}]. ` +
+                `Nothing was written. The user must apply it manually.`,
+              proposal_id: proposal.ts,
+              manifest: proposalsFile(directory, sessionID),
+            },
+            null,
+            2,
+          );
+        },
+      }),
+
+      // ── Registry write channel (M1r): submit entries through review ────
+      registry_propose: tool({
+        description:
+          "Submit a registry entry for review — the write channel for the project's " +
+          "shared-logic registry (.opencode/manage.registry.json). Use this when you " +
+          "notice duplicated logic, a reusable pattern, or a change touching " +
+          "central/shared code: the registry is how this project avoids reinventing " +
+          "the wheel. " +
+          "This tool writes NOTHING to the registry — it appends to a pending queue " +
+          "the user reviews and merges. " +
+          "kinds: 'shared' (central module — future proposals touching it will require " +
+          "impact), 'canonical' (concept → implementation to reuse; needs 'concept'), " +
+          "'modularize' (repeated code that should be extracted into a module), " +
+          "'consolidations' (2+ similar paths that could merge; needs 'paths'). " +
+          "Run lsp_goto_definition / lsp_find_references on the symbols first and record " +
+          "the real usage sites in 'refs'. Every path must exist on disk. " +
+          "Validation errors are REQUIREMENTS retries — fix the input and re-emit." +
+          buildRegistrySummary(directory),
+        args: {
+          kind: tool.schema
+            .string()
+            .describe("'shared' | 'canonical' | 'modularize' | 'consolidations'"),
+          path: tool.schema
+            .string()
+            .describe(
+              "Project-relative path to the module (shared/canonical/modularize). Empty for consolidations.",
+            ),
+          paths: tool.schema
+            .string()
+            .describe(
+              "For consolidations only: JSON array of 2+ existing project-relative paths. Empty otherwise.",
+            ),
+          symbols: tool.schema
+            .string()
+            .describe(
+              'JSON array of symbol names — REQUIRED for shared and canonical. ' +
+                "Verify each resolves via lsp_goto_definition first.",
+            ),
+          concept: tool.schema
+            .string()
+            .describe(
+              "For canonical only: the concept this implementation is the canonical " +
+                "answer for (e.g. 'time formatting').",
+            ),
+          rationale: tool.schema
+            .string()
+            .describe("WHY this entry belongs in the registry — shown in the summary MD."),
+          refs: tool.schema
+            .string()
+            .describe(
+              'Optional: JSON array of {"path","symbol","relation"} usage sites gathered ' +
+                "via lsp_find_references. Every path must exist on disk.",
+            ),
+          fragile: tool.schema
+            .string()
+            .describe(
+              "For shared only: 'true' or 'false' — marks high-risk central logic [FRAGILE].",
+            ),
+          constraints: tool.schema
+            .string()
+            .describe(
+              "For shared only: rules the model must follow when touching this module " +
+                "(e.g. 'additive changes only').",
+            ),
+          suggested_target: tool.schema
+            .string()
+            .describe(
+              "For consolidations only: the proposed merged target path (optional).",
+            ),
+          group: tool.schema
+            .string()
+            .describe("Optional M1g slug tying this entry to a task group."),
+        },
+        async execute(args, context) {
+          const sessionID = context.sessionID;
+          const kind = (args.kind || "").trim();
+          if (!(REGISTRY_KINDS as readonly string[]).includes(kind)) {
+            throw new Error(
+              `[manage] ⚠️ registry_propose "kind" must be one of: ${REGISTRY_KINDS.join(", ")}. Re-emit.`,
+            );
+          }
+          if (!args.rationale || args.rationale.trim() === "") {
+            throw new Error(
+              '[manage] ⚠️ registry_propose needs "rationale" — the WHY that shows in the summary. Re-emit.',
+            );
+          }
+
+          const path = (args.path || "").trim();
+          let paths: string[] = [];
+          if (kind === "consolidations") {
+            paths = parseStringList(args.paths, "paths");
+            if (paths.length < 2) {
+              throw new Error(
+                '[manage] ⚠️ "consolidations" needs "paths" with at least 2 existing files. Re-emit.',
+              );
+            }
+          } else {
+            if (!path) {
+              throw new Error(
+                `[manage] ⚠️ registry_propose for kind "${kind}" needs "path". Re-emit.`,
+              );
+            }
+            paths = [path];
+          }
+
+          // Every target must exist on disk — no invented entries.
+          for (const p of paths) {
+            const target = isAbsolute(p) ? p : join(directory, p);
+            if (!existsSync(target)) {
+              throw new Error(
+                `[manage] ⚠️ Path "${p}" does not exist on disk — registry entries must target real code. Re-emit.`,
+              );
+            }
+          }
+
+          const symbols = parseStringList(args.symbols, "symbols");
+          if ((kind === "shared" || kind === "canonical") && symbols.length === 0) {
+            throw new Error(
+              `[manage] ⚠️ kind "${kind}" needs "symbols" — the entry names the actual symbols. Re-emit.`,
+            );
+          }
+          if (kind === "canonical" && (!args.concept || args.concept.trim() === "")) {
+            throw new Error(
+              '[manage] ⚠️ kind "canonical" needs "concept" — the concept this implementation is canonical for. Re-emit.',
+            );
+          }
+
+          let refs: RefEntry[] = [];
+          if (args.refs && args.refs.trim() !== "") {
+            refs = parseRefs(directory, args.refs);
+          }
+
+          let fragile = false;
+          if (args.fragile && args.fragile.trim() !== "") {
+            if (args.fragile.trim() === "true") fragile = true;
+            else if (args.fragile.trim() !== "false") {
+              throw new Error('[manage] ⚠️ "fragile" must be "true" or "false". Re-emit.');
+            }
+          }
+
+          // Duplicate detection against the registry AND the pending queue.
+          const key = entryKey(kind, path, paths);
+          if (entryExists(directory, kind, key)) {
+            throw new Error(
+              `[manage] Entry "${key}" (${kind}) is already registered or pending — ` +
+                "no re-emit needed; the registry already covers it.",
+            );
+          }
+
+          const entry = {
+            ts: Date.now(),
+            sessionID,
+            kind,
+            path: kind === "consolidations" ? null : path,
+            paths: kind === "consolidations" ? paths : [],
+            symbols,
+            concept: kind === "canonical" ? args.concept.trim() : null,
+            rationale: args.rationale.trim(),
+            refs,
+            fragile: kind === "shared" ? fragile : false,
+            constraints: kind === "shared" ? args.constraints?.trim() || null : null,
+            suggested_target:
+              kind === "consolidations" ? args.suggested_target?.trim() || null : null,
+            group: args.group || "misc",
+            status: "pending", // pending | merged | rejected (user/nvim sets this)
+          };
+          appendPending(directory, sessionID, entry);
+          await recordEvent(
+            directory,
+            sessionID,
+            "registry_proposal",
+            `${kind}: ${paths.join(", ")}`,
+            null,
+          );
+          return JSON.stringify(
+            {
+              ok: true,
+              message:
+                `Registry proposal recorded (${kind}) for ${paths.join(", ")} — ` +
+                "pending review. Nothing was written to the registry; accept " +
+                "via the review console to merge.",
+              entry_id: entry.ts,
+              queue: registryPendingFile(directory),
+            },
+            null,
+            2,
+          );
+        },
+      }),
+    },
+  };
+};
+
+// V1 plugin shape — the loader's modern path (readV1Plugin). Bypasses the
+// legacy getLegacyPlugins path entirely, making loading deterministic.
+export default {
+  id: "manage",
+  server: ManagePlugin,
+};

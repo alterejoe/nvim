@@ -24,6 +24,17 @@ return {
         end,
     },
 
+    -- SQLite for the opencode-manage verdict store (T2 + T2.5).
+    -- sqlite.lua's FFI is pointed at the system library explicitly because
+    -- this system has libsqlite3.so.0 but not necessarily libsqlite3.so.
+    {
+        "kkharji/sqlite.lua",
+        lazy = true,
+        init = function()
+            vim.g.sqlite_clib_path = "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0"
+        end,
+    },
+
     -- Quick HTML/CSS templating via Emmet (requires emmet-language-server v2.2.0+)
     {
         "olrtg/nvim-emmet",

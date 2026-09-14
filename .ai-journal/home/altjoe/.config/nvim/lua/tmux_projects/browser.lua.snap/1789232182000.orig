@@ -1,0 +1,367 @@
+-- lua/tmux_projects/browser.lua FINAL-6
+-- Shared Oil-style level browser built on scratchbuf.
+--
+-- Model (mirrors oil.nvim):
+--   * One level per buffer. Rows ending in "/" are folders, other rows are
+--     sessions in the "name<TAB>path" format.
+--   * <CR> on a folder commits the level, closes the view and opens the child.
+--   * <CR> on a session opens it and closes the browser window.
+--   * "-" / <leader>e commit the level and return to the parent.
+--   * <C-l> / r refresh the current level; live tmux state is cached.
+--   * dd cuts a session row, gp/gP paste it. Moving a session between folders:
+--     dd at the source level, <CR> into the target folder, gp, W.
+--   * <Tab> jumps the cursor between the name and path fields of a row.
+--   * The plugin owning a level provides render/commit/open_session and keeps
+--     all state; this module only handles navigation and presentation.
+
+local scratchbuf = require("scratchbuf")
+
+local M = {}
+
+local live_cache = nil
+local dir_cache = nil
+
+function M.live_sessions()
+	if not live_cache then
+		live_cache = {}
+		for _, name in ipairs(vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null")) do
+			live_cache[name] = true
+		end
+	end
+	return live_cache
+end
+
+function M.invalidate_live()
+	live_cache = nil
+end
+
+-- Switch the client to a nvim session (never opencode/air/browser/devproxy),
+-- creating the default "ide/nvim" session if none exists.
+function M.ensure_nvim_session()
+	local live = vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null")
+	for _, s in ipairs(live) do
+		if s == "ide/nvim" then
+			vim.fn.system("tmux switch-client -t " .. vim.fn.shellescape(s))
+			return
+		end
+	end
+	for _, s in ipairs(live) do
+		local hidden = s:find("^opencode%-")
+			or s:find("^air%-")
+			or s:find("^browser%-")
+			or s:find("^devproxy%-")
+		if not hidden then
+			vim.fn.system("tmux switch-client -t " .. vim.fn.shellescape(s))
+			return
+		end
+	end
+	vim.fn.system("tmux new-session -ds ide/nvim -c " .. vim.fn.shellescape(vim.fn.expand("~/.config/nvim")))
+	vim.fn.system("tmux switch-client -t ide/nvim")
+end
+
+-- Kill and recreate a live session at a new base path. If we are attached to
+-- the session being recreated, move to a nvim session first (never an
+-- opencode/air session), creating one if needed.
+function M.recreate_session(name, path)
+	if not name or name == "" or not path or path == "" then
+		return
+	end
+	local current = vim.trim(vim.fn.system("tmux display-message -p '#S' 2>/dev/null"))
+	if current == name then
+		M.ensure_nvim_session()
+	end
+	vim.fn.system("tmux kill-session -t=" .. vim.fn.shellescape(name) .. " 2>/dev/null")
+	vim.fn.system(
+		"tmux new-session -ds "
+			.. vim.fn.shellescape(name)
+			.. " -c "
+			.. vim.fn.shellescape(vim.fn.expand(path))
+			.. " 2>/dev/null"
+	)
+	M.invalidate_live()
+	vim.notify("tmux: session '" .. name .. "' recreated at " .. path, vim.log.levels.INFO)
+end
+
+local function refresh_dirs()
+	local scan = require("plenary.scandir")
+	local dirs, seen = {}, {}
+	local function add(d)
+		if d ~= "" and not seen[d] then
+			seen[d] = true
+			table.insert(dirs, d)
+		end
+	end
+	for _, root in ipairs({ vim.fn.getcwd(), vim.fn.expand("~/projects"), vim.fn.expand("~/tools") }) do
+		if vim.fn.isdirectory(root) == 1 then
+			add(root)
+			for _, d in ipairs(scan.scan_dir(root, { depth = 1, only_dirs = true, silent = true })) do
+				add(d)
+			end
+		end
+	end
+	table.sort(dirs)
+	dir_cache = dirs
+	return dirs
+end
+
+-- Fuzzy-searchable path picker. Typing a path that is not in the list and
+-- pressing <CR> accepts the typed text as-is (arbitrary manual paths).
+function M.pick_path(default, callback)
+	local dirs = dir_cache or refresh_dirs()
+	local actions = require("telescope.actions")
+	local state = require("telescope.actions.state")
+	require("telescope.pickers")
+		.new({}, {
+			prompt_title = "Session path",
+			finder = require("telescope.finders").new_table({
+				results = dirs,
+				entry_maker = function(entry)
+					return { value = entry, display = vim.fn.fnamemodify(entry, ":~"), ordinal = entry }
+				end,
+			}),
+			sorter = require("telescope.config").values.generic_sorter({}),
+			attach_mappings = function(prompt_bufnr)
+				actions.select_default:replace(function()
+					local selected = state.get_selected_entry()
+					actions.close(prompt_bufnr)
+					if selected then
+						callback(selected.value)
+					else
+						local typed = table.concat(vim.api.nvim_buf_get_lines(prompt_bufnr, 0, -1, false), "")
+						if typed ~= "" then
+							callback(typed)
+						end
+					end
+				end)
+				return true
+			end,
+		})
+		:find()
+end
+
+local function split_session(line)
+	local raw = vim.trim(line)
+	local name, path = raw:match("^(.-)%s+(.+)$")
+	if not name then
+		return raw, ""
+	end
+	return vim.trim(name), vim.trim(path)
+end
+
+-- A folder row is a single token ending in "/" (e.g. "work/"). A session row
+-- has a whitespace separator, so "test<TAB>/" is a session with path "/".
+local function is_folder(line)
+	local raw = vim.trim(line)
+	return raw:sub(-1) == "/" and not raw:find("%s")
+end
+
+local function parent_of(prefix)
+	if prefix == "" or prefix == nil then
+		return nil
+	end
+	return prefix:match("^(.*)/[^/]+$") or ""
+end
+
+local function close_view(buf)
+	local win = vim.fn.bufwinid(buf)
+	if win ~= -1 then
+		vim.api.nvim_win_close(win, true)
+	end
+	if vim.api.nvim_buf_is_valid(buf) then
+		vim.api.nvim_buf_delete(buf, { force = true })
+	end
+end
+
+function M.open_level(opts)
+	local prefix = opts.prefix or ""
+	local live = opts.live or M.live_sessions
+
+	local function title()
+		if prefix == "" then
+			return opts.title_root or "Browser"
+		end
+		return (opts.title_prefix or opts.title_root or "Browser") .. " / " .. prefix
+	end
+
+	local function render()
+		return opts.render(prefix)
+	end
+
+	local function navigate(child)
+		M.open_level(vim.tbl_extend("force", opts, { prefix = child }))
+	end
+
+	-- prompt_paths is true only for explicit saves (W), so navigation never
+	-- interrupts with path prompts.
+	local function commit(buf, prompt_paths)
+		local ok = opts.commit(prefix, vim.api.nvim_buf_get_lines(buf, 0, -1, false), prompt_paths)
+		if ok then
+			vim.bo[buf].modified = false
+		end
+		return ok
+	end
+
+	local function leave(buf, target)
+		vim.schedule(function()
+			close_view(buf)
+			navigate(target)
+		end)
+	end
+
+	scratchbuf.open({
+		title = title(),
+		lines = render(),
+		close_on_open = false,
+		refresh = function()
+			M.invalidate_live()
+			return render()
+		end,
+		on_open = function(line)
+			local buf = vim.api.nvim_get_current_buf()
+			local raw = vim.trim(line)
+			if is_folder(raw) then
+				local name = vim.trim(raw:sub(1, -2))
+				if name == "" then
+					return
+				end
+				if commit(buf, false) then
+					leave(buf, prefix == "" and name or (prefix .. "/" .. name))
+				end
+				return
+			end
+			local name, path = split_session(raw)
+			if name ~= "" then
+				local ok = opts.open_session(name, path, prefix)
+				if ok then
+					vim.schedule(function()
+						close_view(buf)
+					end)
+				end
+			end
+		end,
+		on_save = function()
+			local buf = vim.api.nvim_get_current_buf()
+			local ok = commit(buf, true)
+			if ok and opts.on_commit then
+				opts.on_commit(prefix)
+			end
+			if ok and opts.on_missing_paths then
+				opts.on_missing_paths(buf, prefix)
+			end
+			return ok == true
+		end,
+		on_ready = function(buf)
+			local ns = vim.api.nvim_create_namespace("tmux_browser_" .. buf)
+
+			local function decorate()
+				vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+				local live_set = live()
+				for row, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+					local text = vim.trim(line)
+					if text ~= "" then
+						if is_folder(text) then
+							vim.api.nvim_buf_add_highlight(buf, ns, "Directory", row - 1, 0, -1)
+						else
+							local name = text:match("^(.-)%s") or text
+							local marker = live_set[name] and " ●" or " ○"
+							local hl = live_set[name] and "DiagnosticOk" or "Comment"
+							vim.api.nvim_buf_set_extmark(buf, ns, row - 1, 0, {
+								virt_text = { { marker, hl } },
+								virt_text_pos = "eol",
+							})
+						end
+					end
+				end
+			end
+
+			decorate()
+			vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+				buffer = buf,
+				callback = decorate,
+			})
+
+			local function go_parent()
+				local parent = parent_of(prefix)
+				if parent == nil then
+					return
+				end
+				if commit(buf, false) then
+					leave(buf, parent)
+				end
+			end
+
+			vim.keymap.set("n", "-", go_parent, {
+				buffer = buf,
+				nowait = true,
+				noremap = true,
+				desc = "Parent level",
+			})
+
+			vim.keymap.set("n", "<C-l>", function()
+				M.invalidate_live()
+				vim.api.nvim_buf_set_lines(buf, 0, -1, false, render())
+				vim.bo[buf].modified = false
+				decorate()
+			end, { buffer = buf, nowait = true, noremap = true, desc = "Refresh level" })
+
+			-- <leader>e mirrors "-" (parent level) instead of leaking to oil.
+			vim.keymap.set("n", "<leader>e", go_parent, {
+				buffer = buf,
+				nowait = true,
+				noremap = true,
+				desc = "Parent level",
+			})
+
+			-- Tab jumps between the name and path fields of a session row.
+			local function toggle_field()
+				local line = vim.api.nvim_get_current_line()
+				local row = vim.api.nvim_win_get_cursor(0)[1]
+				local col = vim.api.nvim_win_get_cursor(0)[2]
+				local ws_start, ws_end = line:find("%s+")
+				if not ws_start then
+					return
+				end
+				local target = col < ws_start - 1 and ws_end or 0
+				vim.api.nvim_win_set_cursor(0, { row, target })
+			end
+			vim.keymap.set("n", "<Tab>", toggle_field, {
+				buffer = buf,
+				nowait = true,
+				noremap = true,
+				desc = "Toggle name/path",
+			})
+			vim.keymap.set("i", "<Tab>", toggle_field, {
+				buffer = buf,
+				nowait = true,
+				noremap = true,
+				desc = "Toggle name/path",
+			})
+
+			local function paste(above)
+				local raw = vim.fn.getreg('"')
+				if raw == "" then
+					vim.notify("tmux browser: register empty", vim.log.levels.WARN)
+					return
+				end
+				local lnum = vim.api.nvim_win_get_cursor(0)[1]
+				local at = above and (lnum - 1) or lnum
+				vim.api.nvim_buf_set_lines(buf, at, at, false, { raw })
+				vim.bo[buf].modified = true
+				decorate()
+			end
+
+			vim.keymap.set("n", "gp", function()
+				paste(false)
+			end, { buffer = buf, nowait = true, noremap = true, desc = "Paste below" })
+			vim.keymap.set("n", "gP", function()
+				paste(true)
+			end, { buffer = buf, nowait = true, noremap = true, desc = "Paste above" })
+
+			if opts.on_ready then
+				opts.on_ready(buf, prefix)
+			end
+		end,
+	})
+end
+
+return M

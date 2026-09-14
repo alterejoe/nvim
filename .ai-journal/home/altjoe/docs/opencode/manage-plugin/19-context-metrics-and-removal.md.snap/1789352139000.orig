@@ -1,0 +1,148 @@
+# /home/altjoe/docs/opencode/manage-plugin/19-context-metrics-and-removal.md FINAL
+---
+title: 19 — Context Metrics and Removal (C1–C3)
+status: active
+links: [03-proposals, 10-skills-gating, 11-nvim-companion, 18-staged-workflow]
+---
+
+# Context Metrics and Removal — measure, remove, evaluate
+
+Status: **active** — C1 and C2 are built and exercised; C3 is the next slice.
+
+Implements the intent-network measurement family (../intent-network/04-sidecar,
+05-evaluation-layer, 08-context-mechanisms) inside the manage plugin +
+state.db. Supersedes doc 18's S4 (digests + prune — the compacting half is
+C2) and S6 (skill tiers — reduced to machine tags), and doc 10 (skills
+gating — reduced to capture plus optional validation). Wording/injection is
+deliberately not the mechanism: intent is measured, not prompted.
+
+## As built
+
+| Piece | State |
+|---|---|
+| C1 capture (turn_metrics, context_events) | live — verified: 32 turns, 44 tool calls, 8 proposals recorded in one session store |
+| C1 read (`:ManageMetrics`, `metrics.turns/events`) | live — colon-call driver fix required first |
+| C2 prune request + shaped compaction | live — requests and consumes recorded; compaction effect confirmed via token columns on following turns |
+| C2 interface (`<leader>at`, `:ManagePrune`) | built — persistent two-pane viewer over turns + per-turn event windows |
+| C3 evaluation | pending |
+
+Two driver bugs had to die first, both silent: the lsqlite3-style API
+(`db:exec`/`db:prepare`) does not exist in kkharji/sqlite.lua, and
+`sqlite.open(path)` (dot-call) passes no self — sqlite.lua then falls back to
+an in-memory DB. Both fixed; the store now persists for nvim and plugin
+alike. Plugin-side, `node:sqlite` does not exist under Bun — the shared
+lib/sqlite.ts loader picks `bun:sqlite` or `node:sqlite` at runtime.
+
+## The problem
+
+Context only grows. Every turn adds tool output, dead ends, superseded code,
+and plan text; nothing removes any of it. Removal must be structural and its
+effect measurable, or it is theater.
+
+## Architecture
+
+```
+session events ──► manage.ts hooks ──► state.db (turn_metrics, context_events, verdicts)
+                                              │
+                    nvim console ◄────────────┤  :ManageMetrics · <leader>at
+                                              │
+nvim :ManagePrune ──► prune_request row ──► plugin claims on next message
+                                              │
+                     experimental.session.compacting shapes ──► client.session.summarize
+```
+
+- Capture is plugin-only (event + tool hooks). No new process.
+- Storage is the existing `state.db` (project + global), additive tables.
+- Removal reads metrics + verdicts; it never asks the model to decide.
+
+## C1 — Measure (built)
+
+| Table | Row per | Columns |
+|---|---|---|
+| turn_metrics | assistant message (upsert by message_id) | session_id, message_id, ts, tokens_input/output/reasoning, cache_read/write, model, agent |
+| context_events | notable act | session_id, ts, kind (tool_call / skill_load / proposal / registry_proposal / prune_request / prune_consumed), detail, subject |
+
+Capture points: `message.updated` (assistant usage), `tool.execute.after`
+(tool calls), `tool.execute.before` on `skill` (skill loads), proposal and
+registry emits. Reads: `:ManageMetrics` (one-shot) and `<leader>at` (viewer,
+below). Aggregation views: `v_session_growth`, `v_tool_usage`.
+
+Skills policy manifest (tags only) remains optional and unbuilt; when it
+exists, `context_events.subject` attributes skill loads.
+
+## C2 — Remove (built, coarse first)
+
+The flow, as implemented:
+
+1. In nvim: `:ManagePrune [note]` — writes one `prune_request` event into
+   `context_events`. No side effects on opencode until claimed.
+2. On the next user message, the plugin claims the request (newest request
+   newer than newest consume): `prune_consumed` row + in-memory flag.
+3. `experimental.session.compacting` then shapes that compaction: keep
+   verified state, accepted/rejected outcomes, decisions, changed paths,
+   open questions, the current task; drop exploration, superseded code and
+   plans, tool noise.
+4. `client.session.summarize({ path: { id } })` triggers the compaction. On
+   failure the request is kept and retried on the next message (log:
+   `[manage] prune: summarize failed`).
+
+Acceptance: `cache_read` / `tokens_input` in `turn_metrics` shrink on the
+turns following a prune; the viewer shows request → consume directly.
+
+Honest limit: this pass compacts the whole session with keep/drop
+instructions — coarse. Selective removal (rewriting old message ranges via
+`messages.transform`) is the finer pass, deliberately later.
+
+## Interface
+
+- `<leader>at` — metrics viewer: turns list (time · in · out · cache),
+  detail pane shows the selected turn's metadata plus every context event in
+  its window (between the previous turn and this one), winbar shows totals
+  and prune status. Keys: `j/k`, `r`, `Q`.
+- `:ManageMetrics` — one-shot summary in `:messages`.
+- `:ManagePrune [note]` — request a prune.
+- Errors and driver messages: `:messages` (verdicts/metrics notify at ERROR
+  level; there is no silent fail-open in the nvim store anymore).
+
+## C3 — Evaluate (pending)
+
+Derived stats from verdicts + turn_metrics (SQL, no model): per-path
+verdict counts and recency; per-group acceptance rate; per-prune
+effectiveness (did corrections on pruned content follow). Feeds retention
+tiers (intent-network 08 section 3). Explainable stats only; mechanism
+promotion/demotion (05) later.
+
+## Honest limits
+
+- Compaction verification: the summarize call returns success; whether the
+  visible compaction ran is confirmed by the following turns' token columns
+  and the TUI's compaction marker.
+- Token metrics depend on provider usage fields; absent fields are skipped.
+- Removal is structural first: verified slices, verdict history, recency.
+- Continuous verdict capture (every user message, not just proposal
+  completions) with origin weights — proposal outcomes high-confidence,
+  conversation signals review-gated — is the queued follow-up in the
+  intent-network verdict docs (10/11), not this doc.
+
+## Slices
+
+| Slice | Content | State |
+|---|---|---|
+| **C1** | metrics capture + read interface | done |
+| **C2** | prune request + shaped compaction | done (coarse) |
+| **C3** | verdict-derived stats + retention candidates | next |
+
+## Open questions
+
+1. Prune trigger: manual only for now; token-threshold automatic comes only
+   after C3 shows the stats.
+2. Protected window: last N turns untouched — relevant to the selective
+   (messages.transform) pass.
+3. Selective removal pass: when C2's measured effect justifies the risk.
+
+## Related
+
+- ../intent-network/04-sidecar, 05-evaluation-layer, 08-context-mechanisms
+- [18-staged-workflow](18-staged-workflow.md) — S4 implemented here as C2
+- [10-skills-gating](10-skills-gating.md) — reduced to tags + validation
+- [11-nvim-companion](11-nvim-companion.md) — the viewer family

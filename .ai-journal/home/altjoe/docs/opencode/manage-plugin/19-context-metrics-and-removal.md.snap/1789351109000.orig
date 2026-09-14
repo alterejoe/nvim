@@ -1,0 +1,156 @@
+# /home/altjoe/docs/opencode/manage-plugin/19-context-metrics-and-removal.md FINAL
+---
+title: 19 — Context Metrics and Removal (C1–C3)
+status: proposed
+links: [03-proposals, 10-skills-gating, 11-nvim-companion, 18-staged-workflow]
+---
+
+# Context Metrics and Removal — measure, remove, evaluate
+
+Status: proposed — nothing built. This implements the intent-network's
+measurement family (../intent-network/04-sidecar, 05-evaluation-layer,
+08-context-mechanisms) inside the manage plugin + state.db.
+
+Supersedes: doc 18's S4 (digests + prune, implemented here as C2) and S6
+(skill tiers — reduced to machine tags), and doc 10 (skills gating — reduced
+to capture plus optional validation). Wording/injection is deliberately not
+the mechanism: intent is measured, not prompted.
+
+## The problem
+
+Context only grows. Every turn adds tool output, dead ends, superseded code,
+and plan text; nothing removes any of it. Injected prose ("stay in scope",
+skill routing hints) is a nudge the model may ignore — the framework verdict:
+intent must be a measured quantity, not a prompt. Removal must be structural
+and its effect must be measurable, or it is theater.
+
+## What exists today (verified)
+
+| Layer | State |
+|---|---|
+| Verdict events (accept/reject/correct/abort) in `state.db` | working (S0, 2026-09-13) |
+| Proposals + journal | working |
+| Token/context metrics | none — the SDK exposes per-message tokens; nothing records them |
+| Removal mechanisms | none — no prune, no compaction shaping |
+| Evaluation / retention tiers | none — docs only (intent-network 04/05/08) |
+
+## Architecture
+
+```
+session events ──► manage.ts hooks ──► state.db (turn_metrics, context_events, verdicts)
+                                              │
+                    nvim console reads ◄──────┘
+                                              │
+plugin hooks (messages.transform, compacting) ◄── removal reads metrics + verdicts
+```
+
+- Capture is plugin-only (event hook + tool hooks). No new process.
+- Storage is the existing `state.db` (project + global), additive tables only.
+- Removal reads metrics + verdicts; it never asks the model to decide.
+
+## C1 — Measure (automatic)
+
+Additive tables (`CREATE TABLE IF NOT EXISTS` on both sides):
+
+| Table | Row per | Columns |
+|---|---|---|
+| turn_metrics | assistant message (upsert by message_id) | session_id, message_id, ts, tokens_input, tokens_output, cache_read, cache_write, model, agent |
+| context_events | notable act | session_id, ts, kind (tool_call / skill_load / proposal / prune / compaction), detail, subject |
+
+Capture points in manage.ts (all existing hooks):
+- `event` on `message.updated` — assistant token usage; fail-open when a
+  provider omits usage fields.
+- `tool.execute.after` — tool name + result status (no payload bodies).
+- `tool.execute.before` on `skill` — skill name, plus subject tags from the
+  policy manifest below.
+- `emit_proposal` / `registry_propose` execute — one context_event row
+  alongside the queue write.
+- Verdicts stay in the verdicts table; evaluation reads them, no duplication.
+
+Aggregation: SQL views (`v_session_growth`, `v_tool_usage`) so the plugin and
+nvim read the same numbers; no cached copies.
+
+**Skills policy manifest** (the only skill change): `skills.policy.json`
+(global + optional per-project merge) mapping `skill -> { subject[] }` —
+machine tags so skill loads are attributable. No routing prose, no tier
+injection. Structured validation of skills remains optional here.
+
+Acceptance (runtime, not doc status): after a >3-turn session,
+`turn_metrics` has one row per assistant message with non-zero tokens, and
+the growth curve is queryable per session.
+
+## C2 — Remove (the first real mechanism)
+
+Removal levers (plugin-only, verified in the SDK):
+
+- `experimental.session.compacting` — shape compaction: inject slice digests
+  and the instruction to drop exploration and superseded code while keeping
+  verified state.
+- `experimental.chat.messages.transform` — coarse removal on the outgoing
+  array: replace old, verified-slice text parts with their digest; never
+  touch the last N turns; never touch toolcall/result pairs until proven;
+  fail-open (any error returns the array unmodified).
+- Trigger: user action in the nvim console first (deterministic); an
+  automatic token-threshold trigger only after the manual path proves safe.
+
+Prune candidates come from data, not judgment: proposal groups that are
+verified (S0 readback) and older than K turns; paths whose verdict history is
+rejected or corrected; content superseded by a later accepted proposal.
+
+Digests (doc 18 S4): written at verify time — files changed with hashes,
+decisions, verified checks, superseded approaches. The digest is what
+survives; detail is what goes.
+
+Acceptance: with C1 running, input tokens per call drop measurably after a
+prune on a long session; the digest still appears in the injection; no call
+errors originate from the transform.
+
+## C3 — Evaluate (feed removal)
+
+Derived stats from verdicts + turn_metrics (SQL, no model):
+
+- per path: accepted/corrected/rejected counts, last-verdict ts, recency
+  weight; repeated corrections are negative.
+- per group: acceptance rate (proposal quality).
+- per prune: did corrections on pruned content follow? (prune effectiveness —
+  a negative signal feeds the next retention decision).
+
+These feed retention tiers (intent-network 08 section 3, "user control
+overrides"): high-weight objects (frequent + accepted) are protected;
+low-weight objects (single occurrence + corrected/rejected) become C2's
+prune candidates. Promotion/demotion of mechanisms (05) is explicitly later —
+C3 ships explainable stats only.
+
+Acceptance: the stats view is non-empty after any verdicts; every prune
+candidate list is explainable by row ("rejected, one occurrence").
+
+## Honest limits
+
+- Removal is structural first: verified slices, verdict history, recency.
+  Deciding what is unnecessary by meaning stays judgment; we do not pretend
+  otherwise.
+- Token metrics depend on provider usage fields; absent fields are skipped.
+- `messages.transform` rewriting is powerful and risky — bounded scope and
+  fail-open are requirements, not options.
+
+## Slices
+
+| Slice | Content | Effort |
+|---|---|---|
+| **C1** | metrics tables + capture + views + policy manifest (tags only) | Short |
+| **C2** | prune + compaction shaping, user-triggered, metric-proven | Medium |
+| **C3** | verdict-derived stats + retention candidates feeding C2 | Medium |
+
+Kill switch after each; each slice is independently useful.
+
+## Open questions
+
+1. Prune trigger: manual console only for C2, or also a token threshold?
+2. Protected window: last N turns untouched (start with N = 6)?
+3. Skill subject tags: keep for attribution, or defer entirely?
+
+## Related
+
+- ../intent-network/04-sidecar, 05-evaluation-layer, 08-context-mechanisms
+- [18-staged-workflow](18-staged-workflow.md) — S4 implemented here as C2
+- [10-skills-gating](10-skills-gating.md) — reduced to tags + validation

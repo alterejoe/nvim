@@ -1,0 +1,23 @@
+local tmux = require("tmux_projects")
+
+tmux.setup({
+	project_order = { "hookit", "volleyball" },
+	projects = {
+		hookit = {
+			{ name = "hookit", path = "~/projects/hookit/" },
+		},
+
+		volleyball = {
+			{ name = "volleyall", path = "~/projects/volleyball/" },
+		},
+		-- side = {
+		-- 	{ name = "blog", path = "~/projects/blog" },
+		-- },
+	},
+	default = {
+		{ name = "ide/nvim", path = "~/.config/nvim" },
+	},
+})
+
+vim.keymap.set("n", "<leader>tp", tmux.pick_project, { desc = "Tmux switch project" })
+vim.keymap.set("n", "<leader>tP", tmux.recover_project, { desc = "Tmux recover project" })

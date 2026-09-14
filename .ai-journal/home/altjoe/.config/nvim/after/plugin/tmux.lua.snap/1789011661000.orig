@@ -1,0 +1,23 @@
+-- after/plugin/tmux.lua FINAL
+local tmux = require("tmux_projects")
+
+tmux.setup({
+	project_order = { "hookit", "volleyball" },
+	projects = {
+		hookit = {
+			{ name = "hookit", path = "~/projects/hookit/" },
+		},
+		volleyball = {
+			{ name = "volleyall", path = "~/projects/volleyball/" },
+		},
+	},
+	default = {
+		{ name = "ide/nvim", path = "~/.config/nvim" },
+	},
+})
+
+-- Both keys open the same project scratchbuf. Project folders are internal
+-- scratchbuf containers; the legacy live-session editor is no longer on ts.
+vim.keymap.set("n", "<leader>tp", tmux.pick_project, { desc = "Project browser" })
+vim.keymap.set("n", "<leader>ts", tmux.pick_project, { desc = "Project browser" })
+vim.keymap.set("n", "<leader>tP", tmux.recover_project, { desc = "Tmux recover project" })

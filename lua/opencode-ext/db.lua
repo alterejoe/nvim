@@ -1,4 +1,4 @@
--- /home/jmeyer/.config/nvim/lua/opencode-ext/db.lua FINAL-6
+-- /home/altjoe/.config/nvim/lua/opencode-ext/db.lua FINAL
 local DB_PATH = vim.fn.expand("~/.local/share/opencode/opencode.db")
 local M = {}
 
@@ -35,6 +35,9 @@ local function db_query_write(sql)
 	return true
 end
 
+--- Fetch session rows with the latest message state for health detection.
+--- Timestamps remain in the database's native units; callers normalize them.
+--- @return table[]|nil, string|nil
 function M.fetch_sessions()
 	local sql = [[
 		SELECT json_group_array(json_object(
@@ -44,14 +47,26 @@ function M.fetch_sessions()
 			'time_created', s.time_created,
 			'time_updated', s.time_updated,
 			'msg_count', (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id),
+			'last_role', (SELECT json_extract(m.data, '$.role')
+				FROM message m WHERE m.session_id = s.id
+				ORDER BY m.time_created DESC, m.id DESC LIMIT 1),
+			'last_message_created', (SELECT m.time_created
+				FROM message m WHERE m.session_id = s.id
+				ORDER BY m.time_created DESC, m.id DESC LIMIT 1),
+			'last_completed', (SELECT json_extract(m.data, '$.time.completed')
+				FROM message m WHERE m.session_id = s.id
+				ORDER BY m.time_created DESC, m.id DESC LIMIT 1),
+			'last_error', (SELECT json_extract(m.data, '$.error.name')
+				FROM message m WHERE m.session_id = s.id
+				ORDER BY m.time_created DESC, m.id DESC LIMIT 1),
 			'preview', (SELECT json_extract(pr.data, '$.text')
-			            FROM part pr
-			            JOIN message ms ON ms.id = pr.message_id
-			            WHERE ms.session_id = s.id
-			              AND json_extract(pr.data, '$.type') = 'text'
-			              AND json_extract(ms.data, '$.role') = 'user'
-			            ORDER BY ms.time_created ASC, pr.id ASC
-			            LIMIT 1)
+				FROM part pr
+				JOIN message ms ON ms.id = pr.message_id
+				WHERE ms.session_id = s.id
+				  AND json_extract(pr.data, '$.type') = 'text'
+				  AND json_extract(ms.data, '$.role') = 'user'
+				ORDER BY ms.time_created ASC, pr.id ASC
+				LIMIT 1)
 		) ORDER BY s.time_updated DESC)
 		FROM session s
 		JOIN project p ON p.id = s.project_id
@@ -78,15 +93,15 @@ function M.fetch_session(sid)
 			'sid', ']] .. esc .. [[',
 			'label', (SELECT title FROM session WHERE id = ']] .. esc .. [['),
 			'messages', (SELECT json_group_array(
-			                  json_set(json(m.data), '$.id', m.id)
-			             )
+				                  json_set(json(m.data), '$.id', m.id)
+				             )
 			    FROM message m
 			    WHERE m.session_id = ']] .. esc .. [['
 			    ORDER BY m.time_created ASC
 			),
 			'parts', (SELECT json_group_array(
-			                  json_set(json(p.data), '$.message_id', p.message_id, '$.id', p.id)
-			                 )
+				                  json_set(json(p.data), '$.message_id', p.message_id, '$.id', p.id)
+				                 )
 			    FROM part p
 			    WHERE p.session_id = ']] .. esc .. [['
 			    ORDER BY p.message_id ASC, p.id ASC

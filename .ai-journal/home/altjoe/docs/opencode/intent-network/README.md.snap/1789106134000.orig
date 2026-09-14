@@ -1,0 +1,58 @@
+# /home/altjoe/docs/opencode/intent-network/README.md FINAL
+---
+title: Intent Network — Orchestrator Layer (Index)
+status: proposed
+links: [00-doc-conventions, 01-thesis, 02-permissions-tooling, 03-hook-inventory, 04-sidecar, 05-evaluation-layer, 06-structural-tool-layer, 07-playbooks, 08-context-mechanisms, 09-breakpoint-evaluation, 10-verdict-capture]
+---
+
+# Intent Network — Orchestrator Layer
+
+A policy engine that sits between the user and the AI. The core thesis: the
+LLM is the **orchestrator, not the worker**. Real tools (LSP, formatters,
+vuln checks, search) do the work; the AI sequences them; the user's
+expertise — encoded as rules and playbooks — guides the sequencing; an
+evaluation layer measures whether the AI operated the tools the way an
+experienced developer would.
+
+Builds on the manage plugin (the airlock + proposals foundation). The manage
+plugin is the cockpit; this is the navigation system.
+
+## The one-sentence contract
+
+**The AI never does work that tools can do. It sequences tools, guided by
+the user's encoded expertise, under user oversight — and the system
+evaluates whether it operated them correctly.**
+
+## The goal — make things repeated less
+
+The AI never re-walks a rejected path, never re-asks a settled question,
+never re-makes a corrected mistake. Every verdict is recorded once and
+enforced forever. Repetition is the failure mode; the shared store is the
+cure.
+
+## Document map
+
+| Doc | Point |
+|---|---|
+| [00-doc-conventions](00-doc-conventions.md) | How to interact with these docs — add/remove/update rules |
+| [01-thesis](01-thesis.md) | The culmination: why the LLM is an orchestrator, not a worker |
+| [02-permissions-tooling](02-permissions-tooling.md) | Per-project folder permissions + fail-closed rejection for all tool types |
+| [03-hook-inventory](03-hook-inventory.md) | The verified opencode plugin API — every lever, what it can and can't do |
+| [04-sidecar](04-sidecar.md) | The non-LLM analysis process — categorization, metrics over time, intent as a measured quantity |
+| [05-evaluation-layer](05-evaluation-layer.md) | User-centric evaluation — credit assignment, routing, demotion/promotion, LSP diagnostics as objective signals |
+| [06-structural-tool-layer](06-structural-tool-layer.md) | LSP-backed symbol addressing — never line numbers; full-function context; proposal validation at emission |
+| [07-playbooks](07-playbooks.md) | User-defined diagnostic chains, enforced not suggested; negative constraints (disliked patterns) as pinned rules |
+| [08-context-mechanisms](08-context-mechanisms.md) | The mechanism family — retention tiers, summary-drift, density chains, tool pipelines |
+| [09-breakpoint-evaluation](09-breakpoint-evaluation.md) | Watching the thinking — stream observation, alignment checks at tool-call boundaries, action-boundary denial |
+| [10-verdict-capture](10-verdict-capture.md) | T2: the shared SQLite store — accept/reject/correct becomes a verdict, injected back as a constraint |
+
+## Status legend
+
+- **T1** = thesis + conventions (this set) — the anchor
+- **T2** = verdict capture (Short) — the shared store; accept/reject/correct writes verdicts automatically; corrections become structural facts, not prose; recent verdicts injected as constraints (loop-breaking)
+- **T3** = structural tool layer (Medium) — LSP-backed symbol addressing + proposal validation at emission
+- **T4** = sidecar (Medium) — non-LLM analysis process: categorization, metrics over time, intent interpretation
+- **T5** = evaluation layer (Large) — credit assignment, situational routing, mechanism demotion/promotion
+- **T6** = playbooks (Medium) — user-defined diagnostic chains, enforced; negative constraints
+- **T7** = breakpoint evaluation (Medium) — stream observation + action-boundary denial
+- **Stretch** = density chains, retention tiers, summary-drift detection, tool pipelines

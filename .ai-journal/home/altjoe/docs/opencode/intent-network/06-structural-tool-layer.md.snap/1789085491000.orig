@@ -1,0 +1,48 @@
+# /home/altjoe/docs/opencode/intent-network/06-structural-tool-layer.md FINAL
+---
+title: Intent Network — Structural Tool Layer
+status: proposed
+links: [README, 05-evaluation-layer]
+---
+
+# Structural Tool Layer — LSP-backed symbol addressing
+
+The AI cannot read code. It fabricates line numbers the way it fabricates
+everything else — plausibly, not accurately. The fix is to change the
+**addressing scheme**: the AI specifies *what* (symbol, function name), and a
+tool resolves *where* (exact range via LSP). **The AI never touches numbers.**
+
+## The mechanism
+
+A structural tool layer (plugin-side, backed by LSP/tree-sitter):
+
+- `resolve_symbol("UserService", "GetUser")` → exact line range of the
+  function, from the LSP, not from the model
+- `read_function(...)` → the **complete** current function injected as
+  context — the AI edits against the full body, never broken pieces
+- **Proposal validation at emission**: when `emit_proposal` arrives with an
+  edit_range, the plugin checks the range against the real structure — does
+  it align with a function boundary? does the proposed content have balanced
+  brackets? does the result parse? Bad proposals are rejected *before* they
+  reach the review queue
+- **Post-accept diagnostics**: after an accept, run LSP diagnostics on the
+  file — syntax errors feed the evaluation layer as an objective negative
+
+## What it kills (structurally)
+
+- **Mispaired brackets** — validated by a parser at emission, not by the
+  model's counting. The AI is not good at counting brackets; it never has to be.
+- **Partial functions** — the AI only ever sees and edits full functions.
+  Partial-function updates were never sensible; the tool layer makes them
+  impossible.
+- **Random greps** — the search mechanism gets evaluated against a structural
+  alternative (symbol lookup), and the router promotes whichever actually
+  finds the right context.
+- **Wrong line numbers** — the AI generates symbol references; the tool
+  resolves them. Numbers that "could be anything" never reach the file.
+
+## Feasibility
+
+LSP is already in the stack on both sides — opencode has LSP tools, nvim has
+a full LSP client. The structural layer is a custom tool + a validation hook,
+no new infrastructure. This is the most buildable piece of the whole design.

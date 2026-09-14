@@ -1,0 +1,86 @@
+// /home/altjoe/.config/opencode/plugins/lib/verdicts.ts FINAL
+/**
+ * Verdict store (M2, T2 — 10-verdict-capture.md).
+ * Shared SQLite, same schema as nvim's verdicts.lua. Read-only here:
+ * the nvim viewer writes verdicts; this module reads them for injection.
+ * Fail-open: no store, no node:sqlite, or a busy DB → [].
+ */
+
+import { existsSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
+
+export const VERDICT_SCHEMA = `
+CREATE TABLE IF NOT EXISTS verdicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  session_id TEXT,
+  proposal_id INTEGER,
+  group_name TEXT,
+  path TEXT NOT NULL,
+  operation TEXT,
+  verdict TEXT NOT NULL,
+  reason TEXT,
+  proposed_content TEXT,
+  applied_content TEXT,
+  project TEXT,
+  scope TEXT NOT NULL DEFAULT 'project'
+);
+CREATE INDEX IF NOT EXISTS idx_verdicts_path ON verdicts(path);
+CREATE INDEX IF NOT EXISTS idx_verdicts_ts ON verdicts(ts);
+`;
+
+export interface VerdictRow {
+  path: string;
+  verdict: string;
+  reason: string | null;
+}
+
+/**
+ * Read the most recent verdicts from the project store, then the global
+ * store. Deduped by path+verdict, newest first.
+ */
+export async function loadRecentVerdicts(
+  directory: string,
+  limit: number,
+): Promise<VerdictRow[]> {
+  let DatabaseSync: any;
+  try {
+    ({ DatabaseSync } = await import("node:sqlite"));
+  } catch {
+    return []; // node:sqlite unavailable — fail open, no injection
+  }
+
+  const rows: VerdictRow[] = [];
+  const stores = [
+    join(directory, ".opencode", "state.db"),
+    join(homedir(), ".config", "opencode", "state.db"),
+  ];
+  for (const dbPath of stores) {
+    if (!existsSync(dbPath)) continue;
+    try {
+      const db = new DatabaseSync(dbPath);
+      db.exec(VERDICT_SCHEMA); // ensure schema (no-op when nvim already created it)
+      const stmt = db.prepare(
+        "SELECT path, verdict, reason FROM verdicts ORDER BY ts DESC LIMIT ?",
+      );
+      for (const row of stmt.all(limit) as VerdictRow[]) {
+        rows.push(row);
+      }
+      db.close();
+    } catch {
+      // busy/corrupt — skip this store, never crash the session
+    }
+  }
+
+  const seen = new Set<string>();
+  const out: VerdictRow[] = [];
+  for (const r of rows) {
+    const key = r.path + "|" + r.verdict;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+    if (out.length >= limit) break;
+  }
+  return out;
+}

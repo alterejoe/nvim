@@ -1,0 +1,165 @@
+// /home/altjoe/.config/opencode/plugins/lib/metrics.ts FINAL
+/**
+ * Context metrics store (doc 19, C1). Same shared SQLite file as the verdict
+ * store (.opencode/state.db), additive tables only. Writes only — nvim and
+ * the future removal mechanisms (C2) are the readers.
+ *
+ * Captured from hooks the manage plugin already runs:
+ *   - turn_metrics   <- message.updated (assistant token usage, upsert by message id)
+ *   - context_events <- tool.execute.after, skill loads, proposal emits
+ *
+ * Fail-open: no node:sqlite, a busy DB, or a bad row -> no-op, never a crash.
+ * Driver failure is logged once so an empty metrics table has a visible cause.
+ * Unlike the verdict reader (which only opens existing stores), this CREATES
+ * the store on first write so measurement starts at turn one.
+ */
+
+import { mkdirSync } from "fs";
+import { join } from "path";
+
+export const METRICS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS turn_metrics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  message_id TEXT NOT NULL UNIQUE,
+  ts INTEGER NOT NULL,
+  tokens_input INTEGER,
+  tokens_output INTEGER,
+  tokens_reasoning INTEGER,
+  cache_read INTEGER,
+  cache_write INTEGER,
+  model TEXT,
+  agent TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_turn_metrics_session ON turn_metrics(session_id, ts);
+
+CREATE TABLE IF NOT EXISTS context_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT,
+  ts INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  detail TEXT,
+  subject TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_context_events_session ON context_events(session_id, ts);
+CREATE INDEX IF NOT EXISTS idx_context_events_kind ON context_events(kind, ts);
+
+DROP VIEW IF EXISTS v_session_growth;
+CREATE VIEW v_session_growth AS
+  SELECT session_id, ts, message_id, tokens_input, tokens_output, tokens_reasoning,
+         cache_read, cache_write, model
+  FROM turn_metrics
+  ORDER BY session_id, ts;
+
+DROP VIEW IF EXISTS v_tool_usage;
+CREATE VIEW v_tool_usage AS
+  SELECT session_id, detail AS tool, COUNT(*) AS calls, MAX(ts) AS last_ts
+  FROM context_events
+  WHERE kind = 'tool_call'
+  GROUP BY session_id, detail
+  ORDER BY calls DESC;
+`;
+
+let DatabaseSync: any;
+let driverWarned = false;
+
+async function loadDriver(): Promise<boolean> {
+  if (DatabaseSync) return true;
+  try {
+    ({ DatabaseSync } = await import("node:sqlite"));
+    return true;
+  } catch {
+    if (!driverWarned) {
+      driverWarned = true;
+      console.error(
+        "[manage] metrics: node:sqlite unavailable — context metrics disabled in this runtime",
+      );
+    }
+    return false;
+  }
+}
+
+function openStore(directory: string): any | null {
+  try {
+    mkdirSync(join(directory, ".opencode"), { recursive: true });
+    const db = new DatabaseSync(join(directory, ".opencode", "state.db"));
+    db.exec(METRICS_SCHEMA);
+    return db;
+  } catch {
+    return null;
+  }
+}
+
+function num(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/**
+ * Upsert one assistant message's token usage. Called on every
+ * message.updated for assistant messages; the message id makes the latest
+ * (final) values win over streaming partial updates.
+ */
+export async function recordTurn(directory: string, info: any): Promise<void> {
+  try {
+    if (!info || info.role !== "assistant") return;
+    if (!(await loadDriver())) return;
+    const t = info.tokens || {};
+    const cache = t.cache || {};
+    const sessionID = info.sessionID;
+    const messageID = info.id;
+    if (!sessionID || !messageID) return;
+    const db = openStore(directory);
+    if (!db) return;
+    try {
+      db.prepare(
+        "INSERT INTO turn_metrics " +
+          "(session_id, message_id, ts, tokens_input, tokens_output, tokens_reasoning, " +
+          "cache_read, cache_write, model, agent) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+          "ON CONFLICT(message_id) DO UPDATE SET " +
+          "ts=excluded.ts, tokens_input=excluded.tokens_input, tokens_output=excluded.tokens_output, " +
+          "tokens_reasoning=excluded.tokens_reasoning, cache_read=excluded.cache_read, " +
+          "cache_write=excluded.cache_write, model=excluded.model, agent=excluded.agent",
+      ).run(
+        sessionID,
+        messageID,
+        num(info.time && info.time.created) ?? Date.now(),
+        num(t.input),
+        num(t.output),
+        num(t.reasoning),
+        num(cache.read),
+        num(cache.write),
+        typeof info.modelID === "string" ? info.modelID : null,
+        typeof info.mode === "string" ? info.mode : null,
+      );
+    } finally {
+      db.close();
+    }
+  } catch {
+    // fail-open: metrics must never break a turn
+  }
+}
+
+/** Append one notable context event (tool call, skill load, proposal, prune). */
+export async function recordEvent(
+  directory: string,
+  sessionID: string | null,
+  kind: string,
+  detail?: string | null,
+  subject?: string | null,
+): Promise<void> {
+  try {
+    if (!(await loadDriver())) return;
+    const db = openStore(directory);
+    if (!db) return;
+    try {
+      db.prepare(
+        "INSERT INTO context_events (session_id, ts, kind, detail, subject) VALUES (?, ?, ?, ?, ?)",
+      ).run(sessionID, Date.now(), kind, detail ?? null, subject ?? null);
+    } finally {
+      db.close();
+    }
+  } catch {
+    // fail-open
+  }
+}

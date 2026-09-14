@@ -1,0 +1,603 @@
+-- opencode-manage.reviewview.render — list + preview rendering.
+-- Row classification (row_state), the CURRENT/AFTER preview panes, and
+-- the list. Pure-ish: takes the shared state table as a parameter.
+
+local diff = require("opencode-manage.reviewview.diff")
+
+local M = {}
+
+local FILTER_LABELS = {
+	all = "🌐 ALL",
+	session = "🗂 SESSION (in cwd)",
+	files = "📄 FILES (in cwd)",
+	neither = "🚫 NEITHER (foreign session+files)",
+}
+
+--- Resolve a proposal path to absolute.
+--- @param p table
+--- @return string
+function M.resolve_path(p)
+	if p.path:sub(1, 1) == "/" then
+		return p.path
+	end
+	if p._file then
+		return vim.fn.fnamemodify(p._file, ":h:h") .. "/" .. p.path
+	end
+	return vim.fn.getcwd() .. "/" .. p.path
+end
+
+--- Does the file on disk already contain exactly what the proposal wants?
+--- Trailing-newline-insensitive. Only meaningful for create/replace
+--- (full-content ops); edit_range blocks can't be compared this way.
+--- @param p table
+--- @param path string
+--- @return boolean
+function M.content_matches(p, path)
+	if not p.content then
+		return false
+	end
+	if vim.fn.filereadable(path) ~= 1 then
+		return false
+	end
+	local disk = table.concat(vim.fn.readfile(path), "\n"):gsub("\n+$", "")
+	local proposed = p.content:gsub("\n+$", "")
+	return disk == proposed
+end
+
+--- Was the target file modified AFTER the proposal was created?
+--- Content equality is checked BEFORE this (see row_state), so a manual
+--- apply with exact proposal content never flags rerun. Second-granularity:
+--- ext4 mtime resolution is 1s; equal-second is ambiguous and treated as
+--- not-modified (conservative).
+--- @param p table
+--- @param path string
+--- @return boolean
+function M.file_modified_since(p, path)
+	if not p.ts or p.ts == 0 then
+		return false
+	end
+	local stat = vim.loop.fs_stat(path)
+	if not stat then
+		return false
+	end
+	return stat.mtime.sec > math.floor(p.ts / 1000)
+end
+
+--- Classify a proposal's state by comparing the proposal against the ACTUAL
+--- file on disk: content first (bytes are truth), then mtime (context
+--- staleness), then existence/op structure.
+--- @param p table
+--- @return string  "new" | "edit" | "rerun" | "delete" | "applied" | "rejected" | "mismatch"
+function M.row_state(p)
+	local st = p.status or "pending"
+
+	-- Explicitly rejected is final, regardless of disk
+	if st == "rejected" then
+		return "rejected"
+	end
+
+	-- Accepted is done — the disk state no longer matters for the label.
+	if st == "accepted" then
+		return "applied"
+	end
+
+	local path = M.resolve_path(p)
+	local exists = vim.fn.filereadable(path) == 1
+
+	-- delete/move: applied once the file is gone (moved to _old/)
+	if p.operation == "delete" then
+		if exists then
+			return "delete"
+		end
+		return "applied" -- already moved / gone
+	end
+
+	-- create/replace: content equality is the ground truth
+	if p.operation == "create" or p.operation == "replace" then
+		if exists and M.content_matches(p, path) then
+			return "applied" -- the file already IS the proposal
+		end
+		if exists then
+			if p.operation == "create" then
+				return "mismatch" -- create on an existing file that differs
+			end
+			-- replace: file exists and differs — context staleness decides
+			if M.file_modified_since(p, path) then
+				return "rerun" -- file changed after the proposal was authored
+			end
+			return "edit"
+		end
+		if p.operation == "create" then
+			return "new"
+		end
+		return "mismatch" -- replace on a missing file
+	end
+
+	-- edit_range: can't content-compare a partial block; existence + mtime.
+	-- The mtime gate matters MORE here — it's the only staleness signal.
+	if exists then
+		if M.file_modified_since(p, path) then
+			return "rerun"
+		end
+		return "edit"
+	end
+	return "mismatch"
+end
+
+--- Precompute the derived state for every item. Called once per refresh —
+--- the ONLY place row_state runs. Rendering reads state.row_states.
+--- @param state table
+function M.compute_row_states(state)
+	state.row_states = {}
+	for i, p in ipairs(state.items) do
+		state.row_states[i] = M.row_state(p)
+	end
+end
+
+--- Human-readable tag for a derived state (shown in the row's [tag]).
+--- @param st string
+--- @return string
+function M.state_tag(st)
+	local tags = {
+		applied = "applied",
+		edit = "edit",
+		rerun = "rerun",
+		new = "new",
+		delete = "delete",
+		rejected = "rejected",
+		mismatch = "mismatch",
+	}
+	return tags[st] or st
+end
+
+--- The highlight group for a row state.
+--- @param st string
+--- @return string
+function M.hl_for(st)
+	return "Manage" .. st:sub(1, 1):upper() .. st:sub(2)
+end
+
+--- @param sid string|nil
+--- @return string
+function M.short_sid(sid)
+	if not sid then
+		return "?"
+	end
+	return sid:sub(-8)
+end
+
+--- Compact "when" stamp for a proposal's epoch-millis ts.
+--- @param ts number|nil
+--- @return string
+function M.fmt_when(ts)
+	if not ts or ts == 0 then
+		return "?"
+	end
+	return os.date("%m-%d %H:%M", math.floor(ts / 1000))
+end
+
+--- The exact content a proposal would write to disk, computed against the
+--- CURRENT file at call time (range-apply for edit_range, full content for
+--- create/replace). nil for delete rows (they move, not write).
+--- @param p table
+--- @param path string
+--- @return string|nil
+function M.after_content(p, path)
+	if p.operation == "delete" then
+		return nil
+	end
+	local disk = {}
+	if vim.fn.filereadable(path) == 1 then
+		disk = vim.fn.readfile(path)
+	end
+	local lines
+	if p.operation == "edit_range" and p.start_line then
+		local block = vim.split(p.content or "", "\n", { plain = true })
+		if block[#block] == "" then
+			table.remove(block)
+		end
+		local s = math.max(1, math.floor(p.start_line or 1))
+		local e = math.max(s, math.floor(p.end_line or s))
+		lines = {}
+		for i = 1, math.min(s - 1, #disk) do
+			lines[#lines + 1] = disk[i]
+		end
+		for _, l in ipairs(block) do
+			lines[#lines + 1] = l
+		end
+		for i = e + 1, #disk do
+			lines[#lines + 1] = disk[i]
+		end
+	else
+		lines = vim.split(p.content or "", "\n", { plain = true })
+		if lines[#lines] == "" then
+			table.remove(lines)
+		end
+	end
+	return table.concat(lines, "\n")
+end
+
+--- Render CURRENT (left) vs AFTER (right) for the selected proposal.
+--- For edit_range: LEFT = unified diff (- removed / + added, red/green),
+--- RIGHT = the full file with the range applied (editable — da writes it).
+--- For create/replace: LEFT = unified diff (disk vs proposed), RIGHT =
+--- proposed content. Panes open at the first change; [ / ] jumps hunks.
+--- @param state table
+function M.render_previews(state)
+	if not state.cur_buf or not vim.api.nvim_buf_is_valid(state.cur_buf) then
+		return
+	end
+	local p = state.items[state.idx]
+	if not p then
+		return
+	end
+	local path = M.resolve_path(p)
+	local is_delete = p.operation == "delete"
+	local is_range = p.operation == "edit_range" and p.start_line ~= nil
+
+	local cur_lines, after_lines
+	local after_span -- 1-based inclusive line span of the added block
+	local first_change -- diff line of the first change (create/replace rows)
+	local first_added -- proposed-content line of the first added line
+
+	if is_delete and vim.fn.filereadable(path) == 1 then
+		cur_lines = vim.fn.readfile(path)
+		after_lines = { "<moved to _old> — da prompts the move" }
+	else
+		local disk = {}
+		if vim.fn.filereadable(path) == 1 then
+			disk = vim.fn.readfile(path)
+		end
+		if is_range then
+			-- AFTER = full file with the range replaced; the preview IS the
+			-- file da writes, so a partial can never truncate anything.
+			local block = vim.split(p.content or "", "\n", { plain = true })
+			if block[#block] == "" then
+				table.remove(block)
+			end
+			local s = math.max(1, math.floor(p.start_line or 1))
+			local e = math.max(s, math.floor(p.end_line or s))
+			local head, tail = {}, {}
+			for i = 1, math.min(s - 1, #disk) do
+				head[i] = disk[i]
+			end
+			for i = e + 1, #disk do
+				tail[#tail + 1] = disk[i]
+			end
+			after_lines = {}
+			for _, l in ipairs(head) do
+				after_lines[#after_lines + 1] = l
+			end
+			for _, l in ipairs(block) do
+				after_lines[#after_lines + 1] = l
+			end
+			for _, l in ipairs(tail) do
+				after_lines[#after_lines + 1] = l
+			end
+			if #block > 0 then
+				after_span = { s, math.min(s + #block - 1, #after_lines) }
+			end
+
+			-- LEFT pane = the DIFF ITSELF: hunk header, a little context,
+			-- removed lines (-, red) and added lines (+, green).
+			local ctx = 2
+			local diff_lines = {}
+			table.insert(
+				diff_lines,
+				string.format("@@ -%d,%d +%d,%d @@", s, math.max(0, math.min(e, #disk) - s + 1), s, #block)
+			)
+			local cs = math.max(1, s - ctx)
+			for i = cs, s - 1 do
+				table.insert(diff_lines, " " .. (disk[i] or ""))
+			end
+			for i = s, math.min(e, #disk) do
+				table.insert(diff_lines, "-" .. (disk[i] or ""))
+			end
+			for i = 1, #block do
+				table.insert(diff_lines, "+" .. block[i])
+			end
+			for i = e + 1, math.min(e + ctx, #disk) do
+				table.insert(diff_lines, " " .. (disk[i] or ""))
+			end
+			cur_lines = diff_lines
+		else
+			-- create/replace: LEFT = unified diff (disk vs proposed),
+			-- RIGHT = proposed content. The change is visible at a glance
+			-- and [ / ] jumps between hunks.
+			after_lines = vim.split(p.content or "", "\n", { plain = true })
+			if after_lines[#after_lines] == "" then
+				table.remove(after_lines)
+			end
+			if #disk == 0 then
+				cur_lines = {}
+				for _, l in ipairs(after_lines) do
+					cur_lines[#cur_lines + 1] = "+" .. l
+				end
+				first_change = 1
+				first_added = 1
+			else
+				cur_lines, first_change, first_added = diff.build_diff(disk, after_lines)
+			end
+		end
+	end
+
+	-- LEFT pane: current state / diff (reference, read-only).
+	if vim.bo[state.cur_buf].modifiable == false then
+		vim.bo[state.cur_buf].modifiable = true
+	end
+	vim.api.nvim_buf_set_lines(state.cur_buf, 0, -1, false, cur_lines or { "" })
+	vim.bo[state.cur_buf].bufhidden = "wipe"
+	vim.bo[state.cur_buf].filetype = vim.filetype.match({ filename = p.path }) or ""
+	vim.api.nvim_buf_set_name(state.cur_buf, "CURRENT: " .. p.path)
+	vim.bo[state.cur_buf].modifiable = false
+
+	-- RIGHT pane: the proposal's result — EDITABLE, da writes this.
+	if vim.bo[state.after_buf].modifiable == false then
+		vim.bo[state.after_buf].modifiable = true
+	end
+	vim.api.nvim_buf_set_lines(state.after_buf, 0, -1, false, after_lines or { "" })
+	vim.bo[state.after_buf].bufhidden = "wipe"
+	vim.bo[state.after_buf].filetype = vim.filetype.match({ filename = p.path }) or ""
+	vim.api.nvim_buf_set_name(state.after_buf, "AFTER: " .. p.path)
+	vim.bo[state.after_buf].modifiable = true
+
+	-- Diff highlights: red = being deleted, green = being added.
+	local ns = vim.api.nvim_create_namespace("manage-diff")
+	vim.api.nvim_buf_clear_namespace(state.cur_buf, ns, 0, -1)
+	vim.api.nvim_buf_clear_namespace(state.after_buf, ns, 0, -1)
+	if is_range or first_change then
+		for ln, l in ipairs(cur_lines or {}) do
+			local prefix = l:sub(1, 1)
+			if prefix == "-" then
+				vim.api.nvim_buf_add_highlight(state.cur_buf, ns, "ManageRemove", ln - 1, 0, -1)
+			elseif prefix == "+" then
+				vim.api.nvim_buf_add_highlight(state.cur_buf, ns, "ManageAdd", ln - 1, 0, -1)
+			end
+		end
+	end
+	diff.hl_span(state.after_buf, ns, "ManageAdd", after_span and after_span[1], after_span and after_span[2])
+
+	-- Winbars: what each side is, and that da writes the right one.
+	local opdesc = p.operation
+	if is_range then
+		opdesc = string.format("%s %d-%d", p.operation, p.start_line, p.end_line or p.start_line)
+	end
+	if state.cur_win and vim.api.nvim_win_is_valid(state.cur_win) then
+		vim.wo[state.cur_win].winbar = string.format("CURRENT %s  [%s]", p._rel or p.path, opdesc)
+	end
+	if state.after_win and vim.api.nvim_win_is_valid(state.after_win) then
+		local what = "proposal content"
+		if is_delete then
+			what = "moved to _old"
+		elseif is_range then
+			what = "range applied"
+		end
+		vim.wo[state.after_win].winbar = string.format("AFTER — %s · da writes this  %s", what, p._rel or p.path)
+	end
+
+	-- Position: open both panes at the first change (diff rows) or the
+	-- added block (range rows); everything else starts at the top.
+	-- The AFTER pane focuses the PROPOSED-content line (first_added), not
+	-- the diff line — the two buffers have different line numbers.
+	local left_focus = 1
+	local right_focus = 1
+	if is_range then
+		right_focus = after_span and after_span[1] or 1
+	elseif first_change then
+		left_focus = first_change
+		right_focus = first_added or first_change
+	end
+	for _, spec in ipairs({ { state.cur_win, left_focus }, { state.after_win, right_focus } }) do
+		local w, ln = spec[1], spec[2]
+		if w and vim.api.nvim_win_is_valid(w) then
+			-- Clamp: the focus line must exist in the pane's buffer.
+			local maxln = math.max(1, vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(w)))
+			ln = math.max(1, math.min(ln, maxln))
+			vim.api.nvim_win_call(w, function()
+				vim.api.nvim_win_set_cursor(w, { ln, 0 })
+				vim.cmd("normal! zt") -- change line lands at the top of the pane
+			end)
+		end
+	end
+end
+
+--- Display-order indices: groups ordered by their NEWEST proposal's time
+--- (descending), proposals within a group newest-first. The comparator is
+--- TOTAL (path tiebreaker) — table.sort is unstable, and equal timestamps
+--- would otherwise reorder rows between refreshes, moving the cursor.
+--- @param state table
+--- @return number[]
+function M.display_order(state)
+	local order = {}
+	local group_newest = {}
+	for i, p in ipairs(state.items) do
+		order[i] = i
+		local g = p.group or "misc"
+		group_newest[g] = math.max(group_newest[g] or 0, p.ts or 0)
+	end
+	table.sort(order, function(a, b)
+		local ia, ib = state.items[a], state.items[b]
+		local ga, gb = ia.group or "misc", ib.group or "misc"
+		if ga ~= gb then
+			return (group_newest[ga] or 0) > (group_newest[gb] or 0)
+		end
+		local ta, tb = ia.ts or 0, ib.ts or 0
+		if ta ~= tb then
+			return ta > tb
+		end
+		return (ia.path or "") < (ib.path or "")
+	end)
+	return order
+end
+
+--- Item index at display position `pos` (1-based), clamped.
+--- @param order number[]
+--- @param pos number
+--- @return number item index
+function M.item_at(order, pos)
+	local n = #order
+	if n == 0 then
+		return nil
+	end
+	pos = math.max(1, math.min(n, pos))
+	return order[pos]
+end
+
+--- @param state table
+function M.render_list(state)
+	if not state.list_buf or not vim.api.nvim_buf_is_valid(state.list_buf) then
+		return
+	end
+	local order = M.display_order(state)
+	local lines = {}
+	local row_of = {} -- display line -> state string
+	local last_group = nil
+	local cursor_line = 1
+	for _, si in ipairs(order) do
+		local p = state.items[si]
+		local g = p.group or "misc"
+		if g ~= last_group then
+			last_group = g
+			table.insert(lines, "── " .. g .. " ─────────────────────")
+		end
+		local marker = (si == state.idx) and ">" or " "
+		local st = state.row_states[si] or M.row_state(p)
+		local tag = M.state_tag(st)
+		table.insert(
+			lines,
+			string.format(
+				"%s %-12s %-9s [%-8s] %s  (s:%s · %s)",
+				marker,
+				p._project or "?",
+				p.operation,
+				tag,
+				p._rel or p.path,
+				M.short_sid(p.sessionID),
+				M.fmt_when(p.ts)
+			)
+		)
+		row_of[#lines] = st
+		if si == state.idx then
+			cursor_line = #lines
+		end
+	end
+	if #lines == 0 then
+		table.insert(lines, "— nothing here —")
+	end
+	if vim.bo[state.list_buf].modifiable == false then
+		vim.bo[state.list_buf].modifiable = true
+	end
+	vim.api.nvim_buf_set_lines(state.list_buf, 0, -1, false, lines)
+	vim.bo[state.list_buf].modifiable = false
+
+	-- Color each row by its cached state
+	local ns = vim.api.nvim_create_namespace("manage-rows")
+	vim.api.nvim_buf_clear_namespace(state.list_buf, ns, 0, -1)
+	for ln, st in pairs(row_of) do
+		local hl = M.hl_for(st)
+		if hl ~= "ManageApplied" and hl ~= "ManageRejected" then
+			vim.api.nvim_buf_add_highlight(state.list_buf, ns, hl, ln - 1, 0, -1)
+		else
+			vim.api.nvim_buf_add_highlight(state.list_buf, ns, hl, ln - 1, 2, -1)
+		end
+	end
+
+	if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
+		local total = vim.api.nvim_buf_line_count(state.list_buf)
+		local target = math.max(1, math.min(cursor_line, total))
+		pcall(vim.api.nvim_win_set_cursor, state.list_win, { target, 0 })
+	end
+end
+
+--- Re-read VISIBLE proposals (pending + accepted) for the current scope.
+--- Preserves the selected proposal BY IDENTITY (path + manifest + ts), so
+--- the cursor stays on the same row through da/ga even though the list is
+--- rebuilt.
+--- @param state table
+function M.refresh_items(state)
+	local proposals = require("opencode-manage.proposals")
+	local items = proposals.list_visible(state.filter)
+	local prev = state.items[state.idx]
+	state.items = items
+	M.compute_row_states(state)
+	if prev then
+		local found = false
+		for i, p in ipairs(items) do
+			if p.path == prev.path and p._file == prev._file and p.ts == prev.ts then
+				state.idx = i
+				found = true
+				break
+			end
+		end
+		if not found then
+			state.idx = math.max(1, math.min(state.idx, #items))
+		end
+	else
+		state.idx = math.max(1, math.min(state.idx, #items))
+	end
+	M.render_list(state)
+	M.render_previews(state)
+end
+
+--- Counts per scope from a single scan — cheap, one read of the manifests.
+--- Counts VISIBLE rows (pending + accepted) to match what the list shows.
+--- @return table<string, number>
+function M.scope_counts()
+	local proposals = require("opencode-manage.proposals")
+	local items = proposals.list_visible("all")
+	local c = { all = #items, session = 0, files = 0, neither = 0 }
+	for _, p in ipairs(items) do
+		if p._cwd then
+			c.session = c.session + 1
+		end
+		if p._cwd_file then
+			c.files = c.files + 1
+		end
+		if not p._cwd and not p._cwd_file then
+			c.neither = c.neither + 1
+		end
+	end
+	return c
+end
+
+--- Permanent legend in the LIST window's winbar: scope + the four counts +
+--- color swatches + every keybind. Multi-line winbar requires nvim 0.10+.
+--- @param state table
+function M.set_legend(state)
+	if not state.list_win or not vim.api.nvim_win_is_valid(state.list_win) then
+		return
+	end
+	local c = M.scope_counts()
+	local line2 = string.format(
+		"%s · %d rows · f: all=%d session=%d files=%d neither=%d · j/k gg/G [/] f r o/CR da dr rr ga y Q",
+		FILTER_LABELS[state.filter],
+		#state.items,
+		c.all,
+		c.session,
+		c.files,
+		c.neither
+	)
+	vim.wo[state.list_win].winbar = table.concat({
+		"%#ManageNew#██%*new  %#ManageEdit#██%*edit  %#ManageRerun#██%*rerun  %#ManageDelete#██%*delete  "
+			.. "%#ManageApplied#██%*applied  %#ManageRejected#██%*rejected  %#ManageMismatch#██%*mismatch",
+		line2,
+	}, "\n")
+end
+
+--- Define the row highlight groups once.
+function M.define_hls()
+	local hl = vim.api.nvim_set_hl
+	hl(0, "ManageNew", { fg = "#4ec9b0", bold = true }) -- green: new file
+	hl(0, "ManageEdit", { fg = "#569cd6" }) -- blue: edit needed
+	hl(0, "ManageRerun", { fg = "#c586c0" }) -- magenta: context stale
+	hl(0, "ManageDelete", { fg = "#f44747" }) -- red: delete/move
+	hl(0, "ManageApplied", { fg = "#6a9955" }) -- dim green: already applied
+	hl(0, "ManageRejected", { fg = "#808080", strikethrough = true }) -- dim: rejected
+	hl(0, "ManageMismatch", { fg = "#dcdcaa", bold = true }) -- yellow: mismatch
+	hl(0, "ManageGroup", { fg = "#808080", italic = true }) -- group headers
+	-- Diff-pane backgrounds: what a partial deletes (left) / adds (right).
+	hl(0, "ManageAdd", { bg = "#1e3b2a" })
+	hl(0, "ManageRemove", { bg = "#3b1f1f" })
+end
+
+return M

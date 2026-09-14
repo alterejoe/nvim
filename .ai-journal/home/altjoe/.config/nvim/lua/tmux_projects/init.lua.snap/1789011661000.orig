@@ -1,0 +1,155 @@
+-- lua/tmux_projects/init.lua FINAL
+-- Entry point and persistence for tmux project groups.
+-- The JSON store is authoritative after its first creation.
+
+local M = {}
+
+M.projects = {}
+M.default = {}
+M.nvim = false
+M.project_order = {}
+
+local order_file = vim.fn.stdpath("data") .. "/tmux_session_slots"
+local active_project_file = vim.fn.stdpath("data") .. "/tmux_active_project"
+local projects_file = vim.fn.stdpath("data") .. "/tmux_project_overrides.json"
+local show_hidden = false
+
+local function copy(value)
+	return vim.deepcopy(value)
+end
+
+local function read_json()
+	local file = io.open(projects_file, "r")
+	if not file then
+		return nil
+	end
+	local raw = file:read("*a")
+	file:close()
+	if not raw or vim.trim(raw) == "" then
+		return nil
+	end
+	local ok, decoded = pcall(vim.json.decode, raw)
+	if not ok or type(decoded) ~= "table" then
+		vim.notify("tmux: invalid project JSON; using configured projects", vim.log.levels.ERROR)
+		return nil
+	end
+	return decoded
+end
+
+function M.load_order()
+	local file = io.open(order_file, "r")
+	if not file then
+		return {}
+	end
+	local slots = {}
+	for line in file:lines() do
+		local value = vim.trim(line)
+		if value ~= "" then
+			table.insert(slots, value)
+		end
+	end
+	file:close()
+	return slots
+end
+
+function M.save_order(slots)
+	local file = io.open(order_file, "w")
+	if not file then
+		vim.notify("tmux: could not write " .. order_file, vim.log.levels.ERROR)
+		return
+	end
+	for _, session in ipairs(slots) do
+		file:write(session .. "\n")
+	end
+	file:close()
+end
+
+function M.load_overrides()
+	return read_json() or {}
+end
+
+function M.save_overrides()
+	local file = io.open(projects_file, "w")
+	if not file then
+		vim.notify("tmux: could not write " .. projects_file, vim.log.levels.ERROR)
+		return false
+	end
+	file:write(vim.json.encode(M.projects))
+	file:close()
+	return true
+end
+
+function M.get_show_hidden()
+	return show_hidden
+end
+
+function M.set_show_hidden(value)
+	show_hidden = value == true
+end
+
+function M.get_active_project()
+	local file = io.open(active_project_file, "r")
+	if not file then
+		return nil
+	end
+	local name = vim.trim(file:read("*a"))
+	file:close()
+	return name ~= "" and name or nil
+end
+
+function M.set_active_project(name)
+	local file = io.open(active_project_file, "w")
+	if not file then
+		vim.notify("tmux: could not write active project", vim.log.levels.ERROR)
+		return
+	end
+	file:write(name)
+	file:close()
+end
+
+local function ordered_group_names(projects, configured_order)
+	local result = {}
+	local seen = {}
+	for _, name in ipairs(configured_order or {}) do
+		if projects[name] and not seen[name] then
+			table.insert(result, name)
+			seen[name] = true
+		end
+	end
+	local remaining = {}
+	for name in pairs(projects) do
+		if not seen[name] then
+			table.insert(remaining, name)
+		end
+	end
+	table.sort(remaining)
+	for _, name in ipairs(remaining) do
+		table.insert(result, name)
+	end
+	return result
+end
+
+function M.setup(opts)
+	opts = opts or {}
+	M.default = copy(opts.default or {})
+	M.nvim = opts.nvim == true
+
+	local configured_projects = copy(opts.projects or {})
+	local persisted = read_json()
+	if persisted then
+		M.projects = persisted
+	else
+		M.projects = configured_projects
+		if next(M.projects) ~= nil then
+			M.save_overrides()
+		end
+	end
+
+	M.project_order = ordered_group_names(M.projects, opts.project_order)
+end
+
+require("tmux_projects.projects").setup(M)
+require("tmux_projects.sessions").setup(M)
+require("tmux_projects.groups").setup(M)
+
+return M
