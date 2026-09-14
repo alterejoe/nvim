@@ -611,17 +611,22 @@ local function setup_pane(pane, all_panes, layout, pane_opts)
 		fuzzy_filter(buf, win, get_lines(buf, typed))
 	end, "Fuzzy filter")
 
+	local function refresh_pane()
+		if pane_opts.refresh then
+			local fresh = pane_opts.refresh()
+			vim.api.nvim_buf_set_lines(buf, 0, -1, false, fresh)
+			pane.original = vim.deepcopy(fresh)
+			pane.scratch_reg = nil
+			vim.bo[buf].modified = false
+			vim.notify("scratchbuf: refreshed", vim.log.levels.INFO)
+		end
+	end
+
 	if k.refresh then
-		map(k.refresh, function()
-			if pane_opts.refresh then
-				local fresh = pane_opts.refresh()
-				vim.api.nvim_buf_set_lines(buf, 0, -1, false, fresh)
-				pane.original = vim.deepcopy(fresh)
-				pane.scratch_reg = nil
-				vim.bo[buf].modified = false
-				vim.notify("scratchbuf: refreshed", vim.log.levels.INFO)
-			end
-		end, "Refresh")
+		map(k.refresh, refresh_pane, "Refresh")
+	end
+	if k.refresh_alt then
+		map(k.refresh_alt, refresh_pane, "Refresh")
 	end
 
 	if pane_opts.on_save then

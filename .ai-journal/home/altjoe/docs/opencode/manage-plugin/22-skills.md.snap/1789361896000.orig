@@ -1,0 +1,196 @@
+# /home/altjoe/docs/opencode/manage-plugin/22-skills.md FINAL
+---
+title: 22 — Skills (SL1 + SL2)
+status: active
+links: [03-proposals, 10-skills-gating, 17-impact-registry, 18-staged-workflow, 19-context-metrics-and-removal, 20-references]
+---
+
+# Skills — emit, tier, route, retire
+
+Status: **active** — SL1 applied (manifest, `emit_skill`, routing hint,
+subject tags); SL2 (lifecycle viewer) emitted (group `skills-lifecycle`).
+`manage-proposals` was the first skill through the pipeline.
+
+Supersedes [10-skills-gating](10-skills-gating.md) (its disk-scan gating was
+first reduced by doc 19 to capture plus optional validation). Picks up doc
+18's S6 tier vocabulary — `default | conditional | emergency | explicit |
+legacy` — as the routing contract, and doc 20's subject vocabulary as the
+shared key between refs and skills.
+
+## The problem
+
+- Skills are files the user writes by hand. The AI can read them but cannot
+  propose one; a procedure that proves repeatable has no reviewed intake.
+- Nothing routes by what the user is working on: O1 captures skill loads as
+  bare names (doc 19), so a load carries no subject and does not join the
+  refs objects.
+- No lifecycle: every skill is effectively tier-less, so routing would either
+  hint everything or nothing; nothing records why a skill stopped surfacing.
+
+## Contract
+
+- **Bodies stay opencode-native.** Skills remain at
+  `~/.config/opencode/skills/<name>/SKILL.md` (global) and
+  `<project>/.opencode/skills/<name>/SKILL.md` (project) — the `skill` tool
+  keeps loading them unchanged; nothing here introduces a second loader.
+- **Metadata lives in one manifest per scope**:
+  `~/.config/opencode/skills.policy.json` (global) and
+  `<project>/.opencode/skills.policy.json` (project), merged by name with
+  project winning. Manifest over frontmatter: opencode owns the frontmatter
+  (`name`, `description`); `tier`/`subject` change on a different cadence,
+  and one diffable artifact beats rewriting 30 skill files per policy tweak.
+- **The AI proposes, the user applies.** `emit_skill` queues two proposals in
+  one group — the SKILL.md and the merged manifest — through the standard
+  review queue (doc 03). Nothing is written until the user accepts.
+- **Routing is a hint, not enforcement** — one `[skills]` line at most, same
+  shape as `[refs]`. Loading stays the model's choice; whether it works is
+  measured through `skill_load` events (doc 19), not asserted here.
+- **Two reload domains.** opencode's skill registry is process-cached: a
+  newly written or edited SKILL.md becomes *loadable by name* only after an
+  opencode restart (the skill list is assembled at startup). The plugin's
+  layer is always live — the manifest, the `[skills]` hint, the subject
+  tags, and `ref_lookup` are read per call — and the hint carries each
+  match's SKILL.md path, so a session whose registry is stale can read the
+  body directly instead of waiting for a restart.
+
+## Metadata schema
+
+```json
+{
+  "skills": {
+    "code-delivery": { "tier": "default", "subject": ["opencode-manage lua", "delivery"] },
+    "batch-exec":     { "tier": "explicit", "subject": ["workflow"], "note": "explicit-only by design" }
+  }
+}
+```
+
+| Tier | Routing behavior |
+|---|---|
+| `default` | hinted when a subject token overlaps the focused file's derived subject |
+| `conditional` | hinted only on an exact subject match (no token overlap) |
+| `emergency` | hinted regardless of focus, ordered first (rare — e.g. ground-truth/realign) |
+| `explicit` | never hinted; loaded only when the user or model names it |
+| `legacy` | kept for history; never hinted |
+
+`note` is optional free text: the WHY an entry sits at its tier.
+
+Subjects share the refs vocabulary (doc 20): `deriveSubject` = directory token
++ extension (`opencode-manage lua`). Matching is token overlap with
+extension tokens ignored on both sides; a skill whose subject is a single
+extension token (`templ`, `lua`) matches that language's files deliberately.
+Explainable, no model involved.
+
+## `emit_skill` — the intake
+
+Args: `name` (kebab slug), `description`, `content` (the body), `tier`,
+`subject` (JSON array), `scope` (`global` | `project`, default global).
+
+- The tool composes the SKILL.md frontmatter (`name`, `description`) from the
+  args; `content` must be the body only — frontmatter in the body is a
+  REQUIREMENTS error (one source of truth).
+- Two proposals, one group `skill-<name>`: (1) `create` (or `replace` for an
+  update) at the skill path, (2) `create`/`replace` of the manifest with the
+  merged entry, pretty-printed. Both ride the existing viewer; no new viewer.
+- Paths are tool-constructed under the declared skills root and slug-checked,
+  so the emit-side parent-dir rule is relaxed for `create` here only (doc
+  21's rule is unchanged for model-supplied paths; the nvim apply side
+  already mkdirs parents for `create`).
+- One manifest row is merged at emit time — emit one skill, apply it, then
+  emit the next, so manifests merge front-to-back.
+- Every validation error follows the doc 03 contract: what, why, how.
+
+## Lifecycle (SL2) — re-tier first, prune last
+
+A skill's life is adjusted through its ROUTING, not its file. The lifecycle
+viewer (`<leader>ak`) edits the manifest entry; the SKILL.md stays where it
+is — deleting skill files is never a viewer action.
+
+| Action | Key | Effect |
+|---|---|---|
+| Re-tier | `t` | `default` hints by subject · `conditional` exact subject only · `emergency` always · `explicit` never · `legacy` retire (kept for history) |
+| Note | `n` | the WHY stored on the entry ("demoted — duplicates verbose-logging") |
+| Subjects | `s` | edit the routing vocabulary (≥1 required — routing needs it) |
+| Drop | `D` | remove the manifest entry: the deliberate full prune; the file stays, the skill simply stops being routed |
+| Open | `o` | jump to the SKILL.md in your buffer |
+
+- **Demotion, not deletion, is the default.** A skill that stops earning its
+  hint is re-tiered — `legacy` keeps the audit trail, `explicit` keeps it
+  loadable on demand. Only a skill that should not exist as a routing entry
+  is dropped. This mirrors refs' prune-with-reason, except the reason here
+  is the note plus the tier itself.
+- Usage lives in the viewer: skill-tag touches and recent loads from this
+  project's `event_tags` (cross-project usage stays a per-project view —
+  honest limit).
+- Every write snapshots the manifest into the journal first, so console
+  edits are revertible like every other change.
+- The viewer refuses to write a malformed manifest (never silently
+  overwritten) and still lists entries from the other scope.
+
+## Routing
+
+- `focus` (R1a) → `deriveSubject(focus.path)` → `matchSkills`.
+- One line, ≤3 entries, emergency first. Each match carries its SKILL.md
+  path so a stale skill registry can be bypassed by reading the file:
+  `[skills] focus=… — matched: code-delivery (default) → /home/…/skills/code-delivery/SKILL.md; load with the skill tool, or read the path directly when the skill list is stale.`
+- `skill_load` events carry the skill name and its subjects as O1 tags, so
+  objects mode (`<leader>at`, `t`) joins skill ⇄ subject, and `ref_lookup`
+  on the same subject returns the user's own code — the two layers share one
+  vocabulary.
+
+## What this is not
+
+- Not enforcement: no deny on skill loads; no auto-loading.
+- Not a second loader: opencode still reads SKILL.md.
+- Not a skill editor: the viewer edits routing metadata; SKILL.md stays
+  opencode-native and is edited as a file.
+- Not message-keyword tagging (doc 19 open question 3).
+
+## Interface
+
+- Tool: `emit_skill`.
+- Files: `skills.policy.json` (global + project), SKILL.md under the skills
+  roots.
+- Hints: `[skills]` line (name · tier · path); O1 tags `skill` + `subject`.
+- Lifecycle viewer: `<leader>ak` — `t` re-tier · `n` note · `s` subjects ·
+  `D` drop entry (file kept) · `o` open · `r` refresh.
+- No new nvim viewer for intake: skill proposals are ordinary proposals; the
+  manifest is an ordinary file.
+
+## Slices
+
+| Slice | Content | State |
+|---|---|---|
+| **SL1** | manifest + `emit_skill` + `[skills]` hint + subject tags | applied (group skills-1; hint paths added in skills-hint-paths) |
+| **SL2** | lifecycle: re-tiering (legacy retire / emergency promote), note, subjects, drop — the `<leader>ak` viewer + per-project usage | emitted (group skills-lifecycle) |
+
+## Acceptance (verify live)
+
+1. `emit_skill` a test skill → two pending rows, same group, in `<leader>ap`.
+2. Accept both → `~/.config/opencode/skills/<name>/SKILL.md` exists and the
+   manifest carries the entry; the skill appears by name/description.
+3. Load it (restart opencode first if the skill was just written — the
+   native registry is process-cached) → a `skill_load` event with `skill` +
+   `subject` tags is recorded; `<leader>at` objects mode shows both.
+4. Open a file whose derived subject overlaps a declared subject → the next
+   call carries the `[skills]` line (name · tier · path); `ref_lookup` on
+   that subject returns the matching refs.
+5. Fail-open: remove the manifest → no hint, no crash, skills still load.
+6. Lifecycle: `<leader>ak` → `t` demotes a skill to `legacy` (manifest
+   rewritten, journaled; the skill stops being hinted after the next call),
+   `n` records the why, `D` drops the entry with the file intact.
+
+## Open questions
+
+1. Subject matching strictness — start at token overlap; tighten by outcomes
+   (doc 19 C3).
+2. Manifest provenance — reviewed proposals first; hand edits stay legitimate
+   (it is the user's file).
+3. Skill updates vs new names — `replace` on a name is an update; renaming is
+   a new name + `legacy` on the old entry.
+
+## Related
+
+- [03-proposals](03-proposals.md), [10-skills-gating](10-skills-gating.md),
+  [18-staged-workflow](18-staged-workflow.md) (S6),
+  [19-context-metrics-and-removal](19-context-metrics-and-removal.md),
+  [20-references](20-references.md).

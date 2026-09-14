@@ -77,7 +77,7 @@ wk.add({
 	{ "<leader>rq", desc = "Air: kill" },
 
 	-- tmux
-	{ "<leader>ts", desc = "Sessions (edit)" },
+	{ "<leader>ts", desc = "Workspace board (live)" },
 	{ "<leader>tS", desc = "All sessions (debug)" },
 	{ "<leader>tr", desc = "Rename session" },
 	{ "<leader>ta", desc = "Join pane from session" },
@@ -85,7 +85,7 @@ wk.add({
 	{ "<leader>tT", desc = "Kill ALL sessions" },
 	{ "<leader>t|", desc = "Vertical split" },
 	{ "<leader>t-", desc = "Horizontal split" },
-	{ "<leader>tp", desc = "Pick project" },
+	{ "<leader>tp", desc = "Palette (saved projects + workspaces)" },
 	{ "<leader>tP", desc = "Recover project" },
 	{ "<leader>tj", desc = "Tmux slot 1" },
 	{ "<leader>tk", desc = "Tmux slot 2" },

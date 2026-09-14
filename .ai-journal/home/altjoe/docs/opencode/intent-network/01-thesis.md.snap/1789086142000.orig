@@ -1,0 +1,91 @@
+# /home/altjoe/docs/opencode/intent-network/01-thesis.md FINAL
+---
+title: Intent Network — Thesis
+status: proposed
+links: [README, 02-permissions-tooling]
+---
+
+# Thesis: the LLM is the orchestrator, not the worker
+
+## The problem: four stacked hopes
+
+The current AI-coding pipeline is hope stacked on hope:
+
+1. **Hope the engine is right** — model behavior is a black box, uninspectable, unsteerable.
+2. **Hope the tools are right** — tool selection is static, decided once, never adapted to the task.
+3. **Hope it grabs the right context** — context acquisition is model-discretionary, unguided, and nothing removes what it grabbed wrong.
+4. **Hope iterations converge** — and the model is simultaneously the worker, the quality inspector, and the convergence detector. It decides when it has enough context, when it understands, when it's done. All three judgments come from the same entity that has zero access to the user's intent.
+
+The loop is **self-certifying**: the only signal that says "this is solved" is
+the model's own report — the least trustworthy signal in the system. That is
+why the circling happens: nothing external ever says "you already tried that,
+it failed, move on." The loop has no ground truth to collide with.
+
+## The design principle
+
+**The LLM is a text-to-text model. It was never designed to be accurate at
+the work itself** — counting brackets, resolving symbols, verifying safety,
+searching. Hundreds of thousands of quality tools exist that ARE designed for
+that work: LSPs tell you exactly what's wrong, formatters error when
+something is broken, vuln checks verify safety, search engines find.
+
+The LLM's one genuine capability is **sequencing operations and interpreting
+results**. So:
+
+- **Tools do the work.** LSP resolves, formatters format, vuln checks check, search finds.
+- **The LLM sequences them.** It decides which tool, in what order, and reads the results.
+- **The user's expertise guides the sequencing.** Encoded as rules and playbooks — the diagnostic chains an experienced developer runs without thinking ("file not found → permissions → blank → never generated").
+- **Evaluation measures discipline.** Did the AI use the right tool, follow the rule, and did the result pass the tool's checks?
+
+## Tools are ground truth
+
+- LSP diagnostics are **facts**, not judgments. A syntax error after an edit is objective.
+- A formatter that errors means something is broken — no interpretation needed.
+- Vuln checks make non-dangerous code a verifiable property.
+- The AI should never fabricate what a tool can measure. **Never let the AI
+  address code by coordinates** (line numbers it invents); always by symbol,
+  resolved through LSP to the real range.
+
+## The correction problem: prose vs. verdicts
+
+When the AI commits to a wrong path, the user's only lever is interrupting and
+saying "that's not the right path" — and it takes multiple repetitions because
+each correction is **prose**: one signal competing in context against the
+model's own committed reasoning, which it defends.
+
+A correction is a **verdict**, not a message. Said once, recorded
+structurally ("path X proposed, rejected, reason: wrong interpretation"),
+injected as a constraint on the next call. The model doesn't need to
+understand — the tooling won't let it re-walk the rejected path. One
+correction becomes a fact the system enforces, not a sentence the model
+interprets.
+
+## Context is the single lever
+
+With proper context, the AI builds quickly. With wrong context, mistakes
+compound — each error conditions the next. Context correctness is the one
+lever that matters; everything else exists to detect when context is wrong
+and fix it before compounding starts.
+
+Context adjustment is **mechanism-agnostic**: the same goal (match context to
+intent) has multiple interchangeable mechanisms — keyword/metric removal,
+summary-drift detection (the session summary is the AI's self-model; compare
+it against intent to find what to remove), retention tiers (overarching
+themes are hard to remove, session noise is easy; metrics inform, user
+control overrides), user-defined rules (first-class, never demoted).
+
+## The three layers
+
+1. **Tool layer** — LSP, formatters, vuln checks, search. All exist, all are ground truth.
+2. **Rule layer** — the user's expertise encoded: diagnostic chains, evaluation patterns, "how I look at a project." The knowledge the AI lacks, supplied structurally.
+3. **Oversight layer** — the proposal/review loop. The user is the final arbiter; evaluation measures whether the AI operated the tools the way an experienced developer would.
+
+## What this means for the manage plugin
+
+The manage plugin (airlock + proposals + journal + registry) is the
+foundation and stays. The intent network adds: verdict capture (accept/reject
+becomes memory), the structural tool layer (LSP-backed symbol addressing +
+proposal validation at emission), the sidecar (non-LLM analysis), the
+evaluation layer (credit assignment + routing), and playbooks (enforced
+diagnostic chains). The proposal/review loop is the oversight mechanism —
+unchanged in spirit, richer in signal.

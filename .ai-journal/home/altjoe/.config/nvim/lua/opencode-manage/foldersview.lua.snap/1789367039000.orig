@@ -1,0 +1,422 @@
+-- /home/altjoe/.config/nvim/lua/opencode-manage/foldersview.lua FINAL
+-- opencode-manage.foldersview — the permissions viewer (doc 23, PM1).
+-- Persistent two-pane viewer over folder memory + captured candidates:
+--   j/k move · a approve · x avoid · d remove · o open · b browse ·
+--   s sync · v verify · r refresh · Q kill
+-- Approve writes state.db memory; `s` merges approved rows into
+-- opencode.json external_directory (journaled, additive-only); `v` reports
+-- drift both ways. Candidates come from O1 dir tags (top 100, alphabetical),
+-- filtered by hidden trees and decided ancestors — `b` browses the tree
+-- oil-style instead (approve any folder, one key at every level).
+
+local folders = require("opencode-manage.folders")
+
+local M = {}
+
+local state = {
+	items = {},
+	idx = 1,
+	list_buf = nil,
+	detail_buf = nil,
+	list_win = nil,
+	detail_win = nil,
+	outer_win = nil,
+	origin_win = nil,
+	origin_buf = nil,
+	autocmd = nil,
+	report = nil, -- last verify report
+}
+
+local function define_hls()
+	local hl = vim.api.nvim_set_hl
+	hl(0, "ManageFolderOk", { fg = "#4ec9b0" }) -- approved
+	hl(0, "ManageFolderAvoid", { fg = "#f44747" }) -- avoid
+	hl(0, "ManageFolderCand", { fg = "#569cd6" }) -- candidate
+	hl(0, "ManageFolderDrift", { fg = "#e5c07b" }) -- approved but not in config
+	hl(0, "ManageFolderHeader", { link = "Comment" }) -- section headers
+end
+
+local function short(path)
+	return vim.fn.fnamemodify(path, ":~")
+end
+
+local function secs(v)
+	local n = tonumber(v) or 0
+	if n > 100000000000 then
+		return n / 1000
+	end
+	return n
+end
+
+local function fmt_when(ts)
+	local n = tonumber(ts)
+	if not n or n == 0 then
+		return "?"
+	end
+	return os.date("%m-%d %H:%M", math.floor(secs(n)))
+end
+
+local function load_items()
+	local rows = folders.list()
+	local cfg = folders.config_entries()
+	local out = {}
+	for _, r in ipairs(rows) do
+		out[#out + 1] = {
+			kind = r.status == "avoid" and "avoid" or "approved",
+			id = r.id,
+			path = r.path,
+			scope = r.scope,
+			source = r.source,
+			uses = r.uses or 0,
+			last = r.last_seen,
+			note = r.note,
+			in_config = cfg[folders.entry_for(r.path)] ~= nil,
+		}
+	end
+	local cands = folders.candidates()
+	table.sort(cands, function(a, b)
+		return a.path < b.path
+	end)
+	for _, c in ipairs(cands) do
+		out[#out + 1] = {
+			kind = "candidate",
+			path = c.path,
+			scope = "—",
+			uses = c.n,
+			last = c.last,
+		}
+	end
+	state.items = out
+	state.idx = math.max(1, math.min(state.idx, #out))
+end
+
+local function render_list()
+	local lines = { "📁 FOLDERS" }
+	local row_hl = {}
+	local sel_line = 1
+	local header_done = false
+	for i, it in ipairs(state.items) do
+		if it.kind == "candidate" and not header_done then
+			header_done = true
+			lines[#lines + 1] = "  — candidates (directories your sessions touched; `b` to browse) —"
+			row_hl[#lines] = "ManageFolderHeader"
+		end
+		local marker = i == state.idx and ">" or " "
+		local tag = it.kind == "approved" and "ok " or (it.kind == "avoid" and "x  " or "?  ")
+		local drift = (it.kind == "approved" and not it.in_config) and " !" or ""
+		lines[#lines + 1] = string.format(
+			"%s [%s] %-42s %-7s u=%-3s %s%s",
+			marker,
+			tag,
+			short(it.path),
+			tostring(it.scope or "—"),
+			tostring(it.uses or 0),
+			fmt_when(it.last),
+			drift
+		)
+		row_hl[#lines] = (it.kind == "approved" and not it.in_config) and "ManageFolderDrift"
+			or (it.kind == "approved" and "ManageFolderOk")
+			or (it.kind == "avoid" and "ManageFolderAvoid")
+			or "ManageFolderCand"
+		if i == state.idx then
+			sel_line = #lines
+		end
+	end
+	if #state.items == 0 then
+		lines[#lines + 1] = "  — none yet — `b` to browse for a folder, or approve from candidates as they appear —"
+	end
+	vim.bo[state.list_buf].modifiable = true
+	vim.api.nvim_buf_set_lines(state.list_buf, 0, -1, false, lines)
+	vim.bo[state.list_buf].modifiable = false
+	local ns = vim.api.nvim_create_namespace("manage-folders")
+	vim.api.nvim_buf_clear_namespace(state.list_buf, ns, 0, -1)
+	for ln, hl in pairs(row_hl) do
+		vim.api.nvim_buf_add_highlight(state.list_buf, ns, hl, ln - 1, 0, -1)
+	end
+	pcall(vim.api.nvim_win_set_cursor, state.list_win, { sel_line, 0 })
+end
+
+local function render_detail()
+	local it = state.items[state.idx]
+	local lines = {}
+	if not it then
+		lines = { "— nothing selected —" }
+	else
+		lines[#lines + 1] = "path:      " .. short(it.path)
+		lines[#lines + 1] = "status:    " .. it.kind .. (it.id and ("  (id " .. tostring(it.id) .. ")") or "")
+		lines[#lines + 1] = "scope:     " .. tostring(it.scope or "—")
+		if it.kind ~= "candidate" then
+			lines[#lines + 1] = "source:    " .. tostring(it.source or "manual")
+			lines[#lines + 1] = "in config: " .. (it.in_config and "yes" or "NO — press s to sync")
+		end
+		lines[#lines + 1] = "uses:      " .. tostring(it.uses or 0) .. "  ·  last: " .. fmt_when(it.last)
+		lines[#lines + 1] = "note:      " .. tostring(it.note or "—")
+		lines[#lines + 1] = string.rep("─", 44)
+		lines[#lines + 1] = "a approve · x avoid · d remove · o open · b browse · s sync · v verify"
+		if state.report then
+			lines[#lines + 1] = string.rep("─", 44)
+			lines[#lines + 1] = "verify:"
+			if #state.report.missing == 0 and #state.report.extra == 0 then
+				lines[#lines + 1] = "  in sync"
+			else
+				for _, m in ipairs(state.report.missing) do
+					lines[#lines + 1] = "  missing from config: " .. m
+				end
+				for _, e in ipairs(state.report.extra) do
+					lines[#lines + 1] = "  in config, not in memory: " .. e
+				end
+			end
+		end
+	end
+	vim.bo[state.detail_buf].modifiable = true
+	vim.api.nvim_buf_set_lines(state.detail_buf, 0, -1, false, lines)
+	vim.bo[state.detail_buf].modifiable = false
+end
+
+local function set_legend()
+	if not state.list_win or not vim.api.nvim_win_is_valid(state.list_win) then
+		return
+	end
+	-- Plain concatenation: winbar markers (%#…#%*) are NOT format strings
+	-- (string.format rejected "%#M" and broke refresh).
+	vim.wo[state.list_win].winbar = "FOLDERS · "
+		.. #state.items
+		.. " · %#ManageFolderOk#[ok]%* approved  %#ManageFolderCand#[?]%* candidate"
+		.. "  %#ManageFolderAvoid#[x]%* avoid  %#ManageFolderDrift#!%* drift"
+		.. " · b browse · a x d o s v r Q"
+end
+
+local function refresh()
+	load_items()
+	render_list()
+	render_detail()
+	set_legend()
+end
+
+local function current()
+	return state.items[state.idx]
+end
+
+local function do_approve()
+	local it = current()
+	if not it then
+		return
+	end
+	if it.kind == "approved" then
+		vim.notify("folders: already approved", vim.log.levels.INFO)
+		return
+	end
+	vim.ui.select({ "common", "project" }, { prompt = "scope for " .. short(it.path) }, function(scope)
+		if not scope then
+			return
+		end
+		if folders.approve(it.path, scope, nil, it.uses, it.last) then
+			refresh()
+		end
+	end)
+end
+
+local function do_avoid()
+	local it = current()
+	if not it then
+		return
+	end
+	if folders.avoid(it.path) then
+		refresh()
+	end
+end
+
+local function do_remove()
+	local it = current()
+	if not it or not it.id then
+		vim.notify("folders: no row to remove (candidate — x to avoid, a to approve)", vim.log.levels.INFO)
+		return
+	end
+	local choice = vim.fn.confirm(
+		"Remove the memory row for " .. short(it.path) .. "?\n(config entries stay; sync never deletes)",
+		"&Remove\n&Cancel",
+		2
+	)
+	if choice ~= 1 then
+		return
+	end
+	if folders.remove(it.id) then
+		refresh()
+	end
+end
+
+local function do_open()
+	local it = current()
+	if not it then
+		return
+	end
+	if vim.fn.isdirectory(it.path) ~= 1 then
+		vim.notify("folders: not a directory: " .. it.path, vim.log.levels.WARN)
+		return
+	end
+	pcall(vim.api.nvim_win_set_buf, state.origin_win, state.origin_buf)
+	pcall(vim.cmd, "edit " .. vim.fn.fnameescape(it.path))
+end
+
+--- Oil-flavored folder picker: walk the filesystem with ui.select; every
+--- level offers "approve this folder (save)". Starts at the selected path
+--- when it is a directory, else cwd. Approving uses the same scope select.
+local function browse(dir)
+	dir = dir or vim.fn.getcwd()
+	local entries = vim.fn.glob(dir .. "/*", false, true)
+	local dirs = {}
+	for _, e in ipairs(entries) do
+		if vim.fn.isdirectory(e) == 1 and not e:find("/%.") then
+			dirs[#dirs + 1] = e
+		end
+	end
+	table.sort(dirs)
+	local choices = { "✅ approve " .. short(dir) .. " (save)" }
+	if dir ~= "/" then
+		choices[#choices + 1] = "⬆ .. " .. short(vim.fn.fnamemodify(dir, ":h"))
+	end
+	for _, d in ipairs(dirs) do
+		choices[#choices + 1] = "📁 " .. vim.fn.fnamemodify(d, ":t") .. "/"
+	end
+	vim.ui.select(choices, { prompt = "browse: " .. short(dir) }, function(choice)
+		if not choice then
+			return
+		end
+		local name = choice:match("^📁 (.+)/$")
+		if choice:match("^✅") then
+			vim.ui.select({ "common", "project" }, { prompt = "scope for " .. short(dir) }, function(scope)
+				if scope and folders.approve(dir, scope) then
+					refresh()
+				end
+			end)
+		elseif choice:match("^⬆") then
+			browse(vim.fn.fnamemodify(dir, ":h"))
+		elseif name then
+			browse(dir .. "/" .. name)
+		end
+	end)
+end
+
+local function do_browse()
+	local it = current()
+	local start
+	if it and vim.fn.isdirectory(it.path) == 1 then
+		start = it.path
+	else
+		start = vim.fn.getcwd()
+	end
+	browse(start)
+end
+
+local function do_sync()
+	folders.sync()
+	refresh()
+end
+
+local function do_verify()
+	state.report = folders.verify()
+	render_detail()
+end
+
+local function kill()
+	if state.autocmd then
+		pcall(vim.api.nvim_del_autocmd, state.autocmd)
+		state.autocmd = nil
+	end
+	for _, w in ipairs({ state.list_win, state.detail_win, state.outer_win }) do
+		if w and vim.api.nvim_win_is_valid(w) then
+			pcall(vim.api.nvim_win_close, w, true)
+		end
+	end
+	if state.origin_win and vim.api.nvim_win_is_valid(state.origin_win) then
+		pcall(vim.api.nvim_set_current_win, state.origin_win)
+	end
+end
+
+local function map_keys()
+	local function nmap(lhs, fn, desc)
+		vim.keymap.set("n", lhs, fn, { buffer = state.list_buf, nowait = true, desc = desc })
+	end
+	nmap("j", function()
+		state.idx = math.min(state.idx + 1, #state.items)
+		refresh()
+	end, "folders: next")
+	nmap("k", function()
+		state.idx = math.max(state.idx - 1, 1)
+		refresh()
+	end, "folders: prev")
+	nmap("a", do_approve, "folders: approve")
+	nmap("x", do_avoid, "folders: avoid")
+	nmap("d", do_remove, "folders: remove row")
+	nmap("o", do_open, "folders: open")
+	nmap("b", do_browse, "folders: browse & approve")
+	nmap("s", do_sync, "folders: sync config")
+	nmap("v", do_verify, "folders: verify drift")
+	nmap("r", refresh, "folders: refresh")
+	nmap("Q", kill, "folders: close")
+	nmap("<CR>", do_open, "folders: open")
+end
+
+function M.open()
+	define_hls()
+	state.origin_win = vim.api.nvim_get_current_win()
+	state.origin_buf = vim.api.nvim_get_current_buf()
+	state.list_buf = vim.api.nvim_create_buf(false, true)
+	state.detail_buf = vim.api.nvim_create_buf(false, true)
+	for _, b in ipairs({ state.list_buf, state.detail_buf }) do
+		vim.bo[b].buftype = "nofile"
+		vim.bo[b].bufhidden = "wipe"
+		vim.bo[b].swapfile = false
+	end
+	local total_w = vim.o.columns
+	local total_h = vim.o.lines - vim.o.cmdheight - 1
+	local list_w = math.max(30, math.floor(total_w * 0.45))
+	local detail_w = total_w - list_w - 1
+	state.outer_win = vim.api.nvim_open_win(state.list_buf, true, {
+		relative = "editor",
+		row = 0,
+		col = 0,
+		width = total_w,
+		height = total_h,
+		border = "none",
+		style = "minimal",
+	})
+	vim.wo[state.outer_win].winbar = "FOLDERS"
+	state.list_win = vim.api.nvim_open_win(state.list_buf, true, {
+		relative = "win",
+		win = state.outer_win,
+		row = 0,
+		col = 0,
+		width = list_w,
+		height = total_h,
+		border = "none",
+		style = "minimal",
+	})
+	state.detail_win = vim.api.nvim_open_win(state.detail_buf, false, {
+		relative = "win",
+		win = state.outer_win,
+		row = 0,
+		col = list_w + 1,
+		width = detail_w,
+		height = total_h,
+		border = "none",
+		style = "minimal",
+	})
+	vim.wo[state.detail_win].winbar = "DETAIL"
+	state.autocmd = vim.api.nvim_create_autocmd("WinEnter", {
+		callback = function()
+			if vim.api.nvim_get_current_win() ~= state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
+				vim.schedule(function()
+					if vim.api.nvim_win_is_valid(state.list_win) then
+						pcall(vim.api.nvim_set_current_win, state.list_win)
+					end
+				end)
+			end
+		end,
+	})
+	map_keys()
+	refresh()
+	vim.api.nvim_set_current_win(state.list_win)
+end
+
+return M

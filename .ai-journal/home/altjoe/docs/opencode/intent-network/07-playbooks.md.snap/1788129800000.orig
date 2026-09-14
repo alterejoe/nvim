@@ -1,0 +1,53 @@
+# /home/altjoe/docs/opencode/intent-network/07-playbooks.md FINAL
+---
+title: Intent Network — Playbooks
+status: proposed
+links: [README, 01-thesis]
+---
+
+# Playbooks — the user's diagnostic chains, enforced
+
+## The problem they solve
+
+The AI's pathological search loop: when it cannot find something, it searches
+and searches until it builds enough context to claim it found something. A
+programmer would never do that. Hitting "file not found," a programmer runs a
+chain: *permissions → is it blank → was it ever generated*. That chain is
+expertise — and the AI knows nothing about it.
+
+There are many rules an experienced developer has that the AI knows nothing
+about. Playbooks encode them.
+
+## What a playbook is
+
+A playbook is the user's diagnostic chain for a class of problem, encoded as
+an enforceable structure:
+
+- **Trigger** — a state or situation (e.g., "file not found", "UI blanking",
+  "edit_range rejected twice")
+- **Ordered steps** — the chain the user would run: rule out X, then Y, then Z
+- **Expected outcome** — what each step should produce
+
+Example (UI diagnosis): pasted HTML blanks the screen → rule out CSS
+inheritance → rule out missing element → rule out JS error → rule out
+rendering order. The AI executes *within* the chain instead of inventing its
+own approach.
+
+## Properties
+
+1. **Enforced, not suggested** — the AI must execute within the framework.
+   A playbook is not a hint; it is the structure of the next N tool calls.
+2. **Triggered by state, not always-on** — "file not found" is a *state*
+   that triggers *your* rule, not the AI's infinite search.
+3. **User-defined** — the user writes them from their own experience; the AI
+   can propose additions, but the user approves.
+4. **Evaluated** — a playbook that consistently leads to corrections gets
+   demoted by the evaluation layer; the router tries another.
+
+## The thought-pattern principle
+
+AI text models pattern-match input to output; there is no understanding. The
+user's thought process is the only structure that can guide them. A playbook
+is a **structured thought, repeatable regardless of the model** — the same
+chain works whether the engine is flash, pro, or anything else. This is what
+makes the user's expertise portable across models.

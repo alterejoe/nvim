@@ -13,8 +13,8 @@ local function tmux(cmd)
 	return vim.fn.system("tmux " .. cmd)
 end
 
-local function project_key()
-	local cwd = vim.fn.getcwd()
+local function project_key(cwd)
+	cwd = cwd or vim.fn.getcwd()
 	local parts = {}
 	for part in cwd:gmatch("[^/]+") do
 		table.insert(parts, part)
@@ -23,8 +23,8 @@ local function project_key()
 	return key:gsub("[%.%:]", "_")
 end
 
-local function session_name()
-	return OC_PREFIX .. project_key()
+local function session_name(cwd)
+	return OC_PREFIX .. project_key(cwd)
 end
 
 local function session_exists(name)
@@ -32,8 +32,8 @@ local function session_exists(name)
 	return vim.v.shell_error == 0
 end
 
-local function find_oc_buf()
-	local bufname = "opencode-term-" .. project_key()
+local function find_oc_buf(cwd)
+	local bufname = "opencode-term-" .. project_key(cwd)
 	for _, buf in ipairs(vim.api.nvim_list_bufs()) do
 		if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf):find(bufname, 1, true) then
 			return buf
@@ -47,44 +47,53 @@ local function protect_opencode_buf(buf)
 	vim.keymap.set("t", "<C-c>", "<C-\\><C-c>", { buffer = buf, noremap = true })
 end
 
---- Snap the tmux window to the nvim pty, then nudge the width down 1 and back.
---- The pane keeps a stale size when the session was created detached or the
---- buffer was re-shown after being hidden, so the opencode TUI renders larger
---- than the terminal window and overflows it. opentui sometimes drops a single
---- SIGWINCH (upstream opencode issues #2428, #16351, #34782), so the two-step
---- nudge guarantees a size change reaches the app and forces a correct repaint.
+--- Snap the tmux window to the nvim terminal window's actual geometry.
+--- This is called on real resize events only — never on focus changes.
+--- A focus transition must not synthesize SIGWINCH for OpenTUI.
 --- @param name string  tmux session name
---- @param win number    nvim window showing the oc buffer
+--- @param win number   nvim window showing the oc buffer
 local function resize_and_repaint(name, win)
 	if not vim.api.nvim_win_is_valid(win) then
 		return
 	end
-	local cols = vim.api.nvim_win_get_width(win)
-	tmux("resize-window -a -t " .. vim.fn.shellescape(name))
-	if cols > 3 then
-		vim.defer_fn(function()
-			tmux("resize-window -t " .. vim.fn.shellescape(name) .. " -x " .. (cols - 1))
-			vim.defer_fn(function()
-				tmux("resize-window -t " .. vim.fn.shellescape(name) .. " -x " .. cols)
-			end, 30)
-		end, 30)
-	end
+	local cols = math.max(1, vim.api.nvim_win_get_width(win))
+	local rows = math.max(1, vim.api.nvim_win_get_height(win))
+	tmux(
+		"resize-window -t "
+			.. vim.fn.shellescape(name)
+			.. " -x "
+			.. cols
+			.. " -y "
+			.. rows
+	)
 end
 
---- Keep the pane synced whenever the oc buffer's window is entered or left.
---- Debounced + scheduled: closing the review/journal viewer fires BufEnter
---- mid-window-close, and a blocking tmux resize at that moment makes the TUI
---- redraw at a stale size. vim.schedule defers it until the layout settles.
---- Registered once per buffer (vim.b guard) — the toggle path re-calls this.
+--- Keep the pane synced only when nvim's geometry actually changes.
+--- Do NOT use BufEnter/BufLeave/WinEnter/WinLeave: Oil and ordinary nvim
+--- navigation trigger those events, and resizing OpenTUI during focus changes
+--- corrupts the nested terminal renderer.
 --- @param name string  tmux session name
---- @param buf number    the opencode terminal buffer
+--- @param buf number   the opencode terminal buffer
 local function sync_on_enter(name, buf)
 	if vim.b[buf].oc_sync_registered then
 		return
 	end
 	vim.b[buf].oc_sync_registered = true
 	local timer = nil
-	local function schedule()
+	local function schedule(ev)
+		if ev.event == "WinResized" then
+			local target = vim.fn.win_findbuf(buf)[1]
+			local changed = false
+			for _, win in ipairs((vim.v.event and vim.v.event.windows) or {}) do
+				if win == target then
+					changed = true
+					break
+				end
+			end
+			if not changed then
+				return
+			end
+		end
 		if timer then
 			timer:stop()
 		end
@@ -100,15 +109,11 @@ local function sync_on_enter(name, buf)
 			resize_and_repaint(name, wins[1])
 		end, 50)
 	end
-	vim.api.nvim_create_autocmd({ "BufEnter", "BufLeave", "WinEnter", "WinLeave" }, {
-		buffer = buf,
+	vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
 		callback = schedule,
+		desc = "Resize OpenCode tmux session after its terminal geometry changes",
 	})
 end
-
---- Create the detached session at the size of the window that will display
---- it, so opencode's FIRST render is correct instead of tmux's 80x24 default
---- (the stale default is what later focus redraws fall back to).
 --- @param name string  tmux session name
 --- @param cwd string    start directory
 --- @param cols number   target window width
@@ -157,7 +162,7 @@ local function maybe_reassign(cwd)
 end
 
 local function open_oc_buffer(name, cwd)
-	local bufname = "opencode-term-" .. project_key()
+	local bufname = "opencode-term-" .. project_key(cwd)
 	vim.cmd("vsplit")
 	local win = vim.api.nvim_get_current_win()
 	local cols = vim.api.nvim_win_get_width(win)
@@ -192,8 +197,8 @@ local function open_oc_buffer(name, cwd)
 	end, 200)
 end
 
-local function close_oc_buffer()
-	local buf = find_oc_buf()
+local function close_oc_buffer(cwd)
+	local buf = find_oc_buf(cwd)
 	if not buf then
 		return false
 	end
@@ -207,6 +212,35 @@ local function close_oc_buffer()
 	return was_open
 end
 
+--- Public session controls for opencode-manage's health/reset panel.
+--- These reuse the same lifecycle as <leader>or: close the attached terminal,
+--- kill/recreate the tmux OpenCode wrapper, and preserve the OpenCode DB.
+function M.session_name_for_directory(cwd)
+	return session_name(cwd)
+end
+
+function M.is_running_for_directory(cwd)
+	return cwd and cwd ~= "" and session_exists(session_name(cwd))
+end
+
+function M.restart_for_directory(cwd)
+	if not cwd or cwd == "" then
+		return false, "no project directory"
+	end
+	local name = session_name(cwd)
+	close_oc_buffer(cwd)
+	local buf = find_oc_buf(cwd)
+	if buf and vim.api.nvim_buf_is_valid(buf) then
+		vim.api.nvim_buf_delete(buf, { force = true })
+	end
+	if session_exists(name) then
+		tmux("kill-session -t " .. vim.fn.shellescape(name))
+	end
+	vim.defer_fn(function()
+		open_oc_buffer(name, cwd)
+	end, 500)
+	return true
+end
 --- Persisted main session (3-line format: name, dir, db_sid) ---------------
 
 local function get_main_session()

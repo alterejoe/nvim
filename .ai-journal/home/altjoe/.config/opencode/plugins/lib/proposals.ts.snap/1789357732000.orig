@@ -1,0 +1,22 @@
+// /home/altjoe/.config/opencode/plugins/lib/proposals.ts FINAL
+/**
+ * Proposal queue (M1). The AI's only code "write" channel — appends to
+ * .ai-proposals/<session>.jsonl; the user applies via the nvim viewer.
+ */
+
+import { mkdirSync, appendFileSync } from "fs";
+import { join, dirname } from "path";
+
+export function proposalsFile(directory: string, sessionID: string): string {
+  return join(directory, ".ai-proposals", `${sessionID}.jsonl`);
+}
+
+export function appendProposal(
+  directory: string,
+  sessionID: string,
+  proposal: unknown,
+) {
+  const file = proposalsFile(directory, sessionID);
+  mkdirSync(dirname(file), { recursive: true });
+  appendFileSync(file, JSON.stringify(proposal) + "\n", "utf8");
+}

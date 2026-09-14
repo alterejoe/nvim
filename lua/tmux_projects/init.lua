@@ -1,147 +1,179 @@
--- /home/jmeyer/.config/nvim/lua/tmux_projects/init.lua FINAL
---[[
-Entry point for the tmux session management system.
-Splits the original 1377-line tmux_projects.lua into focused modules.
+-- lua/tmux_projects/init.lua FINAL-3
+-- Entry point and persistence for the tmux palette + workspace board.
+--
+-- The JSON store is authoritative once created:
+--   projects   : folder key -> list of { name, path } sessions
+--   workspaces : name -> { folders = { "backend", ... },
+--                          sessions = { { name, path, folder }, ... } }
+--   board      : the unnamed workspace board state (persisted on W)
+--
+-- Legacy flat group maps are migrated to the new shape on first load.
 
-State files:
-  tmux_session_slots        — session order
-  tmux_active_project       — active project name
-  tmux_project_overrides.json — edited project groups
---]]
-
-local state = require("tmux_projects.state")
 local M = {}
 
 M.projects = {}
+M.workspaces = {}
+M.board = { folders = {}, sessions = {} }
 M.default = {}
 M.nvim = false
 M.project_order = {}
 
--- -----------------------------------------------------------------------
--- Persistence
--- -----------------------------------------------------------------------
-
 local order_file = vim.fn.stdpath("data") .. "/tmux_session_slots"
 local active_project_file = vim.fn.stdpath("data") .. "/tmux_active_project"
-local overrides_file = vim.fn.stdpath("data") .. "/tmux_project_overrides.json"
+local store_file = vim.fn.stdpath("data") .. "/tmux_project_overrides.json"
 local show_hidden = false
 
+local function copy(value)
+	return vim.deepcopy(value)
+end
+
+local function read_store()
+	local file = io.open(store_file, "r")
+	if not file then
+		return nil
+	end
+	local raw = file:read("*a")
+	file:close()
+	if not raw or vim.trim(raw) == "" then
+		return nil
+	end
+	local ok, decoded = pcall(vim.json.decode, raw)
+	if not ok or type(decoded) ~= "table" then
+		vim.notify("tmux: invalid project store; using configured projects", vim.log.levels.ERROR)
+		return nil
+	end
+	return decoded
+end
+
+function M.save_store()
+	local file = io.open(store_file, "w")
+	if not file then
+		vim.notify("tmux: could not write " .. store_file, vim.log.levels.ERROR)
+		return false
+	end
+	file:write(vim.json.encode({ projects = M.projects, workspaces = M.workspaces, board = M.board }))
+	file:close()
+	return true
+end
+
+-- Kept for the remaining group helpers; same backing file.
+function M.save_overrides()
+	return M.save_store()
+end
+
+function M.load_overrides()
+	local store = read_store()
+	if not store then
+		return {}
+	end
+	return store.projects or store
+end
+
 function M.load_order()
-	local f = io.open(order_file, "r")
-	if not f then
+	local file = io.open(order_file, "r")
+	if not file then
 		return {}
 	end
 	local slots = {}
-	for line in f:lines() do
-		local t = vim.trim(line)
-		if t ~= "" then
-			table.insert(slots, t)
+	for line in file:lines() do
+		local value = vim.trim(line)
+		if value ~= "" then
+			table.insert(slots, value)
 		end
 	end
-	f:close()
+	file:close()
 	return slots
 end
 
 function M.save_order(slots)
-	local f = io.open(order_file, "w")
-	if not f then
+	local file = io.open(order_file, "w")
+	if not file then
 		vim.notify("tmux: could not write " .. order_file, vim.log.levels.ERROR)
 		return
 	end
-	for _, s in ipairs(slots) do
-		f:write(s .. "\n")
+	for _, session in ipairs(slots) do
+		file:write(session .. "\n")
 	end
-	f:close()
-end
-
-function M.load_overrides()
-	local f = io.open(overrides_file, "r")
-	if not f then
-		return {}
-	end
-	local raw = f:read("*a")
-	f:close()
-	if not raw or raw == "" then
-		return {}
-	end
-	local ok, data = pcall(vim.fn.json_decode, raw)
-	if not ok or type(data) ~= "table" then
-		return {}
-	end
-	return data
-end
-
-function M.save_overrides()
-	local data = {}
-	for group, entries in pairs(M.projects) do
-		data[group] = entries
-	end
-	local f = io.open(overrides_file, "w")
-	if not f then
-		vim.notify("tmux: could not write overrides", vim.log.levels.ERROR)
-		return
-	end
-	f:write(vim.fn.json_encode(data))
-	f:close()
-end
-
-function M.merge_overrides()
-	local overrides = M.load_overrides()
-	for group, entries in pairs(overrides) do
-		M.projects[group] = entries
-	end
-	local in_order = {}
-	for _, g in ipairs(M.project_order) do
-		in_order[g] = true
-	end
-	for group in pairs(overrides) do
-		if not in_order[group] then
-			table.insert(M.project_order, group)
-		end
-	end
+	file:close()
 end
 
 function M.get_show_hidden()
 	return show_hidden
 end
 
-function M.set_show_hidden(v)
-	show_hidden = v
+function M.set_show_hidden(value)
+	show_hidden = value == true
 end
 
--- -----------------------------------------------------------------------
--- Active project
--- -----------------------------------------------------------------------
-
 function M.get_active_project()
-	local f = io.open(active_project_file, "r")
-	if not f then
+	local file = io.open(active_project_file, "r")
+	if not file then
 		return nil
 	end
-	local name = vim.trim(f:read("*a"))
-	f:close()
+	local name = vim.trim(file:read("*a"))
+	file:close()
 	return name ~= "" and name or nil
 end
 
 function M.set_active_project(name)
-	local f = io.open(active_project_file, "w")
-	if not f then
+	local file = io.open(active_project_file, "w")
+	if not file then
+		vim.notify("tmux: could not write active project", vim.log.levels.ERROR)
 		return
 	end
-	f:write(name)
-	f:close()
+	file:write(name)
+	file:close()
 end
 
--- -----------------------------------------------------------------------
--- Setup
--- -----------------------------------------------------------------------
+local function ordered_group_names(projects, configured_order)
+	local result = {}
+	local seen = {}
+	for _, name in ipairs(configured_order or {}) do
+		if projects[name] and not seen[name] then
+			table.insert(result, name)
+			seen[name] = true
+		end
+	end
+	local remaining = {}
+	for name in pairs(projects) do
+		if not seen[name] then
+			table.insert(remaining, name)
+		end
+	end
+	table.sort(remaining)
+	for _, name in ipairs(remaining) do
+		table.insert(result, name)
+	end
+	return result
+end
 
 function M.setup(opts)
-	M.projects = opts.projects or {}
-	M.default = opts.default or {}
-	M.nvim = opts.nvim or false
-	M.project_order = opts.project_order or vim.tbl_keys(M.projects)
-	M.merge_overrides()
+	opts = opts or {}
+	M.default = copy(opts.default or {})
+	M.nvim = opts.nvim == true
+
+	local configured = copy(opts.projects or {})
+	local stored = read_store()
+	if stored and (stored.projects or stored.workspaces) then
+		M.projects = stored.projects or {}
+		M.workspaces = stored.workspaces or {}
+		M.board = stored.board or { folders = {}, sessions = {} }
+	elseif stored then
+		-- Legacy flat group map: migrate once.
+		M.projects = stored
+		M.workspaces = {}
+		M.board = { folders = {}, sessions = {} }
+		M.save_store()
+	else
+		M.projects = configured
+		M.workspaces = {}
+		M.board = { folders = {}, sessions = {} }
+		if next(M.projects) ~= nil then
+			M.save_store()
+		end
+	end
+
+	M.project_order = ordered_group_names(M.projects, opts.project_order)
 end
 
 require("tmux_projects.projects").setup(M)

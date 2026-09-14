@@ -1,405 +1,414 @@
--- /home/jmeyer/.config/nvim/lua/tmux_projects/projects.lua FINAL-2
--- Project-level operations: open, switch, recover, pick, group drill-down.
+-- lua/tmux_projects/projects.lua FINAL-9
+-- Tmux palette: saved sessions, folders and workspaces (<leader>tp).
+--
+-- The palette is a launcher, not a session holder. Enter on a session or
+-- workspace creates the sessions and hands them off to the workspace board
+-- (<leader>ts), which opens in their place. Switching happens in the board.
+--
+-- Root shows two containers:
+--   projects/   saved session definitions as folders, sessions are "name<TAB>path"
+--   workspaces/ named session combinations; Enter opens the whole workspace
+--
+-- Folders are edited Oil-style: change the text, W to apply. W prompts for
+-- missing session paths via a fuzzy picker and recreates live sessions whose
+-- path changed. A session lives in exactly one folder. Deleting a folder or
+-- a session row deletes it in tmux too.
 
 local state = require("tmux_projects.state")
-local scratchbuf = require("scratchbuf")
+local browser = require("tmux_projects.browser")
 
 local M_sub = {}
 
 function M_sub.setup(M)
-	local function create_session(s)
-		local path = vim.fn.expand(s.path)
-		local exists =
-			vim.trim(vim.fn.system("tmux has-session -t=" .. vim.fn.shellescape(s.name) .. " 2>/dev/null; echo $?"))
-		if exists ~= "0" then
-			local cmd = "new-session -ds " .. vim.fn.shellescape(s.name) .. " -c " .. vim.fn.shellescape(path)
-			if s.nvim ~= false and M.nvim then
-				cmd = cmd .. " " .. vim.fn.shellescape("nvim .")
+	local function shell(value)
+		return vim.fn.shellescape(value)
+	end
+
+	local function find_session_path(name)
+		for _, entries in pairs(M.projects) do
+			for _, entry in ipairs(entries) do
+				if entry.name == name then
+					return entry.path
+				end
 			end
-			state.tmux(cmd)
+		end
+		return nil
+	end
+
+	local function project_key(prefix)
+		if prefix == "projects" then
+			return ""
+		end
+		return (prefix:gsub("^projects/", ""))
+	end
+
+	local function is_project_level(prefix)
+		return prefix == "projects" or vim.startswith(prefix, "projects/")
+	end
+
+	local function child_folders(key)
+		local folders, seen = {}, {}
+		local base = key == "" and "" or (key .. "/")
+		for name in pairs(M.projects) do
+			if name ~= key and vim.startswith(name, base) then
+				local remainder = name:sub(#base + 1)
+				local child = remainder:match("^([^/]+)/") or remainder
+				if child ~= "" and not seen[child] then
+					seen[child] = true
+					table.insert(folders, child)
+				end
+			end
+		end
+		table.sort(folders)
+		return folders
+	end
+
+	-- Delete a folder tree and kill the tmux sessions of its sessions.
+	local function delete_tree(key)
+		local doomed = {}
+		for name in pairs(M.projects) do
+			if name == key or vim.startswith(name, key .. "/") then
+				table.insert(doomed, name)
+			end
+		end
+		local sessions_to_kill = {}
+		for _, name in ipairs(doomed) do
+			for _, entry in ipairs(M.projects[name] or {}) do
+				table.insert(sessions_to_kill, entry)
+			end
+			M.projects[name] = nil
+		end
+		for _, entry in ipairs(sessions_to_kill) do
+			if state.session_exists(entry.name) then
+				state.tmux("kill-session -t " .. shell(entry.name))
+			end
+		end
+		if #sessions_to_kill > 0 then
+			browser.invalidate_live()
 		end
 	end
 
+	local function render(prefix)
+		if prefix == "" then
+			return { "projects/", "workspaces/" }
+		end
+		if prefix == "workspaces" then
+			local names = vim.tbl_keys(M.workspaces)
+			table.sort(names)
+			return names
+		end
+		local key = project_key(prefix)
+		local lines = {}
+		for _, folder in ipairs(child_folders(key)) do
+			table.insert(lines, folder .. "/")
+		end
+		for _, session in ipairs(M.projects[key] or {}) do
+			table.insert(lines, session.name .. "\t" .. (session.path or ""))
+		end
+		return lines
+	end
+
+	local function commit(prefix, lines, prompt_paths)
+		if prefix == "" then
+			return true
+		end
+		if prefix == "workspaces" then
+			local next_workspaces = {}
+			for _, line in ipairs(lines) do
+				local name = vim.trim(line)
+				if name ~= "" and name:sub(-1) ~= "/" then
+					next_workspaces[name] = M.workspaces[name] or { folders = {}, sessions = {} }
+				end
+			end
+			M.workspaces = next_workspaces
+			M.save_store()
+			return true
+		end
+		if not is_project_level(prefix) then
+			return true
+		end
+
+		local key = project_key(prefix)
+		local old_sessions = M.projects[key] or {}
+		local old_by_name = {}
+		for _, session in ipairs(old_sessions) do
+			old_by_name[session.name] = session
+		end
+		local old_children = child_folders(key)
+
+		local new_sessions = {}
+		local kept_folders = {}
+		for _, line in ipairs(lines) do
+			local raw = vim.trim(line)
+			if raw ~= "" then
+				-- Folder rows are single tokens ending in "/"; a session row
+				-- with a trailing-slash path (e.g. "test<TAB>/") is a session.
+				if raw:sub(-1) == "/" and not raw:find("%s") then
+					local name = vim.trim(raw:sub(1, -2))
+					if name ~= "" then
+						kept_folders[key == "" and name or (key .. "/" .. name)] = true
+					end
+				else
+					local name, path = raw:match("^(.-)%s+(.+)$")
+					if not name then
+						name, path = raw, ""
+					end
+					name = vim.trim(name)
+					path = vim.trim(path or "")
+					if name ~= "" then
+						local old = old_by_name[name]
+						table.insert(new_sessions, {
+							name = name,
+							path = path ~= "" and path or (old and old.path or ""),
+						})
+					end
+				end
+			end
+		end
+
+		-- A session lives in exactly one folder: drop same-name entries from
+		-- every other folder so moves/creates never duplicate.
+		local new_names = {}
+		for _, session in ipairs(new_sessions) do
+			new_names[session.name] = true
+		end
+
+		-- Sessions deleted at this level are killed in tmux too, so they do
+		-- not reappear at the board root as live sessions.
+		local deleted_sessions = {}
+		for name, old in pairs(old_by_name) do
+			if not new_names[name] then
+				table.insert(deleted_sessions, old)
+			end
+		end
+
+		for other_key, entries in pairs(M.projects) do
+			if other_key ~= key then
+				local filtered = {}
+				for _, entry in ipairs(entries) do
+					if not new_names[entry.name] then
+						table.insert(filtered, entry)
+					end
+				end
+				M.projects[other_key] = filtered
+			end
+		end
+
+		-- On explicit save (W): recreate live sessions whose base path changed.
+		if prompt_paths then
+			for _, session in ipairs(new_sessions) do
+				local old = old_by_name[session.name]
+				if old and old.path ~= session.path and session.path ~= "" and state.session_exists(session.name) then
+					browser.recreate_session(session.name, session.path)
+				end
+			end
+		end
+
+		M.projects[key] = new_sessions
+		for _, child_name in ipairs(old_children) do
+			local child = key == "" and child_name or (key .. "/" .. child_name)
+			if not kept_folders[child] then
+				delete_tree(child)
+			end
+		end
+		for child in pairs(kept_folders) do
+			M.projects[child] = M.projects[child] or {}
+		end
+		M.save_store()
+
+		for _, session in ipairs(deleted_sessions) do
+			if state.session_exists(session.name) then
+				state.tmux("kill-session -t " .. shell(session.name))
+			end
+		end
+		if #deleted_sessions > 0 then
+			browser.invalidate_live()
+		end
+		return true
+	end
+
+	local function create_session(name, path)
+		if not path or path == "" then
+			return false
+		end
+		if not state.session_exists(name) then
+			state.tmux("new-session -ds " .. shell(name) .. " -c " .. shell(vim.fn.expand(path)))
+		end
+		return true
+	end
+
+	-- Launch a saved session into the board: create it if missing, hand it to
+	-- the board, and let the board open in the palette's place.
+	local function open_saved_session(name, path)
+		local resolved = path
+		if resolved == "" then
+			resolved = find_session_path(name) or ""
+		end
+		if resolved == "" then
+			local entered = vim.fn.input("Path for [" .. name .. "]: ", "", "dir")
+			if entered == "" then
+				vim.notify("tmux: no path for '" .. name .. "'", vim.log.levels.WARN)
+				return false
+			end
+			resolved = vim.trim(entered)
+		end
+		if not state.session_exists(name) then
+			state.tmux("new-session -ds " .. shell(name) .. " -c " .. shell(vim.fn.expand(resolved)))
+		end
+		M.add_to_board(name, resolved)
+		browser.invalidate_live()
+		return true
+	end
+
+	local function open_workspace(name)
+		local workspace = M.workspaces[name]
+		if not workspace then
+			vim.notify("tmux: unknown workspace '" .. name .. "'", vim.log.levels.ERROR)
+			return false
+		end
+		for _, session in ipairs(workspace.sessions or {}) do
+			local path = session.path
+			if not path or path == "" then
+				path = find_session_path(session.name)
+			end
+			if path and path ~= "" then
+				if not state.session_exists(session.name) then
+					state.tmux("new-session -ds " .. shell(session.name) .. " -c " .. shell(vim.fn.expand(path)))
+				end
+				M.add_to_board(session.name, path)
+			end
+		end
+		M.set_active_project(name)
+		browser.invalidate_live()
+		vim.notify("Workspace loaded: " .. name, vim.log.levels.INFO)
+		return true
+	end
+
 	function M.open_project(name)
-		local proj = M.projects[name]
-		if not proj then
+		local sessions = M.projects[name]
+		if not sessions then
 			vim.notify("tmux: unknown project '" .. name .. "'", vim.log.levels.ERROR)
 			return
 		end
-		local slots = {}
-		for _, s in ipairs(proj) do
-			table.insert(slots, s.name)
-			create_session(s)
+		local slots, first = {}, nil
+		for _, session in ipairs(sessions) do
+			if create_session(session.name, session.path) then
+				table.insert(slots, session.name)
+				first = first or session.name
+			end
 		end
-		for _, s in ipairs(M.default) do
-			table.insert(slots, s.name)
-			create_session(s)
+		for _, session in ipairs(M.default) do
+			if create_session(session.name, session.path) then
+				table.insert(slots, session.name)
+				first = first or session.name
+			end
 		end
 		M.save_order(slots)
 		M.set_active_project(name)
-		state.tmux("switch-client -t " .. vim.fn.shellescape(proj[1].name))
+		if first then
+			state.tmux("switch-client -t " .. shell(first))
+		end
 		vim.notify("Project loaded: " .. name, vim.log.levels.INFO)
 	end
 
 	function M.switch_project(name)
 		M.open_project(name)
 		local keep = {}
-		for _, s in ipairs(M.default) do
-			keep[s.name] = true
+		for _, session in ipairs(M.default) do
+			keep[session.name] = true
 		end
-		if M.projects[name] then
-			for _, s in ipairs(M.projects[name]) do
-				keep[s.name] = true
-			end
+		for _, session in ipairs(M.projects[name] or {}) do
+			keep[session.name] = true
 		end
-		local live = vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null")
-		for _, s in ipairs(live) do
-			if not keep[s] then
-				vim.fn.system("tmux kill-session -t=" .. vim.fn.shellescape(s) .. " 2>/dev/null")
+		for _, live in ipairs(vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null")) do
+			if not keep[live] then
+				vim.fn.system("tmux kill-session -t=" .. shell(live) .. " 2>/dev/null")
 			end
 		end
 	end
 
 	function M.recover_project()
 		local active = M.get_active_project()
-		if active and M.projects[active] then
+		if active and M.workspaces[active] then
+			open_workspace(active)
+		elseif active and M.projects[active] then
 			M.open_project(active)
 		else
 			vim.notify("tmux: no active project to recover", vim.log.levels.WARN)
 		end
 	end
 
-	-- Group drill-down -----------------------------------------------------
-	local function show_group_sessions(group_name)
-		local proj = M.projects[group_name]
-		if not proj then
-			vim.notify("tmux: unknown project '" .. group_name .. "'", vim.log.levels.ERROR)
-			return
-		end
-
-		local entries = {}
-		local path_map = {}
-		for _, s in ipairs(proj) do
-			local e = { name = s.name, path = s.path }
-			table.insert(entries, e)
-			path_map[s.name] = s.path
-		end
-		for _, s in ipairs(M.default) do
-			local e = { name = s.name, path = s.path, _default = true }
-			table.insert(entries, e)
-			path_map[s.name] = s.path
-		end
-
-		local live_sessions = vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null") or {}
-		local hidden_ocs = {}
-		for _, s in ipairs(live_sessions) do
-			if s:find("^opencode%-") then
-				local oc_tail = s:gsub("^opencode%-", "")
-				for _, e in ipairs(entries) do
-					local e_key = e.name:gsub("/", "-"):gsub("%.", "_")
-					if oc_tail == e_key then
-						table.insert(hidden_ocs, s)
-						break
-					end
-				end
-			end
-		end
-
-		local showing_hidden = false
-		local function build_lines()
-			local lines = {}
-			for _, e in ipairs(entries) do
-				table.insert(lines, e.name)
-			end
-			if showing_hidden then
-				for _, h in ipairs(hidden_ocs) do
-					table.insert(lines, h .. "  (opencode)")
-				end
-			end
-			return lines
-		end
-
-		local current = vim.trim(vim.fn.system("tmux display-message -p '#S' 2>/dev/null"))
-
-		scratchbuf.open({
-			title = group_name .. " sessions",
-			lines = build_lines(),
-			current = current,
-			refresh = function()
-				local fresh = vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null") or {}
-				hidden_ocs = {}
-				for _, s in ipairs(fresh) do
-					if s:find("^opencode%-") then
-						local oc_tail = s:gsub("^opencode%-", "")
-						for _, e in ipairs(entries) do
-							local e_key = e.name:gsub("/", "-"):gsub("%.", "_")
-							if oc_tail == e_key then
-								table.insert(hidden_ocs, s)
-								break
-							end
-						end
-					end
-				end
-				return build_lines()
-			end,
-			on_open = function(name)
-				local clean = name:gsub("%s*%(opencode%)$", "")
-				local is_oc = false
-				for _, h in ipairs(hidden_ocs) do
-					if name == h .. "  (opencode)" then
-						is_oc = true
-						break
-					end
-				end
-				if is_oc then
-					state.tmux("switch-client -t " .. vim.fn.shellescape(clean))
-					return
-				end
-				local path = path_map[clean]
-				if not path then
-					vim.notify("tmux: no path for '" .. clean .. "'", vim.log.levels.WARN)
-					return
-				end
-				local exists = vim.trim(
-					vim.fn.system("tmux has-session -t=" .. vim.fn.shellescape(clean) .. " 2>/dev/null; echo $?")
-				)
-				if exists ~= "0" then
-					local expanded = vim.fn.expand(path)
-					local cmd = "new-session -ds "
-						.. vim.fn.shellescape(clean)
-						.. " -c "
-						-- FIXED: use expanded (already resolved) not raw path
-						.. vim.fn.shellescape(expanded)
-					if M.nvim then
-						cmd = cmd .. " " .. vim.fn.shellescape("nvim .")
-					end
-					state.tmux(cmd)
-					vim.notify("tmux: created session '" .. clean .. "'", vim.log.levels.INFO)
-				end
-				state.tmux("switch-client -t " .. vim.fn.shellescape(clean))
-			end,
-			-- FIXED: no rename detection. Simple path_map lookup.
-			-- name in path_map → keep with existing path
-			-- name NOT in path_map → new entry, needs path prompt
-			on_save = function()
-				local buf = vim.api.nvim_get_current_buf()
-				local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-				local default_names = {}
-				for _, d in ipairs(M.default) do
-					default_names[d.name] = true
-				end
-				local new_entries = {}
-				local needs_path = {}
-				for _, raw in ipairs(lines) do
-					local name = vim.trim(raw)
-					if name == "" or name:find("%(opencode%)$") or default_names[name] then
-						goto next_line
-					end
-					local path = path_map[name]
-					if path then
-						table.insert(new_entries, { name = name, path = path })
-					else
-						table.insert(new_entries, { name = name, path = "" })
-						table.insert(needs_path, name)
-					end
-					::next_line::
-				end
-				if #new_entries == 0 then
-					return
-				end
-				M.projects[group_name] = new_entries
-				M.save_overrides()
-				entries = {}
-				path_map = {}
-				for _, s in ipairs(new_entries) do
-					table.insert(entries, { name = s.name, path = s.path })
-					path_map[s.name] = s.path
-				end
-				for _, d in ipairs(M.default) do
-					table.insert(entries, { name = d.name, path = d.path, _default = true })
-				end
-				vim.notify("tmux: saved '" .. group_name .. "' order", vim.log.levels.INFO)
-				if #needs_path > 0 then
-					vim.schedule(function()
-						local function process(i)
-							if i > #needs_path then
-								return
-							end
-							local name = needs_path[i]
-							state.pick_directory(function(path)
-								if path and path ~= "" then
-									for _, e in ipairs(M.projects[group_name] or {}) do
-										if e.name == name then
-											e.path = path
-											break
-										end
-									end
-									M.save_overrides()
-									local expanded = vim.fn.expand(path)
-									state.tmux(
-										"new-session -ds "
-											.. vim.fn.shellescape(name)
-											.. " -c "
-											.. vim.fn.shellescape(expanded)
-									)
-									vim.notify(
-										"tmux: created session '" .. name .. "' at " .. path,
-										vim.log.levels.INFO
-									)
-								end
-								process(i + 1)
-							end)
-						end
-						process(1)
-					end)
-				end
-				return true
-			end,
-			on_ready = function(buf, _win)
-				local ns = vim.api.nvim_create_namespace("tmux_drilldown_hints")
-				local function render_hints()
-					vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
-					local lc = vim.api.nvim_buf_line_count(buf)
-					vim.api.nvim_buf_set_extmark(buf, ns, math.max(lc - 1, 0), 0, {
-						virt_lines = {
-							{ { "  ", "Comment" } },
-							{
-								{ "<CR> ", "Title" },
-								{ "select  ", "Comment" },
-								{ "H ", "Title" },
-								{ "opencode  ", "Comment" },
-								{ "o ", "Title" },
-								{ "new  ", "Comment" },
-								{ "e ", "Title" },
-								{ "path  ", "Comment" },
-								{ "W ", "Title" },
-								{ "save  ", "Comment" },
-								{ "r ", "Title" },
-								{ "refresh  ", "Comment" },
-								{ "/ ", "Title" },
-								{ "filter  ", "Comment" },
-								{ "S ", "Title" },
-								{ "switch  ", "Comment" },
-								{ "Q ", "Title" },
-								{ "close", "Comment" },
-							},
-						},
-						virt_lines_above = false,
-					})
-				end
-				render_hints()
-				vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
-					buffer = buf,
-					callback = render_hints,
-				})
-
-				vim.keymap.set("n", "H", function()
-					if #hidden_ocs == 0 then
-						vim.notify("tmux: no opencode sessions for this group", vim.log.levels.WARN)
-						return
-					end
-					showing_hidden = not showing_hidden
-					vim.api.nvim_buf_set_lines(buf, 0, -1, false, build_lines())
-					vim.notify(
-						"tmux: " .. (showing_hidden and "showing" or "hiding") .. " opencode sessions",
-						vim.log.levels.INFO
-					)
-				end, { buffer = buf, nowait = true, noremap = true, desc = "Toggle opencode sessions" })
-
-				vim.keymap.set("n", "e", function()
-					local session = vim.trim(vim.api.nvim_get_current_line())
-					if session == "" then
-						return
-					end
-					local clean = session:gsub("%s*%(opencode%)$", "")
-					M.edit_session(clean)
-				end, { buffer = buf, nowait = true, noremap = true, desc = "Edit session path" })
-
-				vim.keymap.set("n", "S", function()
-					local line = vim.trim(vim.api.nvim_get_current_line())
-					if line == "" then
-						return
-					end
-					local clean = line:gsub("%s*%(opencode%)$", "")
-					local path = path_map[clean]
-					if not path then
-						vim.notify("tmux: no path for '" .. clean .. "'", vim.log.levels.WARN)
-						return
-					end
-					vim.schedule(function()
-						if vim.api.nvim_buf_is_valid(buf) then
-							vim.api.nvim_buf_delete(buf, { force = true })
-						end
-						M.switch_project(group_name)
-					end)
-				end, { buffer = buf, nowait = true, noremap = true, desc = "Switch project (kill old)" })
-			end,
-		})
-	end
-
-	-- Project picker -------------------------------------------------------
 	function M.pick_project()
-		if not state.in_tmux() then
-			return
-		end
-		local names = M.project_order
-		if #names == 0 then
-			vim.notify("tmux: no projects defined", vim.log.levels.WARN)
-			return
-		end
-		local active = M.get_active_project()
-		local live_set = {}
-		local live = vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null")
-		for _, s in ipairs(live) do
-			live_set[s] = true
-		end
-		local title = "Tmux Projects" .. (active and (" [" .. active .. "]") or "")
-		scratchbuf.open({
-			title = title,
-			lines = names,
-			current = active,
-			refresh = function()
-				return names
+		browser.open_level({
+			title_root = "Tmux Palette",
+			title_prefix = "Palette",
+			prefix = "",
+			render = render,
+			commit = commit,
+			open_session = function(name, path, prefix)
+				local ok
+				if prefix == "workspaces" then
+					ok = open_workspace(name)
+				else
+					ok = open_saved_session(name, path)
+				end
+				if ok then
+					-- Hand off to the board: it opens after the palette closes.
+					vim.schedule(function()
+						M.open_workboard()
+					end)
+				end
+				return ok
 			end,
-			on_open = function(entry)
-				show_group_sessions(entry)
+			on_missing_paths = function(buf, prefix)
+				if not is_project_level(prefix) then
+					return
+				end
+				local key = project_key(prefix)
+				local missing = {}
+				for _, session in ipairs(M.projects[key] or {}) do
+					if session.path == "" then
+						table.insert(missing, session)
+					end
+				end
+				if #missing == 0 then
+					return
+				end
+				vim.schedule(function()
+					local function process(i)
+						if i > #missing then
+							if vim.api.nvim_buf_is_valid(buf) then
+								vim.api.nvim_buf_set_lines(buf, 0, -1, false, render(prefix))
+								vim.bo[buf].modified = false
+							end
+							return
+						end
+						local session = missing[i]
+						browser.pick_path(find_session_path(session.name) or "", function(path)
+							if path and path ~= "" then
+								session.path = path
+								M.save_store()
+							end
+							process(i + 1)
+						end)
+					end
+					process(1)
+				end)
 			end,
-			on_save = function() end,
-			on_ready = function(buf, _win)
+			on_ready = function(buf, prefix)
 				vim.keymap.set("n", "S", function()
-					local line = vim.trim(vim.api.nvim_get_current_line())
-					if line == "" then
+					if not is_project_level(prefix) then
 						return
 					end
-					vim.schedule(function()
-						if vim.api.nvim_buf_is_valid(buf) then
-							vim.api.nvim_buf_delete(buf, { force = true })
-						end
-						M.switch_project(line)
-					end)
-				end, { buffer = buf, nowait = true, noremap = true, desc = "Switch project (kill old)" })
-				local ns = vim.api.nvim_create_namespace("tmux_project_preview")
-				local plines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-				local default_parts = {}
-				for _, s in ipairs(M.default) do
-					local icon = live_set[s.name] and "*" or "-"
-					table.insert(default_parts, icon .. " " .. s.name)
-				end
-				local default_str = #default_parts > 0 and ("  |  " .. table.concat(default_parts, "  ")) or ""
-				for i, line in ipairs(plines) do
-					local proj = M.projects[vim.trim(line)]
-					if proj then
-						local parts = {}
-						for _, s in ipairs(proj) do
-							local icon = live_set[s.name] and "*" or "-"
-							table.insert(parts, icon .. " " .. s.name)
-						end
-						vim.api.nvim_buf_set_extmark(buf, ns, i - 1, 0, {
-							virt_text = { { "  " .. table.concat(parts, "  ") .. default_str, "Comment" } },
-							virt_text_pos = "eol",
-						})
+					local key = project_key(prefix)
+					if key == "" then
+						return
 					end
-				end
+					M.switch_project(key)
+					browser.invalidate_live()
+					vim.api.nvim_buf_set_lines(buf, 0, -1, false, render(prefix))
+					vim.bo[buf].modified = false
+				end, { buffer = buf, nowait = true, noremap = true, desc = "Open all (kill others)" })
 			end,
 		})
 	end

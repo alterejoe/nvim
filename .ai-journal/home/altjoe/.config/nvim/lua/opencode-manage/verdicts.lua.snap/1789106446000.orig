@@ -1,0 +1,227 @@
+-- opencode-manage.verdicts — the shared store (T2, 10-verdict-capture.md).
+-- SQLite verdict store: <project>/.opencode/state.db per project + global
+-- ~/.config/opencode/state.db. Written by the nvim viewer (user actions),
+-- read by the manage plugin (injection) and later the sidecar (T4).
+-- One store, one manager, no JSONL sprawl. The AI never writes here.
+-- Driver: sqlite.lua (LuaJIT FFI → libsqlite3), required LAZILY inside
+-- functions — a missing sqlite.lua must never break nvim startup.
+-- Fail-open: a verdict write must never break the review flow.
+-- The .opencode dir is CREATED on demand at the project root (git dir or
+-- cwd) — the store must not depend on the dir pre-existing.
+
+local M = {}
+
+-- sqlite is required on first use, not at module load (lazy.nvim has
+-- install.missing=false — plugins are installed manually via :Lazy install).
+local sqlite = nil
+
+local SCHEMA = [[
+CREATE TABLE IF NOT EXISTS verdicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  session_id TEXT,
+  proposal_id INTEGER,
+  group_name TEXT,
+  path TEXT NOT NULL,
+  operation TEXT,
+  verdict TEXT NOT NULL,
+  reason TEXT,
+  proposed_content TEXT,
+  applied_content TEXT,
+  project TEXT,
+  scope TEXT NOT NULL DEFAULT 'project'
+);
+CREATE INDEX IF NOT EXISTS idx_verdicts_path ON verdicts(path);
+CREATE INDEX IF NOT EXISTS idx_verdicts_ts ON verdicts(ts);
+]]
+
+--- Nearest .opencode dir: walk up from cwd; stop at the project root
+--- (first dir with .git) and CREATE .opencode there if missing.
+--- @return string
+local function project_dir()
+	local dir = vim.fn.getcwd()
+	for _ = 1, 12 do
+		local candidate = dir .. "/.opencode"
+		if vim.fn.isdirectory(candidate) == 1 then
+			return candidate
+		end
+		if vim.fn.isdirectory(dir .. "/.git") == 1 then
+			break
+		end
+		local parent = vim.fn.fnamemodify(dir, ":h")
+		if parent == dir then
+			break
+		end
+		dir = parent
+	end
+	local root = vim.fn.isdirectory(dir .. "/.git") == 1 and dir or vim.fn.getcwd()
+	vim.fn.mkdir(root .. "/.opencode", "p")
+	return root .. "/.opencode"
+end
+
+--- @return string
+local function global_dir()
+	return vim.env.HOME .. "/.config/opencode"
+end
+
+--- Open (creating if needed) a store and ensure the schema.
+--- Fail-open: no sqlite.lua installed → nil, never a crash.
+--- @param dir string
+--- @return table|nil
+local function open_db(dir)
+	vim.fn.mkdir(dir, "p")
+	local ok, db = pcall(function()
+		if not sqlite then
+			sqlite = require("sqlite")
+		end
+		return sqlite.open(dir .. "/state.db")
+	end)
+	if not ok then
+		return nil
+	end
+	local ok2 = pcall(function()
+		db:exec(SCHEMA)
+	end)
+	if not ok2 then
+		db:close()
+		return nil
+	end
+	return db
+end
+
+--- Project slug: the project root's basename.
+--- @return string
+local function project_slug()
+	local d = project_dir()
+	return vim.fn.fnamemodify(d, ":h:t")
+end
+
+--- Record a verdict in the project store.
+--- @param opts table  ts, session_id, proposal_id, group_name, path, operation,
+---   verdict, reason, proposed_content, applied_content
+function M.record(opts)
+	local dir = project_dir()
+	local db = open_db(dir)
+	if not db then
+		vim.notify("⚠️ verdicts: cannot open store " .. dir .. "/state.db", vim.log.levels.WARN)
+		return
+	end
+	local ok, err = pcall(function()
+		local stmt = db:prepare([[
+			INSERT INTO verdicts
+			  (ts, session_id, proposal_id, group_name, path, operation, verdict,
+			   reason, proposed_content, applied_content, project, scope)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'project')
+		]])
+		stmt:bind(
+			opts.ts or os.time() * 1000,
+			opts.session_id,
+			opts.proposal_id,
+			opts.group_name,
+			opts.path,
+			opts.operation,
+			opts.verdict,
+			opts.reason,
+			opts.proposed_content,
+			opts.applied_content,
+			project_slug()
+		)
+		stmt:step()
+		stmt:close()
+	end)
+	db:close()
+	if not ok then
+		vim.notify("⚠️ verdicts: write failed: " .. tostring(err), vim.log.levels.WARN)
+	end
+end
+
+--- Global promotion: same path + verdict seen in ≥2 distinct projects →
+--- also written to the global store (scope='global').
+--- @param path string
+--- @param verdict string
+function M.promote_if_cross_project(path, verdict)
+	local dir = project_dir()
+	local db = open_db(dir)
+	if not db then
+		return
+	end
+	local n = 0
+	local ok = pcall(function()
+		local stmt = db:prepare(
+			"SELECT COUNT(DISTINCT project) AS n FROM verdicts WHERE path = ? AND verdict = ? AND scope = 'project'"
+		)
+		stmt:bind(path, verdict)
+		stmt:step()
+		local row = stmt:get_named_values()
+		n = tonumber(row.n) or 0
+		stmt:close()
+	end)
+	db:close()
+	if not ok or n < 2 then
+		return
+	end
+
+	local gdb = open_db(global_dir())
+	if not gdb then
+		return
+	end
+	pcall(function()
+		local stmt = gdb:prepare([[
+			INSERT INTO verdicts
+			  (ts, session_id, proposal_id, group_name, path, operation, verdict,
+			   reason, proposed_content, applied_content, project, scope)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'global')
+		]])
+		stmt:bind(
+			os.time() * 1000,
+			nil,
+			nil,
+			nil,
+			path,
+			nil,
+			verdict,
+			nil,
+			nil,
+			nil,
+			project_slug()
+		)
+		stmt:step()
+		stmt:close()
+	end)
+	gdb:close()
+end
+
+--- Recent verdicts (project + global), newest first — for the verdict
+--- viewer and debugging. Includes the content columns so corrected
+--- verdicts can render their diff (proposed vs applied).
+--- @param limit number
+--- @return table[]
+function M.recent(limit)
+	limit = limit or 10
+	local out = {}
+	local dir = project_dir()
+	local db = open_db(dir)
+	if not db then
+		return out
+	end
+	pcall(function()
+		local stmt = db:prepare(
+			"SELECT ts, session_id, proposal_id, group_name, path, operation, verdict, reason, "
+				.. "proposed_content, applied_content, project, scope "
+				.. "FROM verdicts ORDER BY ts DESC LIMIT ?"
+		)
+		stmt:bind(limit)
+		while true do
+			local row = stmt:step()
+			if not row then
+				break
+			end
+			out[#out + 1] = stmt:get_named_values()
+		end
+		stmt:close()
+	end)
+	db:close()
+	return out
+end
+
+return M

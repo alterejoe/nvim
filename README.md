@@ -345,6 +345,25 @@ First launch is slow. Subsequent launches should be <1 second.
 
 Make sure win32yank.exe is installed (see WSL2 setup above).
 
+### Screen breaks when switching between tmux panes (opencode TUI / nvim)
+
+Symptom: moving focus from the opencode TUI (or another full-screen TUI) to
+another tmux pane corrupts the screen; only restarting opencode fixes it.
+
+Cause: `focus-events on` makes tmux send focus-in/focus-out escape
+sequences to panes. The opencode TUI mishandles focus-out and fails to
+redraw on focus-in.
+
+Fix (in `~/.tmux.conf`):
+
+```tmux
+set -g focus-events off
+```
+
+Then `tmux source-file ~/.tmux.conf` and restart opencode. If the breakage
+persists, also try `set -g alternate-screen off` (forces full pane
+redraws on switch; TUI content stays visible after exit).
+
 ---
 
 ## Customization

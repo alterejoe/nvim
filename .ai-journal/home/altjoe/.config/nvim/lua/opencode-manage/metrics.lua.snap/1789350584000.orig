@@ -1,0 +1,191 @@
+-- /home/altjoe/.config/nvim/lua/opencode-manage/metrics.lua FINAL
+-- opencode-manage.metrics — read-only reader for the C1 context metrics
+-- (doc 19): turn_metrics + context_events in the shared state.db written by
+-- the opencode manage plugin.
+-- Stable verification command:
+--   :ManageMetrics
+-- No side effects: never creates the store, never writes. If the file or the
+-- tables are absent it says exactly that (and lists the tables it can see),
+-- so a missing table is never a mystery again.
+-- Driver: sqlite.lua, required lazily — same fail-open rules as verdicts.lua.
+
+local M = {}
+
+local sqlite = nil
+
+--- Nearest state.db: walk up from cwd looking for .opencode; stop at the
+--- project root (first dir with .git). Never creates anything.
+--- @return string
+local function metrics_store()
+	local dir = vim.fn.getcwd()
+	for _ = 1, 12 do
+		local candidate = dir .. "/.opencode"
+		if vim.fn.isdirectory(candidate) == 1 then
+			return candidate .. "/state.db"
+		end
+		if vim.fn.isdirectory(dir .. "/.git") == 1 then
+			break
+		end
+		local parent = vim.fn.fnamemodify(dir, ":h")
+		if parent == dir then
+			break
+		end
+		dir = parent
+	end
+	return vim.fn.getcwd() .. "/.opencode/state.db"
+end
+
+--- Open the store. Only called after filereadable() confirmed it exists, so
+--- this never creates a file. sqlite.lua is required lazily.
+--- @param path string
+--- @return table|nil
+local function open(path)
+	local ok, db = pcall(function()
+		if not sqlite then
+			sqlite = require("sqlite")
+		end
+		return sqlite.open(path)
+	end)
+	if not ok or type(db) ~= "table" then
+		return nil
+	end
+	return db
+end
+
+--- pcall'd eval: a missing table raises in sqlite.lua — never crash here.
+--- @param db table
+--- @param sql string
+--- @return table[]|nil, string|nil
+local function q(db, sql)
+	local ok, rows = pcall(function()
+		return db:eval(sql)
+	end)
+	if not ok then
+		return nil, tostring(rows)
+	end
+	if type(rows) ~= "table" then
+		return {}, nil
+	end
+	return rows, nil
+end
+
+--- Collected metrics facts.
+--- @return table  { path, exists, tables, turns, events, newest, error }
+function M.stats()
+	local path = metrics_store()
+	local out = {
+		path = path,
+		exists = vim.fn.filereadable(path) == 1,
+		tables = {},
+		turns = nil,
+		events = nil,
+		newest = nil,
+	}
+	if not out.exists then
+		return out
+	end
+	local db = open(path)
+	if not db then
+		out.error = "sqlite.lua could not open the store"
+		return out
+	end
+
+	local tables = q(db, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+	if tables then
+		for _, r in ipairs(tables) do
+			out.tables[#out.tables + 1] = r.name
+		end
+	end
+	local has = {}
+	for _, t in ipairs(out.tables) do
+		has[t] = true
+	end
+
+	if has.turn_metrics then
+		local rows = q(
+			db,
+			"SELECT COUNT(*) AS n, COALESCE(SUM(tokens_input),0) AS input, "
+				.. "COALESCE(SUM(tokens_output),0) AS output FROM turn_metrics"
+		)
+		if rows and rows[1] then
+			out.turns = {
+				n = tonumber(rows[1].n) or 0,
+				input = tonumber(rows[1].input) or 0,
+				output = tonumber(rows[1].output) or 0,
+			}
+		end
+		local newest = q(
+			db,
+			"SELECT ts, message_id, tokens_input, tokens_output, cache_read "
+				.. "FROM turn_metrics ORDER BY ts DESC LIMIT 1"
+		)
+		if newest and newest[1] then
+			out.newest = newest[1]
+		end
+	end
+
+	if has.context_events then
+		local rows = q(db, "SELECT kind, COUNT(*) AS n FROM context_events GROUP BY kind ORDER BY n DESC")
+		out.events = {}
+		if rows then
+			for _, r in ipairs(rows) do
+				out.events[#out.events + 1] = { kind = r.kind, n = tonumber(r.n) or 0 }
+			end
+		end
+	end
+
+	pcall(function()
+		db:close()
+	end)
+	return out
+end
+
+--- Human-readable summary; prints each line and returns them.
+--- @return string[]
+function M.summary()
+	local s = M.stats()
+	local lines = {}
+	lines[#lines + 1] = "metrics store: " .. s.path
+	if not s.exists then
+		lines[#lines + 1] = "  not created yet — it appears after the first assistant turn or tool call"
+		lines[#lines + 1] = "  (if it stays absent, check :messages for [manage] metrics errors)"
+	else
+		lines[#lines + 1] = "  tables: " .. (#s.tables > 0 and table.concat(s.tables, ", ") or "(none)")
+		if s.turns then
+			lines[#lines + 1] = string.format(
+				"  turns: %d · input %d · output %d",
+				s.turns.n,
+				s.turns.input,
+				s.turns.output
+			)
+			if s.newest then
+				local when = os.date("%H:%M:%S", math.floor((tonumber(s.newest.ts) or 0) / 1000))
+				lines[#lines + 1] = string.format(
+					"  newest: %s · in %s · out %s · cache %s",
+					when,
+					tostring(s.newest.tokens_input),
+					tostring(s.newest.tokens_output),
+					tostring(s.newest.cache_read)
+				)
+			end
+		elseif #s.tables > 0 then
+			lines[#lines + 1] = "  metrics tables absent — the plugin has not written yet"
+		end
+		if s.events then
+			local parts = {}
+			for _, e in ipairs(s.events) do
+				parts[#parts + 1] = string.format("%s=%d", e.kind, e.n)
+			end
+			lines[#lines + 1] = "  events: " .. (#parts > 0 and table.concat(parts, " · ") or "(none)")
+		end
+		if s.error then
+			lines[#lines + 1] = "  error: " .. s.error
+		end
+	end
+	for _, l in ipairs(lines) do
+		print(l)
+	end
+	return lines
+end
+
+return M

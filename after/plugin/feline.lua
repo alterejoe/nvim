@@ -1,4 +1,4 @@
--- /home/jmeyer/.config/nvim/after/plugin/feline.lua FINAL
+-- /home/jmeyer/.config/nvim/after/plugin/feline.lua FINAL-2
 -- Modern color scheme with better visibility
 local hl_active = {
 	cwd = { fg = "#1e293b", bg = "#93c5fd", style = "bold" },
@@ -6,6 +6,7 @@ local hl_active = {
 	file = { fg = "#1e293b", bg = "#6ee7b7", style = "bold" },
 	gowork = { fg = "#1e293b", bg = "#fde047", style = "NONE" },
 	recording = { fg = "#1e293b", bg = "#f87171", style = "bold" },
+	tmux = { fg = "#1e293b", bg = "#f472b6", style = "bold" },
 }
 local hl_inactive = {
 	cwd = { fg = "#6b7280", bg = "#374151" },
@@ -13,12 +14,34 @@ local hl_inactive = {
 	file = { fg = "#6b7280", bg = "#374151" },
 	gowork = { fg = "#6b7280", bg = "#374151" },
 	recording = { fg = "#6b7280", bg = "#374151" },
+	tmux = { fg = "#6b7280", bg = "#374151" },
 }
 local function hl_pick(a, b)
 	local this = vim.fn.win_getid()
 	local active = vim.api.nvim_get_current_win()
 	return (this == active) and a or b
 end
+-- Tmux session indicator (cached; refreshed by a timer so the winbar never
+-- shells out on every redraw).
+local tmux_session = ""
+local function refresh_tmux_session()
+	if vim.env.TMUX then
+		local name = vim.trim(vim.fn.system("tmux display-message -p '#S' 2>/dev/null"))
+		if vim.v.shell_error == 0 and name ~= "" then
+			tmux_session = name
+			return
+		end
+	end
+	tmux_session = ""
+end
+refresh_tmux_session()
+vim.fn.timer_start(5000, function()
+	local before = tmux_session
+	refresh_tmux_session()
+	if tmux_session ~= before then
+		vim.cmd("redrawstatus!")
+	end
+end, { ["repeat"] = -1 })
 -- Find "project root" for the *open buffer*
 -- Rule: nearest parent containing `cmd/` or `config.lua`
 local function find_buffer_root(filepath, is_directory)
@@ -80,6 +103,20 @@ local recording_component = {
 }
 -- Components used for BOTH active + inactive
 local left_components = {
+	-- 0. Tmux session - most visible
+	{
+		provider = function()
+			if tmux_session == "" then
+				return ""
+			end
+			return "  tmux session: " .. tmux_session .. " "
+		end,
+		hl = function()
+			return hl_pick(hl_active.tmux, hl_inactive.tmux)
+		end,
+		left_sep = sep_style.left,
+		right_sep = sep_style.right,
+	},
 	-- 1. CWD - just the folder name
 	{
 		provider = function()
@@ -159,7 +196,6 @@ local right_components = {
 		right_sep = sep_style.right,
 	},
 }
--- /home/jmeyer/.config/nvim/after/plugin/feline.lua:144-152 FINAL-2
 -- Banner lives in the winbar (top of each window) so the bottom stays clear
 -- winbar.setup() skips global init (colors/separators/providers), so prime it
 -- via the regular setup() path first, then hand the statusline back to Neovim.

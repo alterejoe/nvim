@@ -1,0 +1,30 @@
+# /home/altjoe/docs/opencode/manage-plugin/10-skills-gating.md FINAL
+---
+title: 10 — Skills Gating (stretch)
+status: proposed
+links: [09-tag-context, 12-hooks-stability]
+---
+
+# Skills Gating
+
+Fighting skill hallucination with a structural gate. **Stretch milestone.**
+
+## What it does
+
+- Registry built from disk at startup (scan `~/.config/opencode/skills/` +
+  `.opencode/skills/`)
+- `skill` tool calls validated against the registry — hallucinated skill
+  names throw before loading
+- Structural validation: required frontmatter, required sections
+- Logged loads/denials/validation failures visible in the nvim panel
+
+## The honest limit
+
+Structural only: *which* skill loads and *that* it parses. Not whether the
+model applies the skill's instructions correctly — that's reasoning, not a
+tool call.
+
+## Related
+
+- [12-hooks-stability](12-hooks-stability.md) — same hook, same pattern as the gate
+- [09-tag-context](09-tag-context.md) — registry philosophy shared

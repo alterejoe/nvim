@@ -1,0 +1,292 @@
+-- /home/altjoe/.config/nvim/lua/opencode-manage/verdicts.lua FINAL
+-- opencode-manage.verdicts — the shared store (T2 + T2.5, 10-verdict-capture.md).
+-- SQLite verdict store: <project>/.opencode/state.db per project + global
+-- ~/.config/opencode/state.db. Written by the nvim viewer (user actions)
+-- and the manage plugin (conversation aborts, T2.5); read by the plugin
+-- (injection) and later the sidecar (T4).
+-- One store, one manager, no JSONL sprawl. The AI never writes here.
+--
+-- S0 API FIX: the installed driver is kkharji/sqlite.lua, NOT lsqlite3.
+-- The previous code called db:exec / db:prepare / stmt:get_named_values,
+-- none of which exist in this library. Correct API in use now:
+--   sqlite:open(path)              open/create the db ("rwc") — COLON call.
+--                                  The dot form sqlite.open(path) passes no
+--                                  self: the method got the path as self and
+--                                  nil as uri, and sqlite.lua silently fell
+--                                  back to an in-memory DB — the reason every
+--                                  nvim-side write vanished and every query
+--                                  saw "no such table".
+--   db:execute(sql)                multi-statement exec (schema/migration)
+--   db:eval(sql, named_params)     rows as { column = value }
+--   db:close()                     close the connection
+-- Named binds whose value is nil are skipped by pairs() and stay SQL NULL.
+-- Fail-open stays — a verdict write must never break the review flow — but
+-- failures now notify at ERROR with the real message instead of hiding.
+--
+-- Schema v2: path nullable (conversation verdicts), source column
+-- (proposal | conversation). v1 stores migrate on open.
+
+local M = {}
+
+-- sqlite is required on first use, not at module load (lazy.nvim has
+-- install.missing=false — plugins are installed manually via :Lazy install).
+local sqlite = nil
+
+local SCHEMA = [[
+CREATE TABLE IF NOT EXISTS verdicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  session_id TEXT,
+  proposal_id INTEGER,
+  group_name TEXT,
+  path TEXT,
+  operation TEXT,
+  verdict TEXT NOT NULL,
+  reason TEXT,
+  proposed_content TEXT,
+  applied_content TEXT,
+  project TEXT,
+  scope TEXT NOT NULL DEFAULT 'project',
+  source TEXT NOT NULL DEFAULT 'proposal'
+);
+CREATE INDEX IF NOT EXISTS idx_verdicts_path ON verdicts(path);
+CREATE INDEX IF NOT EXISTS idx_verdicts_ts ON verdicts(ts);
+]]
+
+-- v1 → v2 migration: path becomes nullable, add source column.
+-- Rebuild preserves existing rows (old rows are proposal-sourced).
+local MIGRATION = [[
+BEGIN;
+ALTER TABLE verdicts RENAME TO verdicts_old;
+CREATE TABLE verdicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  session_id TEXT,
+  proposal_id INTEGER,
+  group_name TEXT,
+  path TEXT,
+  operation TEXT,
+  verdict TEXT NOT NULL,
+  reason TEXT,
+  proposed_content TEXT,
+  applied_content TEXT,
+  project TEXT,
+  scope TEXT NOT NULL DEFAULT 'project',
+  source TEXT NOT NULL DEFAULT 'proposal'
+);
+INSERT INTO verdicts (ts, session_id, proposal_id, group_name, path, operation, verdict, reason, proposed_content, applied_content, project, scope, source)
+  SELECT ts, session_id, proposal_id, group_name, path, operation, verdict, reason, proposed_content, applied_content, project, scope, 'proposal' FROM verdicts_old;
+DROP TABLE verdicts_old;
+COMMIT;
+]]
+
+--- Nearest .opencode dir: walk up from cwd; stop at the project root
+--- (first dir with .git) and CREATE .opencode there if missing.
+--- @return string
+local function project_dir()
+	local dir = vim.fn.getcwd()
+	for _ = 1, 12 do
+		local candidate = dir .. "/.opencode"
+		if vim.fn.isdirectory(candidate) == 1 then
+			return candidate
+		end
+		if vim.fn.isdirectory(dir .. "/.git") == 1 then
+			break
+		end
+		local parent = vim.fn.fnamemodify(dir, ":h")
+		if parent == dir then
+			break
+		end
+		dir = parent
+	end
+	local root = vim.fn.isdirectory(dir .. "/.git") == 1 and dir or vim.fn.getcwd()
+	vim.fn.mkdir(root .. "/.opencode", "p")
+	return root .. "/.opencode"
+end
+
+--- @return string
+local function global_dir()
+	return vim.env.HOME .. "/.config/opencode"
+end
+
+--- Open (creating if needed) a store, ensure the schema, migrate v1 → v2.
+--- kkharji API — sqlite:open + db:execute + db:eval. Fail-open with a
+--- loud ERROR notify: a broken store surfaces, it never silently no-ops.
+--- @param dir string
+--- @return table|nil
+local function open_db(dir)
+	vim.fn.mkdir(dir, "p")
+	local ok, db_or_err = pcall(function()
+		if not sqlite then
+			sqlite = require("sqlite")
+		end
+		return sqlite:open(dir .. "/state.db")
+	end)
+	if not ok then
+		vim.notify("⚠️ verdicts: sqlite open failed: " .. tostring(db_or_err), vim.log.levels.ERROR)
+		return nil
+	end
+	local db = db_or_err
+	if type(db) ~= "table" then
+		vim.notify("⚠️ verdicts: sqlite.open returned no db for " .. dir, vim.log.levels.ERROR)
+		return nil
+	end
+	local ok2, schema_err = pcall(function()
+		db:execute(SCHEMA)
+		-- v1 → v2: rebuild when the source column is missing.
+		-- PRAGMA rows come back as { name = ..., type = ..., ... }.
+		local rows = db:eval("PRAGMA table_info(verdicts)")
+		local has_source = false
+		if type(rows) == "table" then
+			for _, row in ipairs(rows) do
+				if type(row) == "table" and row.name == "source" then
+					has_source = true
+					break
+				end
+			end
+		end
+		if not has_source then
+			db:execute(MIGRATION)
+		end
+	end)
+	if not ok2 then
+		vim.notify("⚠️ verdicts: schema/migration failed: " .. tostring(schema_err), vim.log.levels.ERROR)
+		pcall(function()
+			db:close()
+		end)
+		return nil
+	end
+	return db
+end
+
+--- Project slug: the project root's basename.
+--- @return string
+local function project_slug()
+	local d = project_dir()
+	return vim.fn.fnamemodify(d, ":h:t")
+end
+
+--- Record a proposal verdict in the project store.
+--- @param opts table  ts, session_id, proposal_id, group_name, path, operation,
+---   verdict, reason, proposed_content, applied_content
+function M.record(opts)
+	local dir = project_dir()
+	local db = open_db(dir)
+	if not db then
+		vim.notify("⚠️ verdicts: cannot open store " .. dir .. "/state.db", vim.log.levels.ERROR)
+		return
+	end
+	local ok, err = pcall(function()
+		local res = db:eval([[
+			INSERT INTO verdicts
+			  (ts, session_id, proposal_id, group_name, path, operation, verdict,
+			   reason, proposed_content, applied_content, project, scope, source)
+			VALUES (:ts, :session_id, :proposal_id, :group_name, :path, :operation, :verdict,
+			        :reason, :proposed_content, :applied_content, :project, 'project', 'proposal')
+		]], {
+			ts = opts.ts or os.time() * 1000,
+			session_id = opts.session_id,
+			proposal_id = opts.proposal_id,
+			group_name = opts.group_name,
+			path = opts.path,
+			operation = opts.operation,
+			verdict = opts.verdict,
+			reason = opts.reason,
+			proposed_content = opts.proposed_content,
+			applied_content = opts.applied_content,
+			project = project_slug(),
+		})
+		if res == false then
+			error("insert returned false — sqlite refused the row")
+		end
+	end)
+	pcall(function()
+		db:close()
+	end)
+	if not ok then
+		vim.notify("⚠️ verdicts: write failed: " .. tostring(err), vim.log.levels.ERROR)
+	end
+end
+
+--- Global promotion: same path + verdict seen in ≥2 distinct projects →
+--- also written to the global store (scope='global').
+--- @param path string
+--- @param verdict string
+function M.promote_if_cross_project(path, verdict)
+	local dir = project_dir()
+	local db = open_db(dir)
+	if not db then
+		return
+	end
+	local n = 0
+	local ok = pcall(function()
+		local rows = db:eval(
+			"SELECT COUNT(DISTINCT project) AS n FROM verdicts "
+				.. "WHERE path = :path AND verdict = :verdict AND scope = 'project'",
+			{ path = path, verdict = verdict }
+		)
+		if type(rows) == "table" and type(rows[1]) == "table" then
+			n = tonumber(rows[1].n) or 0
+		end
+	end)
+	pcall(function()
+		db:close()
+	end)
+	if not ok or n < 2 then
+		return
+	end
+
+	local gdb = open_db(global_dir())
+	if not gdb then
+		return
+	end
+	pcall(function()
+		gdb:eval([[
+			INSERT INTO verdicts (ts, path, verdict, project, scope, source)
+			VALUES (:ts, :path, :verdict, :project, 'global', 'proposal')
+		]], {
+			ts = os.time() * 1000,
+			path = path,
+			verdict = verdict,
+			project = project_slug(),
+		})
+	end)
+	pcall(function()
+		gdb:close()
+	end)
+end
+
+--- Recent verdicts (project + global), newest first — for the verdict
+--- viewer and debugging. Includes the content columns so corrected and
+--- aborted verdicts can render their diff (proposed vs applied).
+--- @param limit number
+--- @return table[]
+function M.recent(limit)
+	limit = limit or 10
+	local out = {}
+	local dir = project_dir()
+	local db = open_db(dir)
+	if not db then
+		return out
+	end
+	pcall(function()
+		local rows = db:eval(
+			"SELECT ts, session_id, proposal_id, group_name, path, operation, verdict, reason, "
+				.. "proposed_content, applied_content, project, scope, source "
+				.. "FROM verdicts ORDER BY ts DESC LIMIT " .. tostring(math.floor(limit))
+		)
+		if type(rows) == "table" then
+			for _, row in ipairs(rows) do
+				if type(row) == "table" then
+					out[#out + 1] = row
+				end
+			end
+		end
+	end)
+	pcall(function()
+		db:close()
+	end)
+	return out
+end
+
+return M

@@ -73,9 +73,18 @@ vim.keymap.set("n", "Q", function()
 		return
 	end
 
-	-- terminal: kill the buffer (closing the window alone leaves a dead term)
+	-- terminal: close every window showing the terminal, then delete the
+	-- buffer. Deleting only the buffer leaves an empty replacement split.
 	if bt == "terminal" then
-		vim.api.nvim_buf_delete(buf, { force = true })
+		local wins = vim.fn.win_findbuf(buf)
+		for _, win in ipairs(wins) do
+			if vim.api.nvim_win_is_valid(win) then
+				vim.api.nvim_win_close(win, true)
+			end
+		end
+		if vim.api.nvim_buf_is_valid(buf) then
+			vim.api.nvim_buf_delete(buf, { force = true })
+		end
 		return
 	end
 

@@ -1,8 +1,7 @@
--- keymaps/scratchbuf.lua
--- Defines key bindings used inside scratchbuf windows.
--- Edit lhs strings here to remap. scratchbuf.lua reads this at open time.
--- which-key descriptions are registered buffer-locally when a scratchbuf opens.
+-- lua/keymaps/scratchbuf.lua FINAL
+-- Key bindings used inside scratchbuf windows.
 local M = {}
+
 M.keys = {
 	close = { "Q", "<Esc>" },
 	open = "<CR>",
@@ -16,7 +15,9 @@ M.keys = {
 	focus_next = "<C-Tab>",
 	focus_prev = "<C-S-Tab>",
 	refresh = "r",
+	refresh_alt = "<C-l>",
 }
+
 function M.register_which_key(buf)
 	local ok, wk = pcall(require, "which-key")
 	if not ok then
@@ -33,10 +34,12 @@ function M.register_which_key(buf)
 		{ k.paste_above, buffer = buf, desc = "Paste above" },
 		{ k.filter, buffer = buf, desc = "Fuzzy filter" },
 		{ k.refresh, buffer = buf, desc = "Refresh" },
+		{ k.refresh_alt, buffer = buf, desc = "Refresh" },
 		{ k.close[1], buffer = buf, desc = "Close" },
 		{ k.close[2], buffer = buf, desc = "Close" },
 		{ k.focus_next, buffer = buf, desc = "Focus next pane" },
 		{ k.focus_prev, buffer = buf, desc = "Focus prev pane" },
 	})
 end
+
 return M

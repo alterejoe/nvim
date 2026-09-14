@@ -1,4 +1,4 @@
--- /home/jmeyer/.config/nvim/lua/opencode-ext/viewer.lua FINAL-10
+-- /home/altjoe/.config/nvim/lua/opencode-ext/viewer.lua FINAL
 local db = require("opencode-ext.db")
 local model = require("opencode-ext.model")
 local M = {}
@@ -696,11 +696,54 @@ pick_session = function()
 	local conf = require("telescope.config").values
 	local actions = require("telescope.actions")
 	local state = require("telescope.actions.state")
+	local runtime = require("opencode-ext.sessions")
+	local STALL_AFTER_SECONDS = 45
+
+	local function epoch_seconds(value)
+		local n = tonumber(value) or 0
+		if n > 100000000000 then
+			return n / 1000
+		end
+		return n
+	end
+
+	local function age_label(ts)
+		local age = math.max(0, os.time() - epoch_seconds(ts))
+		if age < 60 then
+			return "now"
+		elseif age < 3600 then
+			return math.floor(age / 60) .. "m"
+		elseif age < 86400 then
+			return math.floor(age / 3600) .. "h"
+		end
+		return math.floor(age / 86400) .. "d"
+	end
+
+	local function health(s)
+		if not s.project or s.project == "" then
+			return "UNKNOWN"
+		end
+		if not runtime.is_running_for_directory(s.project) then
+			return "STOPPED"
+		end
+		if s.last_error and s.last_error ~= vim.NIL and s.last_error ~= "" then
+			return "ERROR"
+		end
+		if s.last_role == "assistant" and (s.last_completed == nil or s.last_completed == vim.NIL) then
+			local last_activity = math.max(epoch_seconds(s.time_updated), epoch_seconds(s.last_message_created))
+			if os.time() - last_activity >= STALL_AFTER_SECONDS then
+				return "STALLED"
+			end
+			return "RUNNING"
+		end
+		return "IDLE"
+	end
+
 	local function ft(ts)
 		if not ts then
 			return "?"
 		end
-		local d = os.time() - ts
+		local d = os.time() - epoch_seconds(ts)
 		if d < 60 then
 			return "now"
 		elseif d < 3600 then
@@ -710,15 +753,15 @@ pick_session = function()
 		elseif d < 604800 then
 			return math.floor(d / 86400) .. "d"
 		end
-		return os.date("%b %d", ts)
+		return os.date("%b %d", epoch_seconds(ts))
 	end
 	pickers
 		.new({}, {
-			prompt_title = "Opencode Sessions  (R=reassign)",
+			prompt_title = "Opencode Sessions  (R=reset)",
 			finder = finders.new_table({
 				results = sessions,
 				entry_maker = function(s)
-					local t = (s.title or ""):gsub("\n", " "):sub(1, 60)
+					local t = (s.title or ""):gsub("\n", " "):sub(1, 55)
 					if t == "" then
 						t = "(untitled)"
 					end
@@ -728,6 +771,7 @@ pick_session = function()
 						local sp = vim.split(p, "/")
 						ps = #sp >= 2 and sp[#sp - 1] .. "/" .. sp[#sp] or sp[#sp]
 					end
+					local status = health(s)
 					local preview_raw = s.preview
 					if preview_raw == vim.NIL then
 						preview_raw = nil
@@ -736,13 +780,14 @@ pick_session = function()
 					return {
 						value = s,
 						display = string.format(
-							"%-55s %-25s %5s  %2d msgs",
+							"%-8s %-55s %-25s %5s  %2d msgs",
+							status,
 							t,
 							ps,
 							ft(s.time_updated),
 							s.msg_count or 0
 						),
-						ordinal = t .. " " .. p .. " " .. preview,
+						ordinal = status .. " " .. t .. " " .. p .. " " .. preview,
 					}
 				end,
 			}),
@@ -781,19 +826,28 @@ pick_session = function()
 						return
 					end
 					local s = sel.value
-					local title = (s.title or "session"):gsub("\n", " "):sub(1, 40)
-					local new_dir = vim.fn.input("Reassign [" .. title .. "] to dir: ", s.project or "", "dir")
-					if new_dir == "" or new_dir == s.project then
+					local project = s.project or ""
+					if project == "" then
+						vim.notify("Cannot reset a session without a project directory", vim.log.levels.WARN)
 						return
 					end
-					local ok, err = db.reassign_session(s.id, new_dir)
-					if ok then
-						vim.notify("Reassigned to " .. new_dir, vim.log.levels.INFO)
-						actions.close(pb)
-					else
-						vim.notify("Reassign failed: " .. (err or "unknown"), vim.log.levels.ERROR)
+					local status = health(s)
+					local answer = vim.fn.confirm(
+						string.format("Reset %s session?\n  %s\n\nConversation data is preserved.", status, project),
+						"&Reset\n&Cancel",
+						status == "STALLED" and 1 or 2
+					)
+					if answer ~= 1 then
+						return
 					end
-				end, { buffer = pb, nowait = true, noremap = true })
+					local ok, err = runtime.restart_for_directory(project)
+					if not ok then
+						vim.notify("Session reset failed: " .. tostring(err), vim.log.levels.ERROR)
+						return
+					end
+					actions.close(pb)
+					vim.notify("Reset OpenCode session: " .. project, vim.log.levels.INFO)
+				end, { buffer = pb, nowait = true, noremap = true, silent = true })
 				return true
 			end,
 		})

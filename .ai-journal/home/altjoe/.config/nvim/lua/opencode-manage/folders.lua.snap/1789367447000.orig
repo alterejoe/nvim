@@ -1,0 +1,483 @@
+-- /home/altjoe/.config/nvim/lua/opencode-manage/folders.lua FINAL
+-- opencode-manage.folders — folder permission memory + sync (doc 23, PM1).
+-- MEMORY: state.db `folders` rows (this module). ENFORCEMENT:
+-- ~/.config/opencode/opencode.json `permission.external_directory`.
+-- The console owns both: approving writes memory; sync merges approved rows
+-- into the config (journaled, ADDITIVE-ONLY — manual config entries are
+-- never removed); verify reports drift in both directions. The plugin reads
+-- both but writes neither (the airlock holds).
+-- Candidates come free from O1: `dir` tags the plugin already captures.
+-- Store helpers copied from refs.lua (store consolidation is the registry's
+-- business, not this slice's).
+
+local journal = require("opencode-manage.journal")
+local json = require("opencode-manage.json")
+
+local M = {}
+
+local sqlite = nil
+
+local FOLDERS_SCHEMA = [[
+CREATE TABLE IF NOT EXISTS folders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  path TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'project',
+  status TEXT NOT NULL DEFAULT 'approved',
+  source TEXT NOT NULL DEFAULT 'manual',
+  uses INTEGER NOT NULL DEFAULT 0,
+  last_seen INTEGER,
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_folders_path ON folders(path);
+]]
+
+--- Nearest state.db: walk up from cwd looking for .opencode; stop at the
+--- project root (first dir with .git). Never creates directories.
+--- @return string
+local function store_path()
+	local dir = vim.fn.getcwd()
+	for _ = 1, 12 do
+		local candidate = dir .. "/.opencode"
+		if vim.fn.isdirectory(candidate) == 1 then
+			return candidate .. "/state.db"
+		end
+		if vim.fn.isdirectory(dir .. "/.git") == 1 then
+			break
+		end
+		local parent = vim.fn.fnamemodify(dir, ":h")
+		if parent == dir then
+			break
+		end
+		dir = parent
+	end
+	return vim.fn.getcwd() .. "/.opencode/state.db"
+end
+
+--- Read-only open: existing store or nil.
+--- @return table|nil
+local function open()
+	local path = store_path()
+	if vim.fn.filereadable(path) ~= 1 then
+		return nil
+	end
+	local ok, db = pcall(function()
+		if not sqlite then
+			sqlite = require("sqlite")
+		end
+		return sqlite:open(path)
+	end)
+	if not ok or type(db) ~= "table" then
+		return nil
+	end
+	pcall(function()
+		db:execute(FOLDERS_SCHEMA)
+	end)
+	return db
+end
+
+--- Writer open: creates the .opencode dir, the DB file, and the schema.
+--- @return table|nil
+local function open_writable()
+	local path = store_path()
+	vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+	local ok, db = pcall(function()
+		if not sqlite then
+			sqlite = require("sqlite")
+		end
+		return sqlite:open(path)
+	end)
+	if not ok or type(db) ~= "table" then
+		vim.notify("❌ folders: could not open/create store at " .. path, vim.log.levels.ERROR)
+		return nil
+	end
+	pcall(function()
+		db:execute(FOLDERS_SCHEMA)
+	end)
+	return db
+end
+
+local function home()
+	return vim.env.HOME or ""
+end
+
+--- Expand a leading ~/ to HOME.
+--- @param path string
+--- @return string
+local function expand(path)
+	if type(path) == "string" and path:sub(1, 2) == "~/" then
+		return home() .. path:sub(2)
+	end
+	return path or ""
+end
+
+--- The opencode config (the enforcement surface).
+--- @return string
+local function config_path()
+	return home() .. "/.config/opencode/opencode.json"
+end
+
+--- Normalized absolute path: expanded, no trailing slash.
+--- @param path string
+--- @return string
+local function norm(path)
+	return (expand(path):gsub("/+$", ""))
+end
+
+--- Config-entry form of a folder: "~/x/**" (home shortened).
+--- @param path string
+--- @return string
+function M.entry_for(path)
+	local p = norm(path)
+	local h = home()
+	if h ~= "" and p:sub(1, #h) == h then
+		p = "~" .. p:sub(#h + 1)
+	end
+	return p .. "/**"
+end
+
+--- Folder rows: approved first, then avoid, by path.
+--- @return table[]
+function M.list()
+	local db = open()
+	if not db then
+		return {}
+	end
+	local rows = {}
+	pcall(function()
+		local res = db:eval(
+			"SELECT id, ts, path, scope, status, source, uses, last_seen, note FROM folders "
+				.. "ORDER BY CASE status WHEN 'approved' THEN 0 ELSE 1 END, path ASC"
+		)
+		if type(res) == "table" then
+			rows = res
+		end
+	end)
+	pcall(function()
+		db:close()
+	end)
+	return rows
+end
+
+--- True when path is the row's path or under it.
+--- @param path string
+--- @param row_path string
+--- @return boolean
+local function covered_by(path, row_path)
+	local p, d = norm(path), norm(row_path)
+	return p == d or p:sub(1, #d + 1) == d .. "/"
+end
+
+--- Candidate dirs the plugin already captured (O1 event_tags, kind=dir):
+--- under $HOME, not hidden trees, not covered by a decided row. Top 100.
+--- @return table[]
+function M.candidates()
+	local db = open()
+	if not db then
+		return {}
+	end
+	local raw = {}
+	pcall(function()
+		local res = db:eval(
+			"SELECT tag AS path, COUNT(*) AS n, MAX(event_ts) AS last FROM event_tags "
+				.. "WHERE kind = 'dir' GROUP BY tag ORDER BY n DESC, tag ASC LIMIT 200"
+		)
+		if type(res) == "table" then
+			raw = res
+		end
+	end)
+	pcall(function()
+		db:close()
+	end)
+	local decided = M.list()
+	local out = {}
+	for _, c in ipairs(raw) do
+		local p = norm(c.path)
+		local skip = p == ""
+		if not skip and home() ~= "" and p:sub(1, #home()) ~= home() then
+			skip = true
+		end
+		if not skip and p:find("/%.", 1) then
+			skip = true -- hidden trees (.git, .cache, …)
+		end
+		if not skip then
+			for _, r in ipairs(decided) do
+				if covered_by(p, r.path) then
+					skip = true
+					break
+				end
+			end
+		end
+		if not skip then
+			out[#out + 1] = { path = p, n = tonumber(c.n) or 0, last = tonumber(c.last) or 0 }
+		end
+		if #out >= 100 then
+			break
+		end
+	end
+	return out
+end
+
+--- Insert or update the row for an exact path.
+--- @param path string
+--- @param status string  "approved" | "avoid"
+--- @param scope string  "project" | "common"
+--- @param note string|nil
+--- @param uses number|nil
+--- @param last_seen number|nil
+--- @return boolean
+local function upsert(path, status, scope, note, uses, last_seen)
+	local db = open_writable()
+	if not db then
+		return false
+	end
+	local p = norm(path)
+	local ok = pcall(function()
+		local rows = db:eval("SELECT id FROM folders WHERE path = ? LIMIT 1", { p })
+		if type(rows) == "table" and rows[1] then
+			db:eval(
+				"UPDATE folders SET ts = ?, status = ?, scope = ?, note = COALESCE(?, note), "
+					.. "uses = COALESCE(?, uses), last_seen = COALESCE(?, last_seen), "
+					.. "source = CASE WHEN ? THEN 'captured' ELSE source END WHERE id = ?",
+				{ os.time() * 1000, status, scope, note, uses, last_seen, uses ~= nil, rows[1].id }
+			)
+		else
+			db:eval(
+				"INSERT INTO folders (ts, path, scope, status, source, uses, last_seen, note) "
+					.. "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+				{
+					os.time() * 1000,
+					p,
+					scope,
+					status,
+					uses ~= nil and "captured" or "manual",
+					uses or 0,
+					last_seen,
+					note,
+				}
+			)
+		end
+	end)
+	pcall(function()
+		db:close()
+	end)
+	return ok
+end
+
+--- Approve a folder. Refuses when a decided ancestor already covers it.
+--- @param path string
+--- @param scope string|nil  default: project
+--- @param note string|nil
+--- @param uses number|nil  (captured candidates carry their touch count)
+--- @param last_seen number|nil
+--- @return boolean
+function M.approve(path, scope, note, uses, last_seen)
+	local p = norm(path)
+	if p == "" then
+		return false
+	end
+	for _, r in ipairs(M.list()) do
+		if covered_by(p, r.path) and norm(r.path) ~= p then
+			vim.notify(
+				string.format("folders: %s is already covered by %s (%s)", p, r.path, r.status),
+				vim.log.levels.INFO
+			)
+			return false
+		end
+	end
+	local ok = upsert(p, "approved", scope or "project", note, uses, last_seen)
+	if ok then
+		vim.notify(string.format("🔐 approved: %s (%s)", p, scope or "project"), vim.log.levels.INFO)
+	end
+	return ok
+end
+
+--- Mark a folder as avoid (never offered, never indexed).
+--- @param path string
+--- @param note string|nil
+--- @return boolean
+function M.avoid(path, note)
+	local ok = upsert(norm(path), "avoid", "project", note)
+	if ok then
+		vim.notify("🚫 avoid: " .. norm(path), vim.log.levels.INFO)
+	end
+	return ok
+end
+
+--- Remove a folder row.
+--- @param id number
+--- @return boolean
+function M.remove(id)
+	local db = open_writable()
+	if not db then
+		return false
+	end
+	local ok = pcall(function()
+		db:eval("DELETE FROM folders WHERE id = ?", { tonumber(id) })
+	end)
+	pcall(function()
+		db:close()
+	end)
+	return ok
+end
+
+--- The config's external_directory entries (entry -> allow/deny).
+--- @return table<string, string>
+function M.config_entries()
+	local file = config_path()
+	local out = {}
+	if vim.fn.filereadable(file) ~= 1 then
+		return out
+	end
+	local f = io.open(file, "r")
+	if not f then
+		return out
+	end
+	local raw = f:read("*a")
+	f:close()
+	local ok, data = pcall(vim.json.decode, raw)
+	if not ok or type(data) ~= "table" then
+		return out
+	end
+	local perm = data.permission
+	if type(perm) == "table" and type(perm.external_directory) == "table" then
+		for k, v in pairs(perm.external_directory) do
+			out[k] = tostring(v)
+		end
+	end
+	return out
+end
+
+--- Merge approved rows into permission.external_directory (journaled,
+--- additive-only: manual config entries are never removed). The config is
+--- rewritten pretty (sorted keys) — a one-time normalization.
+--- @return table|nil  { added = entry[] } or nil on failure
+function M.sync()
+	local file = config_path()
+	if vim.fn.filereadable(file) ~= 1 then
+		vim.notify("❌ folders: config not found: " .. file, vim.log.levels.ERROR)
+		return nil
+	end
+	local f = io.open(file, "r")
+	if not f then
+		vim.notify("❌ folders: cannot open " .. file, vim.log.levels.ERROR)
+		return nil
+	end
+	local raw = f:read("*a")
+	f:close()
+	local ok, data = pcall(vim.json.decode, raw)
+	if not ok or type(data) ~= "table" then
+		vim.notify("❌ folders: config does not parse: " .. file, vim.log.levels.ERROR)
+		return nil
+	end
+	local perm = data.permission
+	if type(perm) ~= "table" then
+		perm = {}
+		data.permission = perm
+	end
+	local ext = perm.external_directory
+	if type(ext) ~= "table" then
+		ext = {}
+		perm.external_directory = ext
+	end
+	local added = {}
+	for _, r in ipairs(M.list()) do
+		if r.status == "approved" then
+			local key = M.entry_for(r.path)
+			if ext[key] == nil then
+				ext[key] = "allow"
+				added[#added + 1] = key
+			end
+		end
+	end
+	if #added == 0 then
+		vim.notify("🔐 folders: external_directory already covers every approved folder", vim.log.levels.INFO)
+		return { added = {} }
+	end
+	local snap = journal.snapshot(file)
+	vim.fn.writefile(vim.split(json.pretty(data), "\n", { plain = true }), file)
+	journal.record({
+		ts = os.time() * 1000,
+		path = file,
+		group = "folders",
+		op = "folders-sync",
+		snapshot = snap,
+		existed = snap ~= nil,
+		reason = "external_directory += " .. table.concat(added, ", "),
+		sessionID = nil,
+	})
+	vim.notify(
+		"🔐 folders: synced " .. #added .. " entr(y/ies) into external_directory",
+		vim.log.levels.INFO
+	)
+	return { added = added }
+end
+
+--- Drift report: approved-without-config (missing) and config-without-row
+--- (extra — manual entries included, informational).
+--- @return table  { missing = string[], extra = string[] }
+function M.verify()
+	local ext = M.config_entries()
+	local approved = {}
+	for _, r in ipairs(M.list()) do
+		if r.status == "approved" then
+			approved[M.entry_for(r.path)] = true
+		end
+	end
+	local missing, extra = {}, {}
+	for k in pairs(approved) do
+		if ext[k] == nil then
+			missing[#missing + 1] = k
+		end
+	end
+	for k in pairs(ext) do
+		if not approved[k] then
+			extra[#extra + 1] = k
+		end
+	end
+	table.sort(missing)
+	table.sort(extra)
+	local lines = {}
+	if #missing == 0 and #extra == 0 then
+		lines[1] = "🔐 folders: in sync — config matches memory"
+	else
+		if #missing > 0 then
+			lines[#lines + 1] = "missing from config (" .. #missing .. "): " .. table.concat(missing, ", ")
+		end
+		if #extra > 0 then
+			lines[#lines + 1] = "in config, not in memory (" .. #extra .. ", manual ok): " .. table.concat(extra, ", ")
+		end
+	end
+	for _, l in ipairs(lines) do
+		vim.notify(l, vim.log.levels.INFO)
+	end
+	return { missing = missing, extra = extra }
+end
+
+--- Print the memory (stable verification command).
+--- @return string[]
+function M.summary()
+	local rows = M.list()
+	local cands = M.candidates()
+	local lines = { string.format("folders: %d decided · %d candidate(s)", #rows, #cands) }
+	for _, r in ipairs(rows) do
+		lines[#lines + 1] = string.format(
+			"  #%s %-8s %-7s uses=%-3s %-40s %s",
+			tostring(r.id),
+			tostring(r.status),
+			tostring(r.scope),
+			tostring(r.uses or 0),
+			tostring(r.path),
+			tostring(r.note or "")
+		)
+	end
+	for _, c in ipairs(cands) do
+		lines[#lines + 1] = string.format("  ?        %-7s uses=%-3s %s", "candidate", tostring(c.n), c.path)
+	end
+	for _, l in ipairs(lines) do
+		print(l)
+	end
+	return lines
+end
+
+return M

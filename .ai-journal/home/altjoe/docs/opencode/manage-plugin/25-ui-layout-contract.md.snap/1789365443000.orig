@@ -1,0 +1,114 @@
+# /home/altjoe/docs/opencode/manage-plugin/25-ui-layout-contract.md FINAL
+---
+title: 25 - UI layout contract: panels, targets, OOB, emit-time validation
+status: handoff
+links: [03-proposals, 11-nvim-companion, 17-impact-registry, 18-staged-workflow, 20-references, 22-skills]
+---
+
+# Handoff - UI layout contract (panels/targets/OOB) + emit-time validation
+
+## Goal
+Give the AI one machine-readable source of truth for per-project UI layout and
+htmx wiring, and enforce it at the emit_proposal airlock so panel/class/OOB
+drift cannot be proposed. The AI keeps shipping htmx wiring that was "known"
+in prose (docs/14, skills htmx-conventions / templ-ui) but is not
+machine-checkable, so consistency depends on recall - which fails.
+
+## Instructions
+- Full-file proposals only, through emit_proposal; never edit files directly.
+- Scope: ~/.config/opencode/plugins/* (manage.ts, lib/*),
+  ~/.config/nvim/lua/opencode-manage/*, and the docs herein.
+- Contract data lives per project: <project>/.opencode/manage.ui.json; grow it
+  through a reviewed channel (same console flow as registry_propose, <leader>ar).
+- Do not touch the volleyball-new tree from this session; the volleyball
+  session owns the defect fixes.
+- Verify with a real emit against a contracted project; reasoning alone is not
+  evidence.
+
+## Evidence (verified 2026-09-14, volleyball-new players workspace)
+1. Templ boolean-attribute bug: `selected={ bool }` generated
+   `selected="false"`; the attribute still selects, so every option was
+   selected -> phantom filters were sent -> empty lists. Fixed in
+   page.templ FINAL-22; a static check would have caught it before queueing.
+2. Vertical/horizontal layout tabs render only in the full-page header and are
+   absent from PlayerWorkspaceTabsOOB: after browse->compare they linger (and
+   still target #tab-content, so games content lands inside the compare
+   panel); after compare->browse they never appear.
+3. BrowseLayoutResponse renders only the #tab-content content; no OOB for
+   #browse-layout-tabs, so the active underline never moves.
+4. View-switch class drift: only #detail-content innerHTML swaps; the shell
+   never re-renders. #list-panel keeps its 50%/70% class variant,
+   #detail-content keeps fill-vs-tabbed scroll mode, #tab-content keeps the
+   wrong scroll class, and the browse divider is missing after switching from
+   compare.
+5. #detail-content receives three different fragments (browse header, compare
+   center, panel header) with no declared binding for which may render there.
+6. No hx-sync / hx-indicator / hx-push-url anywhere in the tree; the #skeleton
+   fade CSS is dead (nothing targets it). Swaps give no loading feedback and
+   rapid clicks interleave responses into the same targets.
+
+Files: /home/altjoe/projects/volleyball-new/web/ui/html/players/page.templ,
+web/internal/handlers/players/players.go,
+web/ui/html/layouts/skeleton.templ, web/ui/html/layouts/player.templ,
+web/ui/static/css/output.css.
+
+## Required behavior
+- R1 Contract (per project, reviewed): pages -> views -> panels
+  {id, class variant per view, width ratio, scroll mode}; swap targets
+  {id -> allowed fragment components}; actions {trigger -> route -> target ->
+  swap -> OOB ids[]}; view-conditional fragments {component -> owner region ->
+  the OOB that keeps it fresh}.
+- R2 Manifest tool: `layout_manifest(page, view)` returns the composed layout
+  tree plus an ASCII sketch from contract + templ/handler sources; optional
+  drift check against a fetched URL (declared vs served DOM).
+- R3 Emit-time validation: emit_proposal touching *.templ / handler files in a
+  contracted project runs these checks and fails with REQUIREMENTS (append
+  nothing):
+  a) templ boolean attributes must use `?=` (flag `attr={ bool }` for
+     selected/checked/disabled).
+  b) every hx-target id exists in the contract; swap style matches the
+     contract entry.
+  c) every view-conditional fragment is in the OOB set of every response that
+     changes its owning region.
+  d) a response component's declared render target matches the caller's
+     hx-target (no target/fragment mismatches).
+  e) shell elements (panel classes, ratios, scroll modes, dividers) change
+     only through a shell swap or explicit OOB - never left to innerHTML
+     content swaps.
+- R4 Components x request methods matrix as contract data + skill text: for
+  each gencomponent (Common/Hx/FormBehavior/Keymap/Close) x method (GET nav,
+  GET partial, POST form, POST->poll, SSE): allowed hx-* set, required
+  companions, forbidden combos.
+- R5 No custom LSP in slice 1. The R3 checker core is the reusable asset; a
+  thin LSP adapter (or an lsp_diagnostics wrapper) is a later slice if editor
+  squiggles are wanted. A per-project LSP would duplicate templ's own syntax
+  LSP and add little beyond the emit-time gate.
+
+## Files to inspect
+- /home/altjoe/.config/opencode/plugins/manage.ts (emit_proposal)
+- /home/altjoe/.config/opencode/plugins/lib/proposals.ts, lib/registry.ts
+- /home/altjoe/.config/nvim/lua/opencode-manage/ (console surface; contract
+  review view)
+- /home/altjoe/projects/volleyball-new/docs/14-htmx-interaction-contract.md
+- /home/altjoe/projects/volleyball-new/docs/15-player-comparison-workspace.md
+- skills: htmx-conventions, templ-ui, gencomponents (routing via
+  skills.policy.json)
+
+## Slices
+- LC1 contract file + reviewed write channel (reuse the registry_propose
+  flow) - Short
+- LC2 layout_manifest tool + drift check - Short/Medium
+- LC3 emit-time validation R3 checks - Medium
+- LC4 components x methods matrix data + skill update - Short
+- LC5 later: served-DOM capture diff + optional thin LSP adapter -
+  Medium/Large
+
+## Verification
+1. Contracted project: emit a templ file with `selected={}` -> REQUIREMENTS,
+   nothing queued.
+2. Emit an hx-target id absent from the contract -> REQUIREMENTS.
+3. Emit a view-conditional header fragment without OOB coverage ->
+   REQUIREMENTS.
+4. layout_manifest(players, browse) matches the served page on ids/classes
+   (spot check).
+5. A project without a contract: emits behave exactly as today.

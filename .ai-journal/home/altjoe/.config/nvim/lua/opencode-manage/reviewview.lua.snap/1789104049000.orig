@@ -1,0 +1,293 @@
+-- opencode-manage.reviewview — the persistent review viewer (shell).
+-- List (top) + CURRENT/AFTER preview panes (below, side by side).
+--   j/k move · gg/G jump · [/] hunks · f scope filter (all / session /
+--   files / neither) · r refresh · o/CR open in origin · da accept
+--   (snapshot + write the RIGHT pane) · dr reject (status only) ·
+--   rr rerun (open for re-eval) · ga GROUP-APPLY (every pending row in
+--   the current group, each against the freshly-written file) ·
+--   y copy+open · Q kill.
+-- ALL keys are mapped on every buffer — nothing is dead by focus.
+-- ACCEPTED ROWS STAY: the list shows pending + accepted rows; accepted
+-- ones render dim-green [applied] so the review history is explicit.
+-- Partial (edit_range) rows: LEFT pane = the unified diff itself
+-- (@@ header, context, - removed red / + added green); RIGHT pane = the
+-- full file with the range applied (editable — da writes it verbatim, so
+-- a partial can never truncate a file). create/replace rows: LEFT = the
+-- unified diff (disk vs proposed), RIGHT = proposed content. Panes open
+-- positioned at the first change; [ / ] jumps between hunks.
+-- Row colors: green=NEW · blue=EDIT · magenta=RERUN · red=DELETE ·
+-- dim=APPLIED · strike=REJECTED · yellow=MISMATCH.
+-- The cursor stays on the selected PROPOSAL across refreshes (identity-
+-- based restore), and row ordering is fully deterministic.
+--
+-- MODULES: state (shared state), render (list/previews/classification),
+-- diff (diff building + hunk navigation), actions (accept/reject/apply/
+-- copy/open). This shell owns the windows, keymaps, and navigation.
+
+local state = require("opencode-manage.reviewview.state")
+local render = require("opencode-manage.reviewview.render")
+local diff = require("opencode-manage.reviewview.diff")
+local actions = require("opencode-manage.reviewview.actions")
+
+local M = {}
+
+local FILTER_CYCLE = { "all", "session", "files", "neither" }
+
+--- Move selection by `delta` DISPLAY positions.
+--- @param delta number  -1 or 1
+local function move(delta)
+	local order = render.display_order and render.display_order(state) or nil
+	if not order then
+		return
+	end
+	if #order == 0 then
+--- Move selection by `delta` DISPLAY positions.
+--- @param delta number  -1 or 1
+local function move(delta)
+	local order = render.display_order(state)
+	if #order == 0 then
+		return
+	end
+	local pos = 1
+	for i, si in ipairs(order) do
+		if si == state.idx then
+			pos = i
+			break
+		end
+	end
+	local next_item = render.item_at(order, pos + delta)
+	if next_item then
+		state.idx = next_item
+		render.render_list(state)
+		render.render_previews(state)
+	end
+end
+
+--- Jump to the first (top) or last (bottom) DISPLAY row.
+--- @param to_last boolean
+local function jump(to_last)
+	local order = render.display_order(state)
+	if #order == 0 then
+		return
+	end
+	state.idx = render.item_at(order, to_last and #order or 1)
+	render.render_list(state)
+	render.render_previews(state)
+end
+	end
+	state.idx = order[to_last and #order or 1]
+	render.render_list(state)
+	render.render_previews(state)
+end
+
+--- f: cycle the scope filter ALL → SESSION → FILES → NEITHER → ALL.
+--- Every press reports all four counts so the effect is visible even when
+--- two scopes coincide (e.g. only one project has manifests).
+local function toggle_filter()
+	local c = render.scope_counts()
+	local cur = 1
+	for i, f in ipairs(FILTER_CYCLE) do
+		if f == state.filter then
+			cur = i
+			break
+		end
+	end
+	state.filter = FILTER_CYCLE[(cur % #FILTER_CYCLE) + 1]
+	state.idx = 1
+	render.refresh_items(state)
+	render.set_legend(state)
+	vim.notify(
+		string.format(
+			"f: all=%d session=%d files=%d neither=%d — now showing %s",
+			c.all,
+			c.session,
+			c.files,
+			c.neither,
+			FILTER_CYCLE[(cur % #FILTER_CYCLE) + 1]
+		),
+		vim.log.levels.INFO
+	)
+end
+
+local function kill_viewer()
+	for _, b in ipairs({ state.list_buf, state.cur_buf, state.after_buf, state.origin_buf }) do
+		if b and vim.api.nvim_buf_is_valid(b) then
+			pcall(vim.keymap.del, "n", "Q", { buffer = b })
+		end
+	end
+	if state.autocmd then
+		pcall(vim.api.nvim_del_autocmd, state.autocmd)
+		state.autocmd = nil
+	end
+	local seen = {}
+	for _, w in ipairs({ state.list_win, state.cur_win, state.after_win, state.outer_win }) do
+		if w and not seen[w] then
+			seen[w] = true
+			if vim.api.nvim_win_is_valid(w) then
+				vim.api.nvim_win_close(w, true)
+			end
+		end
+	end
+	state.items = {}
+	state.row_states = {}
+	state.list_buf = nil
+	state.cur_buf = nil
+	state.after_buf = nil
+	state.list_win = nil
+	state.cur_win = nil
+	state.after_win = nil
+	state.outer_win = nil
+	state.origin_win = nil
+	state.origin_buf = nil
+	vim.notify("🗑️ Review viewer closed", vim.log.levels.INFO)
+end
+
+local function set_q_kill(buf)
+	vim.keymap.set("n", "Q", kill_viewer, { buffer = buf, nowait = true, noremap = true, silent = true })
+end
+
+--- Create a deterministic split window.
+--- @param buf number
+--- @param split string  "right" | "below"
+--- @param ref_win number  window to split (defaults to current)
+--- @return number win
+local function make_window(buf, split, ref_win)
+	local opts = {
+		relative = "",
+		split = split,
+	}
+	if ref_win then
+		opts.win = ref_win
+	end
+	return vim.api.nvim_open_win(buf, false, opts)
+end
+
+--- Map the full key set on one buffer.
+--- @param buf number
+local function map_keys(buf)
+	local opts = { buffer = buf, nowait = true, noremap = true, silent = true }
+	vim.keymap.set("n", "j", function()
+		move(1)
+	end, opts)
+	vim.keymap.set("n", "k", function()
+		move(-1)
+	end, opts)
+	vim.keymap.set("n", "<C-n>", function()
+		move(1)
+	end, opts)
+	vim.keymap.set("n", "<C-p>", function()
+		move(-1)
+	end, opts)
+	vim.keymap.set("n", "gg", function()
+		jump(false)
+	end, opts)
+	vim.keymap.set("n", "G", function()
+		jump(true)
+	end, opts)
+	vim.keymap.set("n", "[", function()
+		diff.jump_hunk(state, -1)
+	end, opts)
+	vim.keymap.set("n", "]", function()
+		diff.jump_hunk(state, 1)
+	end, opts)
+	vim.keymap.set("n", "f", toggle_filter, opts)
+	vim.keymap.set("n", "r", function()
+		render.refresh_items(state)
+	end, opts)
+	vim.keymap.set("n", "o", function()
+		actions.open_in_origin(state)
+	end, opts)
+	vim.keymap.set("n", "<CR>", function()
+		actions.open_in_origin(state)
+	end, opts)
+	vim.keymap.set("n", "da", function()
+		actions.accept_current(state)
+	end, opts)
+	vim.keymap.set("n", "dr", function()
+		actions.reject_current(state)
+	end, opts)
+	vim.keymap.set("n", "rr", function()
+		actions.rerun_open(state)
+	end, opts)
+	vim.keymap.set("n", "ga", function()
+		actions.apply_group(state)
+	end, opts)
+	vim.keymap.set("n", "y", function()
+		actions.copy_and_open(state)
+	end, opts)
+	set_q_kill(buf)
+end
+
+function M.open()
+	local proposals = require("opencode-manage.proposals")
+	local items = proposals.list_visible(state.filter)
+	if #items == 0 then
+		vim.notify("No proposals yet", vim.log.levels.INFO)
+		return
+	end
+	-- Re-entry guard: replace an existing viewer instead of stacking
+	if state.outer_win and vim.api.nvim_win_is_valid(state.outer_win) then
+		kill_viewer()
+	end
+	render.define_hls()
+	state.items = items
+	render.compute_row_states(state)
+
+	-- Cursor: the NEWEST row (first display position — newest-first).
+	state.idx = 1
+
+	state.origin_win = vim.api.nvim_get_current_win()
+	state.origin_buf = vim.api.nvim_get_current_buf()
+
+	-- List buffer: new column to the RIGHT of the origin buffer
+	state.list_buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[state.list_buf].bufhidden = "wipe"
+	vim.bo[state.list_buf].filetype = "managelist"
+	state.outer_win = make_window(state.list_buf, "right")
+	state.list_win = state.outer_win
+	render.set_legend(state)
+
+	-- CURRENT pane: below the list (left of the lower pair) — read-only.
+	state.cur_buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[state.cur_buf].bufhidden = "wipe"
+	vim.bo[state.cur_buf].modifiable = false
+	state.cur_win = make_window(state.cur_buf, "below", state.list_win)
+
+	-- AFTER pane: to the RIGHT of CURRENT — EDITABLE, da writes this.
+	state.after_buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[state.after_buf].bufhidden = "wipe"
+	vim.bo[state.after_buf].modifiable = true
+	state.after_win = make_window(state.after_buf, "right", state.cur_win)
+
+	vim.api.nvim_set_current_win(state.list_win)
+
+	-- Full key set on ALL buffers so nothing is a dead key by focus.
+	map_keys(state.list_buf)
+	map_keys(state.cur_buf)
+	map_keys(state.after_buf)
+
+	state.autocmd = vim.api.nvim_create_autocmd("WinEnter", {
+		callback = function()
+			local cur = vim.api.nvim_get_current_win()
+			if
+				state.list_win
+				and vim.api.nvim_win_is_valid(state.list_win)
+				and (cur == state.cur_win or cur == state.after_win or cur == state.list_win)
+			then
+				-- Deferred: never switch windows synchronously inside a
+				-- nvim_win_call (disallowed) or mid-render — the focus
+				-- return lands on the next tick.
+				vim.schedule(function()
+					if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
+						vim.api.nvim_set_current_win(state.list_win)
+					end
+				end)
+			end
+		end,
+	})
+
+	render.render_list(state)
+	render.render_previews(state)
+end
+
+return M

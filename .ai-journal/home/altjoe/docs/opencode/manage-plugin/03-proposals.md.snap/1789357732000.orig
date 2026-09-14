@@ -1,0 +1,127 @@
+// /home/altjoe/docs/opencode/manage-plugin/03-proposals.md FINAL
+---
+title: 03 — Proposals (emit_proposal)
+status: proposed
+links: [01-core-principle, 02-airlock-gate, 05-snapshots-journal, 17-impact-registry]
+---
+
+# Proposals — the only write channel
+
+The AI's sole mechanism for change: a custom `emit_proposal` tool that
+writes **nothing to the filesystem** — it appends a structured line to the
+proposal manifest.
+
+## Manifest format (JSONL)
+
+`.ai-proposals/<sessionID>.jsonl` — one JSON object per line:
+
+```json
+{
+  "ts": 1780000000000,
+  "sessionID": "ses_abc123",
+  "group": "add-metrics-service",
+  "path": "internal/game/game.go",
+  "operation": "replace",
+  "reason": "Fixed rope tunneling on fast deploy",
+  "start_line": null,
+  "end_line": null,
+  "content": "// full file content",
+  "impact": [
+    { "path": "internal/physics/physics.go", "symbol": "Substeps", "relation": "reads" }
+  ],
+  "reuses": [
+    { "path": "internal/timefmt/format.go", "symbol": "FormatDuration" }
+  ],
+  "status": "pending"
+}
+```
+
+- `impact`: consumers of the changed symbols — **required** when the target
+  is a registered shared module (see [17-impact-registry](17-impact-registry.md)).
+- `reuses`: canonical implementations the change reuses — proof of no
+  duplicated logic.
+
+## Status state machine
+
+```
+pending ──da──▶ accepted
+pending ──dr──▶ rejected
+pending ──gr──▶ needs_revision  ──(AI re-emits)──▶ new pending entry (same group)
+```
+
+- `needs_revision`: the user reviewed and the proposal's content/line
+  numbers are wrong. The AI is asked to re-read the file and re-emit. The
+  NEW proposal is a separate entry in the same group; the old one stays
+  marked `needs_revision` (audit trail) until the user deletes it (`dd`).
+
+## The `group` field — multi-file changes as one unit
+
+A single task (e.g. "add the metrics service") touches several files. Each
+file gets its own `emit_proposal` call, and every call in the task shares
+the same `group` slug. Groups make multi-file changes reviewable and
+reversible as a unit.
+
+### Rules
+
+- `group` is a required string — a short slug the AI invents (or the user
+  suggests): `add-metrics-service`, `fix-tunneling`, `refactor-input`.
+- One group = one logical change across N files.
+- Grouping is the ONLY link between proposals — no ordering, no coupling;
+  each file is still accepted/rejected independently.
+
+### Why group, not batch
+
+- **Per-file control stays** — you can accept fileA, reject fileB, edit
+  fileC. Grouping is for *view* and *revert*, not for surrendering control.
+- **Group revert** (see 05): "undo change #42" = restore every snapshot in
+  the group, one keypress.
+- Groups are auditable: the journal shows which files a change touched.
+
+### Flow for a multi-file task
+
+```
+AI task: "add metrics service"
+  emit_proposal(fileA, group="add-metrics-service")
+  emit_proposal(fileB, group="add-metrics-service")
+  emit_proposal(fileC, group="add-metrics-service")
+        │
+        ▼
+picker groups the 3 by group:  "3 proposals: add-metrics-service"
+you review each file independently
+  accept fileA · edit+accept fileC · reject fileB
+        │
+        ▼
+journal stores the group on every accepted entry
+revert-by-group restores all 2 accepted snapshots in one keypress
+```
+
+## Impact-aware proposals (M1i)
+
+Touching shared code is no longer a blind proposal. When the target `path`
+matches a registered shared module (`.opencode/manage.registry.json`),
+`impact` becomes **required**: the model must run `lsp_find_references` on
+the symbols it will change and record the real consumers. The plugin
+rejects missing, unparseable, or fabricated (non-existent path) impact
+lists with a REQUIREMENTS error — a retry, not a terminal denial. See
+[17-impact-registry](17-impact-registry.md) for the full semantics.
+
+## Operations
+
+| Operation | Meaning |
+|---|---|
+| `create` | New file, `content` = full content |
+| `replace` | Full-file replacement, `content` = new content |
+| `edit_range` | `content` replaces lines `start_line..end_line` |
+| `delete` | Remove the file |
+
+## Why tool-call args
+
+Tool call arguments are structured by construction — schema-valid JSON. This
+kills the entire "parse the AI's free text" failure mode: the proposal is
+never parsed from prose, it IS the structured data.
+
+## Related
+
+- [05-snapshots-journal](05-snapshots-journal.md) — group revert
+- [11-nvim-companion](11-nvim-companion.md) — grouped picker + revision loop
+- [17-impact-registry](17-impact-registry.md) — the impact requirement

@@ -1,0 +1,90 @@
+# /home/altjoe/docs/opencode/intent-network/10-verdict-capture.md FINAL
+---
+title: Intent Network — Verdict Capture (T2)
+status: proposed
+links: [README, 01-thesis, 03-hook-inventory, 04-sidecar]
+---
+
+# Verdict Capture — the shared store (T2)
+
+## The goal
+
+Make things repeated less. Every accept/reject/correct is a verdict — a
+structural fact about what the AI did right or wrong. T2 records verdicts
+into the shared store automatically and injects recent ones back into the
+session so the AI cannot re-walk a rejected path.
+
+## The shared store
+
+One SQLite database is the single source of truth for manage state:
+
+- Per-project: `<project>/.opencode/state.db`
+- Global: `~/.config/opencode/state.db` (cross-project structures)
+
+The AI never writes to it — the airlock denies all mutation tools; the AI's
+only channels are emit_proposal / registry_propose. Writers: the nvim
+viewer (user actions → verdicts). Readers: the plugin (injection), the
+sidecar (T4, metrics). One store, one manager, no JSONL sprawl.
+
+## Schema v1 — verdicts
+
+```sql
+CREATE TABLE IF NOT EXISTS verdicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,              -- ms epoch
+  session_id TEXT,
+  proposal_id INTEGER,              -- null for interrupt corrections
+  group_name TEXT,
+  path TEXT NOT NULL,
+  operation TEXT,                   -- create|replace|edit_range|delete
+  verdict TEXT NOT NULL,            -- accepted|rejected|corrected|moved_old
+  reason TEXT,
+  proposed_content TEXT,            -- what the AI proposed
+  applied_content TEXT,             -- what was actually applied (null on reject)
+  project TEXT,                     -- project slug
+  scope TEXT NOT NULL DEFAULT 'project'  -- project|global
+);
+CREATE INDEX IF NOT EXISTS idx_verdicts_path ON verdicts(path);
+CREATE INDEX IF NOT EXISTS idx_verdicts_ts ON verdicts(ts);
+```
+
+The correction is recoverable: proposed vs applied content IS the diff —
+lossless, zero compute at capture. Consumers diff on read.
+
+## Capture points (nvim)
+
+| Action | Verdict | Recorded |
+|---|---|---|
+| `da` unchanged | accepted | proposed == applied |
+| `da` after editing | corrected | proposed != applied — the diff is the structural fact |
+| `dr` | rejected | applied_content null |
+| delete confirm | moved_old | applied_content null |
+
+## Global promotion
+
+Same path + verdict seen in ≥2 distinct projects → also written to the
+global store (scope='global'). Global verdicts inject everywhere.
+
+## Injection (plugin)
+
+`experimental.chat.messages.transform` appends the last ~5 verdicts for the
+project (plus global) to the next call, compact:
+
+```
+[verdicts] Rejected: src/foo.ts (wrong interpretation) · Corrected: src/bar.go (2 hunks)
+```
+
+Loop-breaking only. No pruning, no evaluation, no demotion — those are T4/T5.
+
+## Non-goals (this milestone)
+
+- No pruning / context removal (T4)
+- No evaluation / credit assignment (T5)
+- No migration of proposals/journal/registry into state.db — additive only;
+  they migrate as later milestones touch them
+
+## Drivers
+
+- nvim: sqlite.lua (FFI) or vim-dadbod
+- plugin: node:sqlite (built-in) or better-sqlite3 fallback
+- sidecar (T4): same file, new tables

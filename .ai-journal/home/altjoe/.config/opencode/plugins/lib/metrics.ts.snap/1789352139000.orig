@@ -1,0 +1,288 @@
+// /home/altjoe/.config/opencode/plugins/lib/metrics.ts FINAL
+/**
+ * Context metrics store (doc 19, C1 + C2). Same shared SQLite file as the
+ * verdict store (.opencode/state.db), additive tables only.
+ *
+ * Captured from hooks the manage plugin already runs:
+ *   - turn_metrics   <- message.updated (assistant token usage, upsert by message id)
+ *   - context_events <- tool.execute.after, skill loads, proposal emits, prune requests
+ *
+ * C2: the nvim console writes `prune_request` rows; hasPendingPrune /
+ * markPruneConsumed let the plugin claim one on the next user message and
+ * shape + trigger the compaction that follows.
+ *
+ * Fail-open: no SQLite driver, a busy DB, or a bad row -> no-op, never a
+ * crash. If no driver exists, capture spools to .opencode/metrics-spool.jsonl
+ * (plain fs) so it never dies silently.
+ */
+
+import { mkdirSync, appendFileSync, existsSync } from "fs";
+import { join } from "path";
+import { openDatabase, sqliteError } from "./sqlite";
+
+export const METRICS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS turn_metrics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  message_id TEXT NOT NULL UNIQUE,
+  ts INTEGER NOT NULL,
+  tokens_input INTEGER,
+  tokens_output INTEGER,
+  tokens_reasoning INTEGER,
+  cache_read INTEGER,
+  cache_write INTEGER,
+  model TEXT,
+  agent TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_turn_metrics_session ON turn_metrics(session_id, ts);
+
+CREATE TABLE IF NOT EXISTS context_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT,
+  ts INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  detail TEXT,
+  subject TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_context_events_session ON context_events(session_id, ts);
+CREATE INDEX IF NOT EXISTS idx_context_events_kind ON context_events(kind, ts);
+
+DROP VIEW IF EXISTS v_session_growth;
+CREATE VIEW v_session_growth AS
+  SELECT session_id, ts, message_id, tokens_input, tokens_output, tokens_reasoning,
+         cache_read, cache_write, model
+  FROM turn_metrics
+  ORDER BY session_id, ts;
+
+DROP VIEW IF EXISTS v_tool_usage;
+CREATE VIEW v_tool_usage AS
+  SELECT session_id, detail AS tool, COUNT(*) AS calls, MAX(ts) AS last_ts
+  FROM context_events
+  WHERE kind = 'tool_call'
+  GROUP BY session_id, detail
+  ORDER BY calls DESC;
+`;
+
+let spoolWarned = false;
+
+/** Fallback capture path when no SQLite driver exists in this runtime. */
+function spoolRow(directory: string, row: Record<string, unknown>): void {
+  try {
+    const dir = join(directory, ".opencode");
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(join(dir, "metrics-spool.jsonl"), JSON.stringify(row) + "\n", "utf8");
+    if (!spoolWarned) {
+      spoolWarned = true;
+      console.error(
+        "[manage] metrics: no SQLite driver in this runtime — spooling to " +
+          ".opencode/metrics-spool.jsonl" +
+          (sqliteError() ? ` (${sqliteError()})` : ""),
+      );
+    }
+  } catch {
+    // absolute last resort — nothing left to do
+  }
+}
+
+function openStore(directory: string): any | null {
+  const db = openDatabase(join(directory, ".opencode", "state.db"));
+  if (!db) return null;
+  try {
+    db.exec(METRICS_SCHEMA);
+    return db;
+  } catch (e) {
+    try {
+      db.close();
+    } catch {
+      /* best effort */
+    }
+    console.error("[manage] metrics: schema apply failed: " + String(e));
+    return null;
+  }
+}
+
+/** Open only if the store already exists — never creates a file. */
+function openExisting(directory: string): any | null {
+  const path = join(directory, ".opencode", "state.db");
+  try {
+    if (!existsSync(path)) return null;
+  } catch {
+    return null;
+  }
+  const db = openDatabase(path);
+  if (!db) return null;
+  try {
+    db.exec(METRICS_SCHEMA);
+    return db;
+  } catch {
+    try {
+      db.close();
+    } catch {
+      /* best effort */
+    }
+    return null;
+  }
+}
+
+function num(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/**
+ * Upsert one assistant message's token usage. Called on every
+ * message.updated for assistant messages; the message id makes the latest
+ * (final) values win over streaming partial updates.
+ */
+export async function recordTurn(directory: string, info: any): Promise<void> {
+  try {
+    if (!info || info.role !== "assistant") return;
+    const t = info.tokens || {};
+    const cache = t.cache || {};
+    const sessionID = info.sessionID;
+    const messageID = info.id;
+    if (!sessionID || !messageID) return;
+    const ts = num(info.time && info.time.created) ?? Date.now();
+    const db = openStore(directory);
+    if (!db) {
+      spoolRow(directory, {
+        t: "turn",
+        session_id: sessionID,
+        message_id: messageID,
+        ts,
+        tokens_input: num(t.input),
+        tokens_output: num(t.output),
+        tokens_reasoning: num(t.reasoning),
+        cache_read: num(cache.read),
+        cache_write: num(cache.write),
+        model: typeof info.modelID === "string" ? info.modelID : null,
+        agent: typeof info.mode === "string" ? info.mode : null,
+      });
+      return;
+    }
+    try {
+      db.prepare(
+        "INSERT INTO turn_metrics " +
+          "(session_id, message_id, ts, tokens_input, tokens_output, tokens_reasoning, " +
+          "cache_read, cache_write, model, agent) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+          "ON CONFLICT(message_id) DO UPDATE SET " +
+          "ts=excluded.ts, tokens_input=excluded.tokens_input, tokens_output=excluded.tokens_output, " +
+          "tokens_reasoning=excluded.tokens_reasoning, cache_read=excluded.cache_read, " +
+          "cache_write=excluded.cache_write, model=excluded.model, agent=excluded.agent",
+      ).run(
+        sessionID,
+        messageID,
+        ts,
+        num(t.input),
+        num(t.output),
+        num(t.reasoning),
+        num(cache.read),
+        num(cache.write),
+        typeof info.modelID === "string" ? info.modelID : null,
+        typeof info.mode === "string" ? info.mode : null,
+      );
+    } finally {
+      try {
+        db.close();
+      } catch {
+        /* best effort */
+      }
+    }
+  } catch {
+    // fail-open: metrics must never break a turn
+  }
+}
+
+/** Append one notable context event (tool call, skill load, proposal, prune). */
+export async function recordEvent(
+  directory: string,
+  sessionID: string | null,
+  kind: string,
+  detail?: string | null,
+  subject?: string | null,
+): Promise<void> {
+  try {
+    const ts = Date.now();
+    const db = openStore(directory);
+    if (!db) {
+      spoolRow(directory, {
+        t: "event",
+        session_id: sessionID,
+        ts,
+        kind,
+        detail: detail ?? null,
+        subject: subject ?? null,
+      });
+      return;
+    }
+    try {
+      db.prepare(
+        "INSERT INTO context_events (session_id, ts, kind, detail, subject) VALUES (?, ?, ?, ?, ?)",
+      ).run(sessionID, ts, kind, detail ?? null, subject ?? null);
+    } finally {
+      try {
+        db.close();
+      } catch {
+        /* best effort */
+      }
+    }
+  } catch {
+    // fail-open
+  }
+}
+
+/**
+ * C2: a pending prune request is a `prune_request` event newer than the
+ * newest `prune_consumed` event. @returns the request ts or null.
+ */
+export async function hasPendingPrune(directory: string): Promise<number | null> {
+  try {
+    const db = openExisting(directory);
+    if (!db) return null;
+    try {
+      const req = db
+        .prepare("SELECT ts FROM context_events WHERE kind = 'prune_request' ORDER BY ts DESC LIMIT 1")
+        .get();
+      const con = db
+        .prepare("SELECT ts FROM context_events WHERE kind = 'prune_consumed' ORDER BY ts DESC LIMIT 1")
+        .get();
+      const reqTs = req && typeof req.ts === "number" ? req.ts : null;
+      const conTs = con && typeof con.ts === "number" ? con.ts : null;
+      if (reqTs !== null && (conTs === null || reqTs > conTs)) return reqTs;
+      return null;
+    } finally {
+      try {
+        db.close();
+      } catch {
+        /* best effort */
+      }
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** C2: record that this session claimed the prune request. */
+export async function markPruneConsumed(
+  directory: string,
+  sessionID: string,
+  requestTs: number,
+): Promise<void> {
+  try {
+    const db = openStore(directory);
+    if (!db) return;
+    try {
+      db.prepare(
+        "INSERT INTO context_events (session_id, ts, kind, detail, subject) VALUES (?, ?, 'prune_consumed', ?, NULL)",
+      ).run(sessionID, Date.now(), String(requestTs));
+    } finally {
+      try {
+        db.close();
+      } catch {
+        /* best effort */
+      }
+    }
+  } catch {
+    // fail-open
+  }
+}

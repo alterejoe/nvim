@@ -1,0 +1,107 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "build": {
+      "maxIterations": 2,
+      "options": {
+        "reasoningEffort": "low",
+        "textVerbosity": "low"
+      }
+    },
+    "chat": {
+      "maxIterations": 1,
+      "options": {
+        "reasoningEffort": "low",
+        "textVerbosity": "low"
+      }
+    },
+    "oracle": {
+      "options": {
+        "reasoningEffort": "low",
+        "textVerbosity": "low"
+      }
+    },
+    "plan": {
+      "maxIterations": 1,
+      "options": {
+        "reasoningEffort": "low",
+        "textVerbosity": "low"
+      }
+    }
+  },
+  "autoupdate": true,
+  "default_agent": "oracle",
+  "instructions": [
+    "AGENTS.md",
+    "/home/jmeyer/.config/opencode/prepends/output-formatting.md",
+    "/home/jmeyer/.config/opencode/prepends/convention-tracker.md",
+    "/home/jmeyer/.config/opencode/prepends/consultation-first.md"
+  ],
+  "mcp": {
+    "engram": {
+      "command": [
+        "/home/linuxbrew/.linuxbrew/bin/engram",
+        "mcp",
+        "--tools=agent"
+      ],
+      "enabled": true,
+      "type": "local"
+    }
+  },
+  "model": "opencode-go/deepseek-v4-flash",
+  "permission": {
+    "bash": "deny",
+    "doom_loop": "deny",
+    "edit": "deny",
+    "external_directory": {
+      "~/.config//opencode/**": "allow",
+      "~/docs/**": "allow",
+      "~/projects//shared/**": "allow"
+    },
+    "read": {
+      "*": "allow",
+      "**/envs/**": "deny",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.key": "deny",
+      "*.pem": "deny",
+      "envs/**": "deny"
+    },
+    "task": "deny",
+    "webfetch": "allow",
+    "write": "deny"
+  },
+  "plugin": [
+    "opencode-ignore",
+    "opencode-mem",
+    "oh-my-openagent",
+    "opencode-plugin-openspec",
+    "opencode-see-image@1.3.2"
+  ],
+  "provider": {
+    "opencode": {
+      "models": {
+        "big-pickle": {
+          "variants": {
+            "high": {
+              "reasoningEffort": "high",
+              "reasoningSummary": "auto",
+              "textVerbosity": "low"
+            },
+            "low": {
+              "reasoningEffort": "low",
+              "reasoningSummary": "auto",
+              "textVerbosity": "low"
+            }
+          }
+        }
+      }
+    }
+  },
+  "server": {
+    "hostname": "localhost",
+    "port": 4096
+  },
+  "share": "manual",
+  "snapshot": true
+}

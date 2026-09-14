@@ -5,6 +5,20 @@
 -- No files are ever permanently deleted — they go to _old/ next to them,
 -- which is reversible and auditable.
 -- The JSONL is ground truth: schema-valid tool-call args, never parsed prose.
+-- T2 (10-verdict-capture.md): every accept/reject/move writes a verdict to
+-- the shared SQLite store automatically — accepted | corrected (edited
+-- before da) | rejected | moved_old. The correction diff is recoverable
+-- from proposed_content vs applied_content.
+-- PATH VALIDATION (doc 21): the apply side FAILS CLOSED. Only absolute
+-- proposal paths apply; update ops (replace/edit_range/delete) require a
+-- readable target and are refused otherwise; only create may mkdir parents.
+-- A relative path is refused with a loud message — joining it to any root
+-- is how web/web copies were born. The emit side enforces the same rules
+-- (lib/proposals.ts validateProposalTarget).
+-- DELIMITER GUARD: edit_range accepts on .ts/.tsx/.js/.lua files with grossly
+-- unbalanced braces/parens warn with a confirm gate — an unbalanced apply can
+-- break a file (or a plugin) at load. Heuristic: strings and comments can
+-- false-positive, so it asks, never silently refuses (default is No).
 -- Two per-proposal cwd predicates drive the viewer's 4-state filter:
 --   _cwd       = the proposal's manifest dir is reachable from cwd
 --                ("session in the cwd" — walk-up + glob-down discovery)
@@ -25,6 +39,7 @@
 -- line must never take the whole viewer down.
 
 local journal = require("opencode-manage.journal")
+local verdicts = require("opencode-manage.verdicts")
 
 local M = {}
 
@@ -177,18 +192,33 @@ function M.list_visible(mode)
 	return out
 end
 
---- Resolve a proposal path to absolute. Absolute paths stay; relative paths
---- resolve against the .ai-proposals dir's project root (best effort).
+--- Resolve a proposal path to absolute, FAIL CLOSED (doc 21): only absolute
+--- paths resolve. Relative paths return nil and every write path refuses
+--- them with a visible message — joining it to any root is how the
+--- web/web copies were born.
 --- @param proposal table
---- @return string
+--- @return string|nil
 local function resolve_path(proposal)
-	if proposal.path:sub(1, 1) == "/" then
+	if type(proposal.path) == "string" and proposal.path:sub(1, 1) == "/" then
 		return proposal.path
 	end
-	if proposal._file then
-		return vim.fn.fnamemodify(proposal._file, ":h:h") .. "/" .. proposal.path
-	end
-	return vim.fn.getcwd() .. "/" .. proposal.path
+	return nil
+end
+
+--- Refuse helper: visible, loud, never writes.
+--- @param proposal table
+--- @param action string
+--- @return boolean  always false
+local function refuse(proposal, action)
+	vim.notify(
+		string.format(
+			"❌ Refused to %s: non-absolute proposal path (legacy entry):\n  %s\n  Re-emit with an absolute path.",
+			action,
+			tostring(proposal.path)
+		),
+		vim.log.levels.ERROR
+	)
+	return false
 end
 
 --- Update a proposal's status field in its jsonl (in place).
@@ -207,22 +237,87 @@ function M.set_status(proposal, status)
 	end
 end
 
---- Accept a proposal: snapshot → write → journal → status flip.
+--- Accept a proposal: snapshot → write → journal → verdict → status flip.
 --- The write is a USER-initiated action from nvim, never the AI.
+--- Fail closed (doc 21): absolute path required; update ops require a
+--- readable target; only create may mkdir parents.
+--- T2: editing the buffer before accepting makes the verdict `corrected` —
+--- the diff between INTENDED and applied content is the structural fact.
 --- @param proposal table
 --- @param content_override string|nil  use this instead of proposal.content
 ---   (the user may have edited the proposed content before accepting)
-function M.accept(proposal, content_override)
+--- @param baseline_override string|nil  the full content the proposal intended
+---   to produce. For edit_range this is the after-content, NOT the replacement
+---   fragment — fragment-vs-file comparisons flagged every accept as corrected.
+--- @return boolean  true when written
+function M.accept(proposal, content_override, baseline_override)
 	local path = resolve_path(proposal)
-	local snap = journal.snapshot(path)
-
-	-- mkdir parents for create / new paths
-	local parent = vim.fn.fnamemodify(path, ":h")
-	if vim.fn.isdirectory(parent) ~= 1 then
-		vim.fn.mkdir(parent, "p")
+	if not path then
+		return refuse(proposal, "accept")
+	end
+	local op = proposal.operation or "replace"
+	local exists = vim.fn.filereadable(path) == 1
+	if op == "create" then
+		if exists then
+			vim.notify(
+				"❌ Refused: create target already exists:\n  " .. path .. "\n  Use replace/edit_range instead.",
+				vim.log.levels.ERROR
+			)
+			return false
+		end
+		local parent = vim.fn.fnamemodify(path, ":h")
+		if vim.fn.isdirectory(parent) ~= 1 then
+			vim.fn.mkdir(parent, "p")
+		end
+	else
+		if not exists then
+			vim.notify(
+				"❌ Refused: "
+					.. op
+					.. " target is not readable:\n  "
+					.. path
+					.. "\n  Update ops never create files — re-emit as 'create' if that was intended.",
+				vim.log.levels.ERROR
+			)
+			return false
+		end
 	end
 
+	local snap = journal.snapshot(path)
+
 	local content = content_override or proposal.content or ""
+	-- Delimiter balance guard (doc 21 follow-up): an edit_range that leaves
+	-- braces/parens unbalanced can kill a plugin at load — that is not
+	-- hypothetical, it happened. Strings and comments can false-positive
+	-- here, so this warns with a confirm gate instead of hard-blocking.
+	if op == "edit_range" then
+		local ext = vim.fn.fnamemodify(path, ":e"):lower()
+		if ext == "ts" or ext == "tsx" or ext == "js" or ext == "lua" then
+			local depth = 0
+			for ch in content:gmatch("[%{%(}%)]") do
+				if ch == "{" or ch == "(" then
+					depth = depth + 1
+				else
+					depth = depth - 1
+				end
+			end
+			if depth ~= 0 then
+				local choice = vim.fn.confirm(
+					string.format(
+						"⚠️ Delimiter balance is off (%+d) after this edit:\n  %s\n\nAn unbalanced apply can kill the plugin at load. Apply anyway?",
+						depth,
+						path
+					),
+					"&No\n&Yes",
+					1
+				)
+				if choice ~= 2 then
+					vim.notify("❌ Refused: unbalanced edit — review the range and re-emit", vim.log.levels.WARN)
+					return false
+				end
+			end
+		end
+	end
 	local lines = vim.split(content, "\n", { plain = true })
 	if lines[#lines] == "" then
 		table.remove(lines) -- writefile adds the trailing newline itself
@@ -239,17 +334,49 @@ function M.accept(proposal, content_override)
 		reason = proposal.reason,
 		sessionID = proposal.sessionID,
 	})
+
+	-- T2 verdict capture
+	local verdict = "accepted"
+	-- Trailing whitespace/newlines are not corrections, and edit_range
+	-- baselines are full files — compare applied content against the intended
+	-- baseline, normalized.
+	local function norm_content(s)
+		return (s or ""):gsub("%s+$", "")
+	end
+	local baseline = baseline_override or proposal.content
+	if content_override and norm_content(content_override) ~= norm_content(baseline) then
+		verdict = "corrected"
+	end
+	verdicts.record({
+		ts = os.time() * 1000,
+		session_id = proposal.sessionID,
+		proposal_id = proposal.ts,
+		group_name = proposal.group,
+		path = path,
+		operation = proposal.operation,
+		verdict = verdict,
+		reason = proposal.reason,
+		proposed_content = baseline,
+		applied_content = content,
+	})
+	verdicts.promote_if_cross_project(path, verdict)
+
 	M.set_status(proposal, "accepted")
 	vim.notify("✅ Accepted: " .. path, vim.log.levels.INFO)
+	return true
 end
 
 --- Snapshot a file WITHOUT writing — the manual `y` path. Records a journal
 --- entry so even copy-paste changes are revertible (the airlock covers
---- every way a file changes, not just `da`).
+--- every way a file changes, not just `da`). Fails closed on relative paths.
 --- @param proposal table
 --- @return string|nil  snapshot path
 function M.snapshot_only(proposal)
 	local path = resolve_path(proposal)
+	if not path then
+		refuse(proposal, "snapshot")
+		return nil
+	end
 	local snap = journal.snapshot(path)
 	journal.record({
 		ts = proposal.ts,
@@ -267,10 +394,15 @@ end
 --- "Delete" a file: snapshot then MOVE it to <dir>/_old/<basename>.
 --- Never permanently deletes — reversible and auditable.
 --- The move is a USER-initiated action from nvim, never the AI.
+--- Fails closed on relative paths.
 --- @param proposal table
 --- @return string|nil  the _old destination path, or nil if nothing moved
 function M.move_to_old(proposal)
 	local path = resolve_path(proposal)
+	if not path then
+		refuse(proposal, "move to _old")
+		return nil
+	end
 	if vim.fn.filereadable(path) ~= 1 then
 		vim.notify("ℹ️ File already gone: " .. path, vim.log.levels.INFO)
 		M.set_status(proposal, "accepted")
@@ -308,15 +440,51 @@ function M.move_to_old(proposal)
 		reason = proposal.reason,
 		sessionID = proposal.sessionID,
 	})
+
+	-- T2 verdict capture
+	verdicts.record({
+		ts = os.time() * 1000,
+		session_id = proposal.sessionID,
+		proposal_id = proposal.ts,
+		group_name = proposal.group,
+		path = path,
+		operation = proposal.operation,
+		verdict = "moved_old",
+		reason = proposal.reason,
+		proposed_content = proposal.content,
+		applied_content = nil,
+	})
+	verdicts.promote_if_cross_project(path, "moved_old")
+
 	M.set_status(proposal, "accepted")
 	vim.notify("📦 Moved to _old: " .. path .. " → " .. dest, vim.log.levels.INFO)
 	return dest
 end
 
---- Reject a proposal: status flip only. Nothing written.
+--- Reject a proposal: status flip + verdict. Nothing written. Rejection is
+--- allowed for legacy relative rows too — it clears them from the queue.
 --- @param proposal table
 function M.reject(proposal)
 	M.set_status(proposal, "rejected")
+
+	-- T2 verdict capture
+	local path = resolve_path(proposal) -- nil for legacy relative entries
+	verdicts.record({
+		ts = os.time() * 1000,
+		session_id = proposal.sessionID,
+		proposal_id = proposal.ts,
+		group_name = proposal.group,
+		path = path,
+		operation = proposal.operation,
+		verdict = "rejected",
+		reason = proposal.reason,
+		proposed_content = proposal.content,
+		applied_content = nil,
+	})
+	if path then
+		verdicts.promote_if_cross_project(path, "rejected")
+	end
+
 	vim.notify("❌ Rejected: " .. proposal.path, vim.log.levels.INFO)
 end
 

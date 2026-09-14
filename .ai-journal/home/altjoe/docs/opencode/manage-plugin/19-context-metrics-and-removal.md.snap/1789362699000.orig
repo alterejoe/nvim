@@ -1,0 +1,154 @@
+# /home/altjoe/docs/opencode/manage-plugin/19-context-metrics-and-removal.md FINAL
+---
+title: 19 — Context Metrics and Removal (C1–C3, O1)
+status: active
+links: [03-proposals, 10-skills-gating, 11-nvim-companion, 18-staged-workflow]
+---
+
+# Context Metrics and Removal — measure, remove, evaluate, objectify
+
+Status: **active** — C1, C2 and O1 are built; C3 is the next slice.
+
+Implements the intent-network measurement family (../intent-network/04-sidecar,
+05-evaluation-layer, 08-context-mechanisms) inside the manage plugin +
+state.db. Supersedes doc 18's S4 (the compacting half is C2) and S6 (skill
+tiers — reduced to machine tags), and doc 10 (skills gating — reduced to
+capture plus optional validation). Wording/injection is deliberately not the
+mechanism: intent is measured, not prompted.
+
+## As built
+
+| Piece | State |
+|---|---|
+| C1 capture (turn_metrics, context_events) | live — verified: 32+ turns, 44+ tool calls recorded in one session store |
+| C1 read (`:ManageMetrics`, `metrics.turns/events`) | live — colon-call driver fix required first |
+| C2 prune request + shaped compaction | live — cache_read resets after compactions (448k→354k, 479k→285k) while input spikes show the summarizer at work |
+| C2 interface (`<leader>at`, `:ManagePrune`) | live — turn badges + cache deltas make prune effects visible |
+| O1 objects/tags (event_tags, objects mode) | built — files, dirs, patterns, symbols, skills, groups captured from tool args; viewer `t` toggles turns ⇄ objects; per-file verdict outcomes |
+| Verdict integrity (false `corrected` fixes) | live — normalized baseline comparisons; injection carries reasons (accepted) and changed lines (corrected) |
+
+Three driver bugs died on the way, all silent: lsqlite3-style API calls that
+kkharji/sqlite.lua does not have; `sqlite.open(path)` (dot-call, no self)
+falling back to an in-memory DB; and plugin-side `node:sqlite` not existing
+under Bun (runtime-adaptive loader now picks `bun:sqlite` or `node:sqlite`).
+
+## The problem
+
+Context only grows. Every turn adds tool output, dead ends, superseded code,
+and plan text; nothing removes any of it. Removal must be structural and its
+effect measurable, or it is theater.
+
+## Architecture
+
+```
+session events ──► manage.ts hooks ──► state.db (turn_metrics, context_events,
+                                              event_tags, verdicts)
+                                              │
+                    nvim console ◄────────────┤  :ManageMetrics · <leader>at
+                                              │
+nvim :ManagePrune ──► prune_request row ──► plugin claims on next message
+                                              │
+                     experimental.session.compacting shapes ──► client.session.summarize
+```
+
+- Capture is plugin-only (event + tool hooks). No new process.
+- Storage is the existing `state.db` (project + global), additive tables.
+- Removal reads metrics + verdicts; it never asks the model to decide.
+
+## C1 — Measure (built)
+
+| Table | Row per | Columns |
+|---|---|---|
+| turn_metrics | assistant message (upsert by message_id) | session_id, message_id, ts, tokens_input/output/reasoning, cache_read/write, model, agent |
+| context_events | notable act | session_id, ts, kind (tool_call / skill_load / proposal / registry_proposal / prune_request / prune_consumed), detail, subject |
+| event_tags (O1) | object on an event | event_ts, session_id, tag, kind (file / dir / pattern / symbol / skill / group) |
+
+Capture points: `message.updated` (assistant usage), `tool.execute.after`
+(tool calls + object tags), `tool.execute.before` on `skill`, proposal and
+registry emits, prune request/consume. Aggregation views:
+`v_session_growth`, `v_tool_usage`, `v_object_usage`.
+
+## C2 — Remove (built, coarse first)
+
+1. In nvim: `:ManagePrune [note]` — writes one `prune_request` event.
+2. On the next user message the plugin claims it (`prune_consumed` row +
+   in-memory flag).
+3. `experimental.session.compacting` shapes that compaction: keep verified
+   state, accepted/rejected outcomes, decisions, paths, open questions, the
+   current task; drop exploration, superseded code and plans, tool noise.
+4. `client.session.summarize({ path: { id } })` triggers the compaction. On
+   failure the request is kept and retried next message.
+
+Acceptance (proven): `cache_read` resets after a prune; the summarizer shows
+as a large `tokens_input` spike; both visible per turn in the viewer.
+
+Honest limit: whole-session compaction with keep/drop instructions — coarse.
+Selective removal (rewriting old message ranges) is the finer pass, later.
+
+## O1 — Objects / tags (built)
+
+Mechanical named-object recognition, no model involved:
+
+- **Tool args** → tags: `read`/LSP `filePath` → `file`; `grep`/`glob` `path` →
+  `dir` and `pattern` → `pattern`; `lsp_symbols.query` → `symbol`; `skill.name`
+  → `skill`; proposal `path`/`group` → `file`/`group`.
+- **Storage**: `event_tags(event_ts, session_id, tag, kind)` — joined to
+  events by timestamp.
+- **Aggregates**: touches + last seen per object; for `file` objects, verdict
+  outcomes joined by absolute path (accepted / corrected / rejected counts).
+- **Interface**: `<leader>at`, press `t` — objects list (kind · touches · last
+  seen · tag), detail shows the verdict breakdown and the recent events under
+  that tag.
+
+Caveats: tags are exact strings from tool args (absolute paths match
+verdicts; relative paths may not); `pattern` tags are noisy by nature and are
+candidates, not truth. Message-keyword extraction is deliberately deferred.
+
+## C3 — Evaluate (pending)
+
+Derived stats from verdicts + turn_metrics + event_tags (SQL, no model):
+per-object acceptance/correction rates and recency feed retention tiers
+(intent-network 08 section 3): frequent + accepted = keep; single-occurrence
++ corrected = prune candidate. Explainable stats only; mechanism
+promotion/demotion (05) later.
+
+## Interface
+
+- `<leader>at` — metrics viewer, two modes (`t` toggles):
+  turns (time · in · out · cache · delta · badge) and objects
+  (kind · touches · last seen · tag). `j/k`, `r`, `Q`.
+- `:ManageMetrics` — one-shot summary (`:messages`).
+- `:ManagePrune [note]` — request a prune.
+- Errors surface in `:messages`; there is no silent fail-open in the nvim store.
+
+## Honest limits
+
+- Token metrics depend on provider usage fields; absent fields are skipped.
+- Removal is structural first: verified slices, verdict history, recency.
+- Object tags come from tool arguments — the AI's own words are not tagged
+  (deferred: message keyword candidates, review-gated).
+- Continuous verdict capture with origin weights (every user message, not
+  just proposal completions) remains the intent-network verdict docs' job
+  (10/11).
+
+## Slices
+
+| Slice | Content | State |
+|---|---|---|
+| **C1** | metrics capture + read interface | done |
+| **C2** | prune request + shaped compaction | done (coarse) |
+| **O1** | objects/tags + objects mode | done |
+| **C3** | verdict-derived stats + retention candidates | next |
+
+## Open questions
+
+1. Prune trigger: manual only for now; token-threshold automatic comes after C3.
+2. Protected window for the selective removal pass (messages.transform).
+3. Message-keyword tagging: adopt (review-gated) or keep tool-args-only.
+
+## Related
+
+- ../intent-network/04-sidecar, 05-evaluation-layer, 08-context-mechanisms
+- [18-staged-workflow](18-staged-workflow.md) — S4 implemented here as C2
+- [10-skills-gating](10-skills-gating.md) — reduced to tags + validation
+- [11-nvim-companion](11-nvim-companion.md) — the viewer family

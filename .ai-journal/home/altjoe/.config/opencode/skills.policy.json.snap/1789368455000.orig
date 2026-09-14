@@ -1,0 +1,12 @@
+{
+  "skills": {
+    "manage-proposals": {
+      "tier": "default",
+      "subject": [
+        "opencode-manage lua",
+        "plugins ts",
+        "manage-plugin md"
+      ]
+    }
+  }
+}
