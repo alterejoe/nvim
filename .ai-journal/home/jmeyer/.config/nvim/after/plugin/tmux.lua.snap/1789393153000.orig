@@ -1,4 +1,3 @@
--- /home/jmeyer/.config/nvim/after/plugin/tmux.lua FINAL-2
 local tmux = require("tmux_projects")
 
 tmux.setup({
@@ -61,6 +60,5 @@ tmux.setup({
 	},
 })
 
-vim.keymap.set("n", "<leader>ts", tmux.open_workboard, { desc = "Workspace board (live)" })
 vim.keymap.set("n", "<leader>tp", tmux.pick_project, { desc = "Tmux switch project" })
 vim.keymap.set("n", "<leader>tP", tmux.recover_project, { desc = "Tmux recover project" })
