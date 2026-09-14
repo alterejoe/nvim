@@ -1,0 +1,354 @@
+// /home/jmeyer/.config/opencode/oh-my-openagent.jsonc FINAL
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode/minimax-m2.5-free",
+  "autoupdate": true,
+  "default_agent": "oracle",
+
+  "provider": {
+    "opencode": {
+      "models": {
+        "minimax-m2.5-free": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+        "big-pickle": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+          "variants": {
+            "low": {
+              "reasoningEffort": "low",
+              "textVerbosity": "low",
+              "reasoningSummary": "auto",
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "textVerbosity": "low",
+              "reasoningSummary": "auto",
+            },
+          },
+        },
+        "glm-5": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+        "glm-5.1": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+        "kimi-k2.5": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+        "kimi-k2.6": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+        "mimo-v2.5": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+        "mimo-v2.5-pro": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+        "minimax-m2.5": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+        "minimax-m2.7": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+        "qwen3.5-plus": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+        "qwen3.6-plus": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+        "deepseek-v4-pro": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+        "deepseek-v4-flash": {
+          "options": {
+            "reasoningEffort": "low",
+            "textVerbosity": "low",
+          },
+        },
+      },
+    },
+  },
+
+  "agent": {
+    "build": {
+      "maxIterations": 2,
+    },
+    "plan": {
+      "maxIterations": 1,
+    },
+    "chat": {
+      "maxIterations": 1,
+    },
+  },
+
+  "permission": {
+    "read": "ask",
+    "edit": "deny",
+    "write": "deny",
+    "bash": "deny",
+    "task": "deny",
+    "webfetch": "allow",
+    "doom_loop": "deny",
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.pem": "deny",
+      "*.key": "deny",
+      "envs/**": "deny",
+      "**/envs/**": "deny",
+    },
+  },
+  "plugin": ["opencode-ignore", "opencode-mem", "oh-my-openagent"],
+
+  "instructions": [
+    "AGENTS.md",
+    "/home/jmeyer/.config/opencode/prepends/output-formatting.md",
+    "/home/jmeyer/.config/opencode/prepends/convention-tracker.md",
+    "/home/jmeyer/.config/opencode/prepends/consultation-first.md",
+  ],
+
+  "snapshot": true,
+  "share": "manual",
+
+  "server": {
+    "port": 4096,
+    "hostname": "localhost",
+  },
+
+  "agents": {
+    "prometheus": {
+      "mode": "primary",
+      "model": "opencode/minimax-m2.5-free",
+      "temperature": 0.3,
+      "options": {
+        "reasoningEffort": "low",
+        "textVerbosity": "low",
+      },
+      "permission": {
+        "read": "ask",
+        "edit": "deny",
+        "bash": "deny",
+        "task": "deny",
+        "glob": "ask",
+        "webfetch": "allow",
+        "doom_loop": "deny",
+        "external_directory": "ask",
+      },
+      "tools": {
+        "ast_grep_replace": false,
+        "todowrite": false,
+        "lsp_rename": false,
+      },
+    },
+    "oracle": {
+      "mode": "primary",
+      "model": "opencode/minimax-m2.5-free",
+      "temperature": 0.2,
+      "options": {
+        "reasoningEffort": "low",
+        "textVerbosity": "low",
+      },
+      "permission": {
+        "read": "ask",
+        "edit": "deny",
+        "bash": "deny",
+        "task": "deny",
+        "glob": "ask",
+        "webfetch": "allow",
+        "doom_loop": "deny",
+        "external_directory": "ask",
+      },
+      "tools": {
+        "ast_grep_replace": false,
+        "todowrite": false,
+        "lsp_rename": false,
+      },
+    },
+    "explore": {
+      "mode": "primary",
+      "model": "opencode/minimax-m2.5-free",
+      "temperature": 0.1,
+      "options": {
+        "reasoningEffort": "low",
+        "textVerbosity": "low",
+      },
+      "permission": {
+        "read": "ask",
+        "edit": "deny",
+        "bash": "deny",
+        "task": "deny",
+        "glob": "ask",
+        "webfetch": "allow",
+        "doom_loop": "deny",
+        "external_directory": "ask",
+      },
+      "tools": {
+        "ast_grep_replace": false,
+        "todowrite": false,
+        "lsp_rename": false,
+      },
+    },
+    "librarian": {
+      "mode": "primary",
+      "model": "opencode/minimax-m2.5-free",
+      "temperature": 0.1,
+      "options": {
+        "reasoningEffort": "low",
+        "textVerbosity": "low",
+      },
+      "permission": {
+        "read": "ask",
+        "edit": "deny",
+        "bash": "deny",
+        "task": "deny",
+        "glob": "ask",
+        "webfetch": "allow",
+        "doom_loop": "deny",
+        "external_directory": "ask",
+      },
+      "tools": {
+        "ast_grep_replace": false,
+        "todowrite": false,
+        "lsp_rename": false,
+      },
+    },
+    "sisyphus": {
+      "disable": true,
+    },
+    "hephaestus": {
+      "disable": true,
+    },
+    "multimodal-looker": {
+      "disable": true,
+    },
+    "sisyphus-junior": {
+      "disable": true,
+    },
+    "OpenCode-Builder": {
+      "disable": true,
+    },
+    "metis": {
+      "disable": true,
+    },
+    "momus": {
+      "disable": true,
+    },
+    "atlas": {
+      "disable": true,
+    },
+  },
+
+  "disabled_hooks": [
+    "ralph-loop",
+    "todo-enforcer",
+    "auto-resume",
+    "todo-continuation-enforcer",
+    "edit-error-recovery",
+    "delegate-task-retry",
+    "start-work",
+    "stop-continuation-guard",
+    "write-existing-file-guard",
+    "tasks-todowrite-disabler",
+    "interactive-bash-session",
+    "background-notification",
+    "session-recovery",
+    "auto-update-checker",
+    "unstable-agent-babysitter",
+    "task-resume-info",
+    "runtime-fallback",
+  ],
+
+  "disabled_commands": ["ralph-loop", "ulw-loop", "refactor", "start-work"],
+
+  "disabled_tools": [
+    "ast_grep_replace",
+    "todowrite",
+    "lsp_rename",
+    "background_output",
+    "background_cancel",
+    "interactive_bash",
+    "call_omo_agent",
+  ],
+
+  "disabled_skills": [
+    "playwright",
+    "agent-browser",
+    "dev-browser",
+    "git-master",
+  ],
+
+  "team_mode": {
+    "enabled": false,
+  },
+
+  "ralph_loop": {
+    "enabled": false,
+    "default_max_iterations": 1,
+    "default_strategy": "continue",
+  },
+
+  "background_task": {
+    "defaultConcurrency": 0,
+    "maxDepth": 1,
+    "maxDescendants": 0,
+  },
+
+  "start_work": {
+    "auto_commit": false,
+  },
+
+  "sisyphus_agent": {
+    "disabled": true,
+    "default_builder_enabled": false,
+    "planner_enabled": false,
+    "replace_plan": false,
+  },
+
+  "tmux": {
+    "enabled": false,
+    "layout": "main-vertical",
+    "main_pane_size": 60,
+    "main_pane_min_width": 120,
+    "agent_pane_min_width": 40,
+  },
+}

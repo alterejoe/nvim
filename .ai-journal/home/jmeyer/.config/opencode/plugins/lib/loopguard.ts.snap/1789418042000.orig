@@ -1,0 +1,121 @@
+// /home/jmeyer/.config/opencode/plugins/lib/loopguard.ts FINAL
+/**
+ * Loop guard — detects when the assistant repeatedly touches the same named
+ * object (file, dir, pattern, symbol, skill, group, subject, ref) within a
+ * single session, escalating from a soft nudge to a hard interrupt.
+ *
+ * Counters are per-session, keyed by `kind\u0000tag`, and reset at the start
+ * of every user turn. NUDGE_AT touches stash a nudge into the next assistant
+ * context; INTERRUPT_AT touches record an interrupt and the caller aborts the
+ * session.
+ *
+ * Fail-open: pure in-memory state, no I/O, never throws.
+ */
+
+import { recordEvent } from "./metrics";
+
+export const NUDGE_AT = 4;
+export const INTERRUPT_AT = 8;
+
+// sessionID -> (kind\u0000tag -> count)
+const sessionCounts = new Map<string, Map<string, number>>();
+
+function keyOf(kind: string, tag: string): string {
+  return kind + "\u0000" + tag;
+}
+
+export type LoopSignal =
+  | { type: "none" }
+  | { type: "nudge"; kind: string; tag: string; count: number }
+  | { type: "interrupt"; kind: string; tag: string; count: number };
+
+/**
+ * Record one tool call's named-object tags against the session and return the
+ * strongest escalation (interrupt beats nudge beats none).
+ */
+export function observe(
+  sessionID: string,
+  tags: Array<{ tag: string; kind: string }> | null | undefined,
+): LoopSignal {
+  if (!sessionID || !Array.isArray(tags) || tags.length === 0) {
+    return { type: "none" };
+  }
+
+  let map = sessionCounts.get(sessionID);
+  if (!map) {
+    map = new Map<string, number>();
+    sessionCounts.set(sessionID, map);
+  }
+
+  let strongest: LoopSignal = { type: "none" };
+  for (const t of tags) {
+    if (!t || typeof t.tag !== "string" || typeof t.kind !== "string") continue;
+    if (!t.tag) continue;
+    const k = keyOf(t.kind, t.tag);
+    const count = (map.get(k) ?? 0) + 1;
+    map.set(k, count);
+    if (count >= INTERRUPT_AT) {
+      strongest = { type: "interrupt", kind: t.kind, tag: t.tag, count };
+    } else if (count >= NUDGE_AT && strongest.type !== "interrupt") {
+      strongest = { type: "nudge", kind: t.kind, tag: t.tag, count };
+    }
+  }
+  return strongest;
+}
+
+/** Reset a session's loop counters at the start of a new user turn. */
+export function resetTurn(sessionID: string): void {
+  sessionCounts.delete(sessionID);
+}
+
+/** Human label for a (kind, tag) pair in nudge/interrupt text. */
+function labelFor(kind: string, tag: string): string {
+  switch (kind) {
+    case "file":
+      return `the file ${tag}`;
+    case "dir":
+      return `the directory ${tag}`;
+    case "pattern":
+      return `the pattern ${tag}`;
+    case "symbol":
+      return `the symbol ${tag}`;
+    case "skill":
+      return `the skill ${tag}`;
+    case "group":
+      return `the group ${tag}`;
+    case "subject":
+      return `the subject ${tag}`;
+    case "ref":
+      return `the reference ${tag}`;
+    default:
+      return `${kind} ${tag}`;
+  }
+}
+
+/** Build the nudge text injected into the next assistant context. */
+export function nudgeText(kind: string, tag: string, count: number): string {
+  return (
+    `[loopguard] You have touched ${labelFor(kind, tag)} ${count} times this ` +
+    "turn — stop re-reading the same thing, change approach, or ask the user."
+  );
+}
+
+/**
+ * Record a loop-guard interrupt to the event store for observability. The
+ * actual session abort is the caller's job (client.session.abort).
+ */
+export async function recordInterrupt(
+  directory: string,
+  sessionID: string,
+  kind: string,
+  tag: string,
+  count: number,
+): Promise<void> {
+  await recordEvent(
+    directory,
+    sessionID,
+    "loop_interrupt",
+    `${kind}\u0000${tag} (${count})`,
+    null,
+  );
+}

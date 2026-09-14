@@ -1,14 +1,12 @@
--- /home/jmeyer/.config/nvim/lua/opencode-manage/foldersview.lua FINAL-3
+-- /home/jmeyer/.config/nvim/lua/opencode-manage/foldersview.lua FINAL-2
 -- opencode-manage.foldersview — permissions viewer (doc 23, PM1, simplified).
 -- ONE float, two views inside it:
 --   · saved list (default)
---   · `a` → oil opens IN THE SAME WINDOW at the tmux pane cwd (fallback:
---     nvim cwd) — navigate like oil; `a` saves the highlighted row, `A`
---     saves the containing folder; `q`/Esc returns to the list; `Q` closes
---     the float from either view.
+--   · `a` saves the selected folder; `A` saves its parent.
+--   · `o` opens the folder; `q`/`Esc`/`Q` closes the float.
 -- No second pane: verify output lands as footer lines.
---   j/k move · a browse+save · x avoid · d remove · o open ·
---   s sync · v verify · Q close
+--   j/k move · a add folder · A add parent · x avoid · d remove ·
+--   o open · s sync · v verify · Q close
 -- Approve writes state.db memory; `s` merges approved rows into
 -- opencode.json external_directory (journaled, additive-only); `v` reports
 -- drift both ways.
@@ -110,7 +108,7 @@ local function render()
 		end
 	end
 	if #state.rows == 0 then
-		lines[#lines + 1] = "  — none saved — press a to browse (oil) and save a folder —"
+		lines[#lines + 1] = "  — none saved — press a to add a folder, A to add its parent —"
 		hl[#lines] = "ManageFolderHint"
 	end
 	if state.report then
@@ -131,7 +129,7 @@ local function render()
 		end
 	end
 	lines[#lines + 1] =
-		"  a browse (oil: a row · A folder) · x avoid · d remove · o open · s sync · v verify · Q close"
+		"  a add folder · A add parent · x avoid · d remove · o open · s sync · v verify · Q close"
 	hl[#lines] = "ManageFolderHint"
 	vim.bo[state.buf].modifiable = true
 	vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
@@ -196,6 +194,31 @@ local function save_dir(dir)
 		end
 		refresh()
 	end
+end
+
+--- `a` (list view): save the SELECTED folder directly.
+local function save_selected()
+	local it = current()
+	if not it or not it.path then
+		vim.notify("folders: nothing selected", vim.log.levels.WARN)
+		return
+	end
+	save_dir(it.path)
+end
+
+--- `A` (list view): save the PARENT of the selected folder.
+local function save_selected_parent()
+	local it = current()
+	if not it or not it.path then
+		vim.notify("folders: nothing selected", vim.log.levels.WARN)
+		return
+	end
+	local parent = vim.fn.fnamemodify(it.path, ":h")
+	if parent == "" or parent == it.path then
+		vim.notify("folders: no parent folder", vim.log.levels.WARN)
+		return
+	end
+	save_dir(parent)
 end
 
 --- Back from oil to the saved list, same window.
@@ -373,7 +396,8 @@ local function map_keys()
 		state.idx = math.max(state.idx - 1, 1)
 		render()
 	end, "folders: prev")
-	nmap("a", browse, "folders: browse (oil) + save")
+	nmap("a", save_selected, "folders: add folder")
+	nmap("A", save_selected_parent, "folders: add parent folder")
 	nmap("x", do_avoid, "folders: avoid")
 	nmap("d", do_remove, "folders: remove row")
 	nmap("o", do_open, "folders: open folder")

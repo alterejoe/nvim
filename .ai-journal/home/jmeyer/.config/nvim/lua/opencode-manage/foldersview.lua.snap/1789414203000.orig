@@ -1,10 +1,10 @@
--- /home/jmeyer/.config/nvim/lua/opencode-manage/foldersview.lua FINAL-3
+-- /home/altjoe/.config/nvim/lua/opencode-manage/foldersview.lua FINAL
 -- opencode-manage.foldersview — permissions viewer (doc 23, PM1, simplified).
 -- ONE float, two views inside it:
 --   · saved list (default)
 --   · `a` → oil opens IN THE SAME WINDOW at the tmux pane cwd (fallback:
---     nvim cwd) — navigate like oil; `a` saves the highlighted row, `A`
---     saves the containing folder; `q`/Esc returns to the list; `Q` closes
+--     nvim cwd) — navigate like oil; `A` (or `o`) saves the directory you
+--     are viewing (scope prompt); `q`/Esc returns to the list; `Q` closes
 --     the float from either view.
 -- No second pane: verify output lands as footer lines.
 --   j/k move · a browse+save · x avoid · d remove · o open ·
@@ -197,6 +197,30 @@ local function save_dir(dir)
 		refresh()
 	end
 end
+--- `a` (list view): save the SELECTED folder directly.
+local function save_selected()
+	local it = current()
+	if not it or not it.path then
+		vim.notify("folders: nothing selected", vim.log.levels.WARN)
+		return
+	end
+	save_dir(it.path)
+end
+
+--- `A` (list view): save the PARENT of the selected folder.
+local function save_selected_parent()
+	local it = current()
+	if not it or not it.path then
+		vim.notify("folders: nothing selected", vim.log.levels.WARN)
+		return
+	end
+	local parent = vim.fn.fnamemodify(it.path, ":h")
+	if parent == "" or parent == it.path then
+		vim.notify("folders: no parent folder", vim.log.levels.WARN)
+		return
+	end
+	save_dir(parent)
+end
 
 --- Back from oil to the saved list, same window.
 local function return_to_list()
@@ -373,7 +397,8 @@ local function map_keys()
 		state.idx = math.max(state.idx - 1, 1)
 		render()
 	end, "folders: prev")
-	nmap("a", browse, "folders: browse (oil) + save")
+	nmap("a", save_selected, "folders: add folder")
+	nmap("A", save_selected_parent, "folders: add parent folder")
 	nmap("x", do_avoid, "folders: avoid")
 	nmap("d", do_remove, "folders: remove row")
 	nmap("o", do_open, "folders: open folder")

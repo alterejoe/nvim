@@ -1,10 +1,10 @@
--- /home/jmeyer/.config/nvim/lua/opencode-manage/foldersview.lua FINAL-3
+-- /home/altjoe/.config/nvim/lua/opencode-manage/foldersview.lua FINAL
 -- opencode-manage.foldersview — permissions viewer (doc 23, PM1, simplified).
 -- ONE float, two views inside it:
 --   · saved list (default)
 --   · `a` → oil opens IN THE SAME WINDOW at the tmux pane cwd (fallback:
---     nvim cwd) — navigate like oil; `a` saves the highlighted row, `A`
---     saves the containing folder; `q`/Esc returns to the list; `Q` closes
+--     nvim cwd) — navigate like oil; `A` (or `o`) saves the directory you
+--     are viewing (scope prompt); `q`/Esc returns to the list; `Q` closes
 --     the float from either view.
 -- No second pane: verify output lands as footer lines.
 --   j/k move · a browse+save · x avoid · d remove · o open ·
