@@ -6,7 +6,7 @@
 --
 -- VIEWERS: proposals (<leader>ap / <leader>ac), journal (<leader>aj),
 -- registry (<leader>ar), verdicts (<leader>av), metrics (<leader>at),
--- references (<leader>af), vault (<leader>ag), skills (<leader>ak), folders (<leader>aa) —
+-- references (<leader>af), skills (<leader>ak), folders (<leader>aa) —
 -- all persistent two-pane viewers with live previews, no bland pickers.
 -- COMMANDS: :ManageMetrics (summary), :ManagePrune [note] (shaped prune),
 -- :ManageFolders (permissions memory + sync + verify),
@@ -23,7 +23,6 @@ local metrics = require("opencode-manage.metrics")
 local metricsview = require("opencode-manage.metricsview")
 local refs = require("opencode-manage.refs")
 local refsview = require("opencode-manage.refsview")
-local vaultview = require("opencode-manage.vaultview")
 local skills = require("opencode-manage.skills")
 local skillsview = require("opencode-manage.skillsview")
 local folders = require("opencode-manage.folders")
@@ -39,7 +38,6 @@ vim.keymap.set("n", "<leader>at", metricsview.open, { desc = "Manage: metrics vi
 vim.keymap.set("n", "<leader>af", refsview.open, { desc = "Manage: references viewer" })
 vim.keymap.set("n", "<leader>ak", skillsview.open, { desc = "Manage: skills lifecycle" })
 vim.keymap.set("n", "<leader>aa", foldersview.open, { desc = "Manage: folder permissions" })
-vim.keymap.set("n", "<leader>ag", vaultview.open, { desc = "Manage: vault (global references)" })
 
 -- Stable commands (path resolution lives in code, not in pasted one-liners)
 vim.api.nvim_create_user_command("ManageMetrics", function()
@@ -110,7 +108,6 @@ return {
 	metricsview = metricsview,
 	refs = refs,
 	refsview = refsview,
-	vaultview = vaultview,
 	skills = skills,
 	skillsview = skillsview,
 	folders = folders,

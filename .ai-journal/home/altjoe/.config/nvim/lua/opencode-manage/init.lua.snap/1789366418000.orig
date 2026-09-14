@@ -1,17 +1,16 @@
 -- /home/altjoe/.config/nvim/lua/opencode-manage/init.lua FINAL
 -- opencode-manage — the review console for the opencode manage plugin.
 -- Proposal review + change journal + registry review + verdict store/viewer
--- + metrics interface + references + skills lifecycle + permissions folders.
+-- + metrics interface + references + skills lifecycle.
 -- Completely separate from opencode-ext (the chat viewer) — no overlap.
 --
 -- VIEWERS: proposals (<leader>ap / <leader>ac), journal (<leader>aj),
 -- registry (<leader>ar), verdicts (<leader>av), metrics (<leader>at),
--- references (<leader>af), vault (<leader>ag), skills (<leader>ak), folders (<leader>aa) —
--- all persistent two-pane viewers with live previews, no bland pickers.
+-- references (<leader>af), skills (<leader>ak) — all persistent two-pane
+-- viewers with live previews, no bland pickers.
 -- COMMANDS: :ManageMetrics (summary), :ManagePrune [note] (shaped prune),
--- :ManageFolders (permissions memory + sync + verify),
--- :ManageIndex [root] / :ManageVault [root] / :ManageRef [path] /
--- :ManageRefs / :ManageRefPrune <id> <why> (references, doc 20).
+-- :ManageIndex [root] / :ManageRef [path] / :ManageRefs /
+-- :ManageRefPrune <id> <why> (references, doc 20).
 -- Focus: BufEnter writes the active file so refs can route by what you work on.
 
 local review = require("opencode-manage.review")
@@ -23,11 +22,8 @@ local metrics = require("opencode-manage.metrics")
 local metricsview = require("opencode-manage.metricsview")
 local refs = require("opencode-manage.refs")
 local refsview = require("opencode-manage.refsview")
-local vaultview = require("opencode-manage.vaultview")
 local skills = require("opencode-manage.skills")
 local skillsview = require("opencode-manage.skillsview")
-local folders = require("opencode-manage.folders")
-local foldersview = require("opencode-manage.foldersview")
 
 -- Keymaps
 vim.keymap.set("n", "<leader>ap", reviewview.open, { desc = "Manage: review proposals" })
@@ -38,8 +34,6 @@ vim.keymap.set("n", "<leader>av", verdictview.open, { desc = "Manage: verdict vi
 vim.keymap.set("n", "<leader>at", metricsview.open, { desc = "Manage: metrics viewer (turns + objects)" })
 vim.keymap.set("n", "<leader>af", refsview.open, { desc = "Manage: references viewer" })
 vim.keymap.set("n", "<leader>ak", skillsview.open, { desc = "Manage: skills lifecycle" })
-vim.keymap.set("n", "<leader>aa", foldersview.open, { desc = "Manage: folder permissions" })
-vim.keymap.set("n", "<leader>ag", vaultview.open, { desc = "Manage: vault (global references)" })
 
 -- Stable commands (path resolution lives in code, not in pasted one-liners)
 vim.api.nvim_create_user_command("ManageMetrics", function()
@@ -50,18 +44,9 @@ vim.api.nvim_create_user_command("ManagePrune", function(opts)
 	metrics.request_prune(opts.args ~= "" and opts.args or nil)
 end, { nargs = "*", desc = "Manage: request a shaped context prune (next opencode message)" })
 
-vim.api.nvim_create_user_command("ManageFolders", function()
-	folders.summary()
-end, { desc = "Manage: folder permissions memory (approve/avoid/sync/verify)" })
-
 vim.api.nvim_create_user_command("ManageIndex", function(opts)
 	refs.index(opts.args ~= "" and opts.args or vim.fn.getcwd())
 end, { nargs = "?", complete = "dir", desc = "Manage: index references under a root" })
-
-vim.api.nvim_create_user_command("ManageVault", function(opts)
-	local root = opts.args ~= "" and opts.args or ((vim.env.HOME or "") .. "/projects/shared")
-	refs.index(root, { global = true })
-end, { nargs = "?", complete = "dir", desc = "Manage: index the shared vault into the GLOBAL ref store" })
 
 vim.api.nvim_create_user_command("ManageRef", function(opts)
 	local path = opts.args ~= "" and opts.args or vim.api.nvim_buf_get_name(0)
@@ -110,11 +95,8 @@ return {
 	metricsview = metricsview,
 	refs = refs,
 	refsview = refsview,
-	vaultview = vaultview,
 	skills = skills,
 	skillsview = skillsview,
-	folders = folders,
-	foldersview = foldersview,
 	proposals = require("opencode-manage.proposals"),
 	journal = require("opencode-manage.journal"),
 	registry = require("opencode-manage.registry"),

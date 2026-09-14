@@ -1,0 +1,93 @@
+# /home/altjoe/docs/opencode/manage-plugin/23-permissions-manager.md FINAL
+---
+title: 23 — Permissions Manager (PM)
+status: proposed
+links: [11-nvim-companion, 20-references, 22-skills]
+---
+
+# Permissions Manager — remember folders, verify they applied
+
+Status: proposed — design for review; nothing built.
+
+Implements the intent-network folder-permissions design
+(`../intent-network/02-permissions-tooling`) inside the manage console,
+with one addition that matters: **verify** that remembered permissions are
+actually in opencode's config, instead of assuming the write landed.
+
+## The problem
+
+- Every project re-asks for folders already trusted; opencode's
+  `permission.external_directory` is hand-edited or forgotten.
+- Approvals have no memory: what was approved lives in a config file
+  nobody audits, and drift (hand-edit, typo, deleted entry) is invisible.
+- The indexer and the capture offers walk into ignored trees
+  (`node_modules`, build output), wasting attention.
+
+## Contract
+
+- **Memory vs enforcement.** state.db `folders` rows are the MEMORY;
+  `opencode.json` `permission.external_directory` is the ENFORCEMENT
+  surface. `s` sync writes the config (a console action, journaled,
+  preserving every other key); `v` verify diffs memory against config and
+  reports drift in both directions. No silent half-state.
+- **Capture is free.** The plugin already tags every searched dir (O1 `dir`
+  tags). The viewer offers those as candidates — approve once, never asked
+  again.
+- **Ignore files are respected, by git.** `git check-ignore --stdin` batch
+  when the root is a repo (accurate, zero dependencies); `.ignore` +
+  built-in patterns as the non-repo fallback. Ignored directories are never
+  offered and never indexed.
+- **Approval indexes.** Approving a folder runs the refs index over it and
+  marks it `indexed`, so the folders you trust are also the folders the AI
+  can cite your own code from (doc 20).
+
+## Storage (state.db, additive)
+
+| Table | Row | Columns |
+|---|---|---|
+| folders | one folder decision | id, ts, path, scope (project \| common), status (approved \| avoid), source (manual \| captured \| indexed), uses, last_seen, note |
+
+`common` rows are the machine-wide trust set (the SCAN_ROOTS idea made
+explicit: `~/projects`, `~/docs`, …); they apply in every project.
+
+## Interface
+
+- `<leader>aa` — the permissions viewer: approved / avoid / candidates
+  (captured dirs not yet decided, ignore-filtered).
+  `a` approve · `x` avoid · `d` remove · `o` open folder · `s` sync to
+  opencode.json · `v` verify (drift report) · `r` refresh · `Q` close.
+- Sync/verify target `~/.config/opencode/opencode.json`
+  `permission.external_directory` (currently a path array). Writes are
+  journaled like every console action; the config is a hand-reviewed
+  artifact — pretty JSON, other keys untouched.
+
+## Restart semantics (verify live)
+
+Whether a RUNNING opencode session picks up an `opencode.json` change is
+unverified — until tested, sync reports: "written; restart opencode if the
+running session still asks". `v` verify is the source of truth for the
+FILE, not for process state.
+
+## Slices
+
+| Slice | Content | Effort |
+|---|---|---|
+| **PM1** | folders table + viewer + sync/verify | Quick |
+| **PM2** | gitignore/.ignore respect in the indexer + capture offers | Short |
+| **PM3** | approval → refs index + `indexed` marking | Quick |
+
+## Honest limits
+
+- nvim manages CONFIG and indexing — it cannot intercept opencode's read
+  gate at runtime (that is opencode's own permission system).
+- Captured candidates come from tool args (O1), so they show what the
+  session touched, not everything under a root.
+- `external_directory` is global config today; per-project scoping lives in
+  our memory + generated globs (`~/projects/<x>/**`), not in opencode.
+
+## Related
+
+- `../intent-network/02-permissions-tooling` — the design this implements
+- [20-references](20-references.md) — approval indexes refs; these ignore
+  rules also govern the indexer
+- [11-nvim-companion](11-nvim-companion.md) — the viewer family

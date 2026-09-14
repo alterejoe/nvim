@@ -128,29 +128,6 @@ local function open_writable()
 	return db
 end
 
---- Writer open for the GLOBAL store (the vault): ~/.config/opencode/state.db.
---- Global refs are shared by every project — indexed once, not per project
---- (CV1, doc 20).
---- @return table|nil
-local function open_global_writable()
-	local path = (vim.env.HOME or "") .. "/.config/opencode/state.db"
-	vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
-	local ok, db = pcall(function()
-		if not sqlite then
-			sqlite = require("sqlite")
-		end
-		return sqlite:open(path)
-	end)
-	if not ok or type(db) ~= "table" then
-		vim.notify("❌ refs: could not open/create the global store at " .. path, vim.log.levels.ERROR)
-		return nil
-	end
-	pcall(function()
-		db:execute(REFS_SCHEMA)
-	end)
-	return db
-end
-
 --- Subject from a path: parent dir + extension (same rule as the plugin).
 --- @param path string
 --- @return string
@@ -164,18 +141,13 @@ end
 
 --- Index files under a root. Live pointers only; pruned entries are not
 --- resurrected and existing entries are skipped. Creates the store.
---- opts.global = true writes the GLOBAL store with scope 'global' (the
---- vault); default stays the project store.
 --- @param root string
---- @param opts table|nil  { global = boolean }
 --- @return number  inserted count
-function M.index(root, opts)
-	opts = opts or {}
-	local db = opts.global and open_global_writable() or open_writable()
+function M.index(root)
+	local db = open_writable()
 	if not db then
 		return 0
 	end
-	local scope = opts.global and "global" or "project"
 
 	local files = {}
 	for _, ext in ipairs(INDEX_EXTS) do
@@ -212,8 +184,8 @@ function M.index(root, opts)
 			if not exists then
 				local res = db:eval(
 					"INSERT INTO refs (ts, source, kind, path, subject, scope) "
-						.. "VALUES (?, 'index', 'file', ?, ?, ?)",
-					{ now, f, M.subject(f), scope }
+						.. "VALUES (?, 'index', 'file', ?, ?, 'project')",
+					{ now, f, M.subject(f) }
 				)
 				if res ~= false then
 					inserted = inserted + 1
@@ -226,7 +198,7 @@ function M.index(root, opts)
 		db:close()
 	end)
 	vim.notify(
-		string.format("📚 refs: indexed %d new file(s) under %s (%s)", inserted, root, scope),
+		string.format("📚 refs: indexed %d new file(s) under %s", inserted, root),
 		vim.log.levels.INFO
 	)
 	return inserted
@@ -304,76 +276,6 @@ function M.list()
 		db:close()
 	end)
 	return rows
-end
-
---- Read-only open of the global vault store (nil when absent/unusable).
---- @return table|nil
-local function open_global()
-	local path = (vim.env.HOME or "") .. "/.config/opencode/state.db"
-	if vim.fn.filereadable(path) ~= 1 then
-		return nil
-	end
-	local ok, db = pcall(function()
-		if not sqlite then
-			sqlite = require("sqlite")
-		end
-		return sqlite:open(path)
-	end)
-	if not ok or type(db) ~= "table" then
-		return nil
-	end
-	pcall(function()
-		db:execute(REFS_SCHEMA)
-	end)
-	return db
-end
-
---- Global vault list (unpruned first, most used first).
---- @return table[]
-function M.list_global()
-	local db = open_global()
-	if not db then
-		return {}
-	end
-	local rows = {}
-	pcall(function()
-		local res = db:eval(
-			"SELECT id, source, kind, subject, path, symbol, uses, last_used, pruned_ts, prune_reason "
-				.. "FROM refs ORDER BY (pruned_ts IS NOT NULL), uses DESC, ts DESC LIMIT 300"
-		)
-		if type(res) == "table" then
-			rows = res
-		end
-	end)
-	pcall(function()
-		db:close()
-	end)
-	return rows
-end
-
---- Prune a GLOBAL vault ref (reason kept; the vault viewer's `d`).
---- @param id number
---- @param reason string
---- @return boolean
-function M.prune_global(id, reason)
-	local db = open_global_writable()
-	if not db then
-		return false
-	end
-	local ok = pcall(function()
-		db:eval("UPDATE refs SET pruned_ts = ?, prune_reason = ? WHERE id = ?", {
-			os.time() * 1000,
-			reason,
-			tonumber(id),
-		})
-	end)
-	pcall(function()
-		db:close()
-	end)
-	if ok then
-		vim.notify("🗑 vault ref pruned: #" .. tostring(id), vim.log.levels.INFO)
-	end
-	return ok
 end
 
 --- Print the list (stable verification command).

@@ -1,0 +1,181 @@
+// /home/altjoe/.config/opencode/plugins/lib/refs.ts FINAL
+/**
+ * References store (doc 20, R1). Live pointers to the user's own working
+ * code plus frozen blocks from corrected verdicts — style references the AI
+ * can consult without copying or executing anything.
+ *
+ * Tables (additive, same state.db):
+ *   refs  — source index|pin|correction; live pointers carry path/symbol,
+ *           corrections carry content; prune_reason keeps the WHY.
+ *   focus — single row: the file the user is working on right now.
+ *
+ * Fail-open: no driver, no store, busy DB -> empty results, never a crash.
+ */
+
+import { existsSync } from "fs";
+import { join } from "path";
+import { openDatabase } from "./sqlite";
+
+export const REFS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS refs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  source TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  path TEXT,
+  symbol TEXT,
+  subject TEXT,
+  scope TEXT NOT NULL DEFAULT 'project',
+  content TEXT,
+  uses INTEGER NOT NULL DEFAULT 0,
+  last_used INTEGER,
+  pruned_ts INTEGER,
+  prune_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_refs_subject ON refs(subject);
+CREATE INDEX IF NOT EXISTS idx_refs_path ON refs(path);
+
+CREATE TABLE IF NOT EXISTS focus (
+  id INTEGER PRIMARY KEY,
+  ts INTEGER NOT NULL,
+  path TEXT NOT NULL,
+  dir TEXT
+);
+`;
+
+export interface RefRow {
+  id: number;
+  source: string;
+  kind: string;
+  path: string | null;
+  symbol: string | null;
+  subject: string | null;
+  content: string | null;
+  uses: number;
+  last_used: number | null;
+}
+
+function openStore(directory: string, create: boolean): any | null {
+  const path = join(directory, ".opencode", "state.db");
+  try {
+    if (!create && !existsSync(path)) return null;
+  } catch {
+    return null;
+  }
+  const db = openDatabase(path);
+  if (!db) return null;
+  try {
+    db.exec(REFS_SCHEMA);
+    return db;
+  } catch {
+    try {
+      db.close();
+    } catch {
+      /* best effort */
+    }
+    return null;
+  }
+}
+
+/** Subject derived from a path: parent dir + extension, e.g. "opencode-manage lua". */
+export function deriveSubject(path: string): string {
+  const parts = path.split("/").filter(Boolean);
+  const dir = parts.length >= 2 ? parts[parts.length - 2] : "";
+  const m = /\.([A-Za-z0-9]+)$/.exec(path);
+  const ext = m ? m[1].toLowerCase() : "";
+  return [dir, ext].filter(Boolean).join(" ");
+}
+
+/** The file the user is working on (single focus row). */
+export function loadFocus(
+  directory: string,
+): { path: string; dir: string | null; ts: number } | null {
+  const db = openStore(directory, false);
+  if (!db) return null;
+  try {
+    const row = db.prepare("SELECT path, dir, ts FROM focus WHERE id = 1").get();
+    return row && typeof row.path === "string" ? row : null;
+  } catch {
+    return null;
+  } finally {
+    try {
+      db.close();
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+/** Refs matching the focused file: same directory prefix or derived subject. */
+export function matchRefs(
+  directory: string,
+  focus: { path: string; dir: string | null },
+): RefRow[] {
+  const db = openStore(directory, false);
+  if (!db) return [];
+  try {
+    const subject = deriveSubject(focus.path);
+    const dir = focus.path.replace(/\/[^/]*$/, "");
+    const rows = db
+      .prepare(
+        "SELECT id, source, kind, path, symbol, subject, content, uses, last_used FROM refs " +
+          "WHERE pruned_ts IS NULL AND (path LIKE ? OR subject = ?) " +
+          "ORDER BY (source = 'correction') DESC, uses DESC, ts DESC LIMIT 3",
+      )
+      .all(`${dir}%`, subject);
+    return rows || [];
+  } catch {
+    return [];
+  } finally {
+    try {
+      db.close();
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+/** Explicit lookup for the ref_lookup tool; bumps uses/last_used on hits. */
+export function lookupRefs(
+  directory: string,
+  q: { subject?: string; path?: string; symbol?: string },
+): RefRow[] {
+  const db = openStore(directory, false);
+  if (!db) return [];
+  try {
+    const where: string[] = ["pruned_ts IS NULL"];
+    const params: unknown[] = [];
+    if (q.subject) {
+      where.push("subject LIKE ?");
+      params.push(`%${q.subject}%`);
+    }
+    if (q.path) {
+      where.push("path LIKE ?");
+      params.push(`%${q.path}%`);
+    }
+    if (q.symbol) {
+      where.push("symbol LIKE ?");
+      params.push(`%${q.symbol}%`);
+    }
+    const sql =
+      "SELECT id, source, kind, path, symbol, subject, content, uses, last_used FROM refs " +
+      `WHERE ${where.join(" AND ")} ` +
+      "ORDER BY (source = 'correction') DESC, uses DESC, ts DESC LIMIT 8";
+    const rows = (db.prepare(sql).all(...params) as RefRow[]) || [];
+    if (rows.length > 0) {
+      const placeholders = rows.map(() => "?").join(",");
+      db.prepare(
+        `UPDATE refs SET uses = uses + 1, last_used = ? WHERE id IN (${placeholders})`,
+      ).run(Date.now(), ...rows.map((r) => r.id));
+    }
+    return rows;
+  } catch {
+    return [];
+  } finally {
+    try {
+      db.close();
+    } catch {
+      /* best effort */
+    }
+  }
+}

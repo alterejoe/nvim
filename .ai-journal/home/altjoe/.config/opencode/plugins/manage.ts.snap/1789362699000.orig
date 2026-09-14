@@ -1,0 +1,1143 @@
+/**
+ * Manage — OpenCode Management Plugin
+ * (M1 + M1g + M1i + M1r + M2 + M2.5 + C1 + C2 + O1 + R1a + SL1)
+ * Entry point only: hooks + tools, wired from lib/ modules.
+ *
+ * V1 plugin shape (PluginModule): `export default { id, server }` — the
+ * loader's modern path. The legacy function-export path is bypassed.
+ *
+ * Core principle: STRUCTURAL, not heuristic. There is no path from the AI
+ * to the filesystem. The gate denies the mutation tools outright; the AI's
+ * only "write" channels are emit_proposal, registry_propose and emit_skill,
+ * which write nothing to disk — they append to review queues the user applies.
+ *
+ * M2/M2.5: verdict capture (store reads, abort + correction pairing).
+ * C1 (doc 19): context metrics — assistant token usage, tool/skill/proposal
+ * events, all in state.db. Capture only.
+ * C2 (doc 19): user-requested prune — nvim writes a prune_request event;
+ * the plugin claims it on the next message, shapes the compaction via
+ * experimental.session.compacting, and triggers client.session.summarize.
+ * O1 (doc 19): named-object tags (files, dirs, patterns, symbols, skills,
+ * groups) attached to tool events in event_tags.
+ * R1a (doc 20): references — focus routing from the nvim-written focus row
+ * plus the read-only ref_lookup tool over live pointers and correction
+ * blocks. References never execute; they are rows in the reviewed store.
+ * SL1 (doc 22): skills — the reviewed intake (emit_skill queues the SKILL.md
+ * and its skills.policy.json routing entry as one group), the tier/subject
+ * routing hint (each match carries its SKILL.md path — opencode's skill
+ * registry is process-cached, so a stale registry can be bypassed by reading
+ * the file), and subject tags on skill loads. Subjects are shared with refs
+ * (doc 20); tiers are doc 18 S6's vocabulary.
+ * SL3 (doc 22): `skill_load` — the manage-side, always-fresh reader: it
+ * resolves the manifest + SKILL.md directly, so a skill applied mid-session
+ * is loadable immediately; the native skill tool catches up on the next
+ * opencode restart.
+ *
+ * DENIAL IS TERMINAL: the throw messages below explicitly tell the model
+ * not to retry or work around a denied tool. The impact requirement and
+ * registry_propose/emit_skill validation are the deliberate exceptions:
+ * their errors are REQUIREMENTS retries — fix the input and re-emit.
+ */
+
+import { type Plugin, tool } from "@opencode-ai/plugin";
+import { existsSync, readFileSync } from "fs";
+import { join, isAbsolute } from "path";
+import { loadRules, DEFAULT_DENY } from "./lib/airlock";
+import {
+  loadRecentVerdicts,
+  recordAbort,
+  attachCorrection,
+} from "./lib/verdicts";
+import { proposalsFile, appendProposal } from "./lib/proposals";
+import {
+  recordTurn,
+  recordEvent,
+  hasPendingPrune,
+  markPruneConsumed,
+} from "./lib/metrics";
+import { loadFocus, matchRefs, deriveSubject, lookupRefs } from "./lib/refs";
+import {
+  loadRegistry,
+  matchesSharedPath,
+  buildRegistrySummary,
+  parseImpact,
+  impactRequiredMessage,
+  parseStringList,
+  parseRefs,
+  entryKey,
+  entryExists,
+  REGISTRY_KINDS,
+  registryPendingFile,
+  appendPending,
+  type ImpactEntry,
+  type RefEntry,
+} from "./lib/registry";
+import {
+  matchSkills,
+  skillSubjects,
+  slugValid,
+  composeSkillMd,
+  mergedManifest,
+  parseSubjectArg,
+  buildSkillsSummary,
+  skillManifestFile,
+  skillsDir,
+  readManifest,
+  loadSkillMeta,
+  TIERS,
+  type SkillScope,
+} from "./lib/skills";
+
+// ── M2.5 conversation verdict state ─────────────────────────────────────────
+// sessionID -> pending abort verdict id (awaiting the user's correction)
+const pendingAborts = new Map<string, number>();
+
+// ── C2 prune state ──────────────────────────────────────────────────────────
+// Sessions whose next compaction is user-requested and should be shaped.
+const pruneShaped = new Set<string>();
+
+/** Extract joined text from a message's text parts (defensive). */
+function messageText(info: any): string {
+  if (!info || !Array.isArray(info.parts)) return "";
+  return info.parts
+    .filter((p: any) => p && p.type === "text" && typeof p.text === "string")
+    .map((p: any) => p.text)
+    .join("\n")
+    .trim();
+}
+
+const ManagePlugin: Plugin = async ({ directory, client }) => {
+  return {
+    // ── Airlock gate: runs before EVERY tool call ────────────────────────
+    "tool.execute.before": async (input, output) => {
+      const rules = loadRules(directory);
+      const toolName = input.tool;
+
+      const explicitlyAllowed = rules.allow.includes(toolName);
+      const explicitlyDenied = rules.deny.includes(toolName);
+
+      // Explicit allow wins over the deny list.
+      if (explicitlyDenied && !explicitlyAllowed) {
+        throw new Error(
+          `[manage] ❌ Tool "${toolName}" is DENIED by the airlock — ` +
+            `permanently, do not retry it or attempt a workaround. ` +
+            `The AI cannot mutate the filesystem. Use emit_proposal instead.`,
+        );
+      }
+      // bash is denied by default even if a rules file forgot it.
+      if (toolName === "bash" && !explicitlyAllowed) {
+        throw new Error(
+          `[manage] ❌ bash is DENIED by the airlock — permanently, do not ` +
+            `retry it or attempt a workaround. The AI cannot run shell ` +
+            `commands. Propose changes with emit_proposal; the user runs commands.`,
+        );
+      }
+
+      // C1: the tool is proceeding — skill loads are context events.
+      // SL1: the load event carries the skill AND its routing subjects so
+      // objects mode joins skill <-> subject (doc 19 O1, doc 22).
+      if (toolName === "skill") {
+        const name = (output as any)?.args?.name;
+        if (typeof name === "string" && name) {
+          const tags: Array<{ tag: string; kind: string }> = [
+            { tag: name, kind: "skill" },
+          ];
+          try {
+            for (const s of skillSubjects(directory, name)) {
+              tags.push({ tag: s, kind: "subject" });
+            }
+          } catch {
+            // fail-open: tags are diagnostics, never a gate
+          }
+          await recordEvent(
+            directory,
+            input.sessionID,
+            "skill_load",
+            name,
+            null,
+            tags,
+          );
+        }
+      }
+    },
+
+    // ── C1 + O1: tool call capture (name + named-object tags) ────────────
+    "tool.execute.after": async (input) => {
+      const args = (input as any).args || {};
+      const seen = new Set<string>();
+      const tags: Array<{ tag: string; kind: string }> = [];
+      const add = (v: unknown, kind: string) => {
+        if (typeof v !== "string") return;
+        const t = v.trim();
+        if (!t || t.length > 300) return;
+        const key = kind + "\u0000" + t;
+        if (seen.has(key)) return;
+        seen.add(key);
+        tags.push({ tag: t, kind });
+      };
+      switch (input.tool) {
+        case "read":
+          add(args.filePath, "file");
+          break;
+        case "grep":
+          add(args.path, "dir");
+          add(args.pattern, "pattern");
+          break;
+        case "glob":
+          add(args.path, "dir");
+          add(args.pattern, "pattern");
+          break;
+        case "list":
+          add(args.path, "dir");
+          break;
+        case "skill":
+          add(args.name, "skill");
+          break;
+        case "lsp_goto_definition":
+        case "lsp_find_references":
+          add(args.filePath, "file");
+          break;
+        case "lsp_symbols":
+          add(args.filePath, "file");
+          add(args.query, "symbol");
+          break;
+        case "emit_proposal":
+          add(args.path, "file");
+          add(args.group, "group");
+          break;
+        case "registry_propose": {
+          add(args.path, "file");
+          const paths = args.paths;
+          if (Array.isArray(paths)) {
+            for (const p of paths) add(p, "file");
+          }
+          break;
+        }
+        case "emit_skill": {
+          add(args.name, "skill");
+          if (typeof args.subject === "string" && args.subject.trim() !== "") {
+            try {
+              const arr = JSON.parse(args.subject);
+              if (Array.isArray(arr)) {
+                for (const s of arr) add(s, "subject");
+              }
+            } catch {
+              // malformed subject never breaks capture; emit_skill validates
+            }
+          }
+          break;
+        }
+        case "skill_load":
+          add(args.name, "skill");
+          break;
+        case "ref_lookup": {
+          if (typeof args.subject === "string" && args.subject)
+            add(args.subject, "subject");
+          if (typeof args.path === "string" && args.path) add(args.path, "ref");
+          break;
+        }
+      }
+      await recordEvent(
+        directory,
+        input.sessionID,
+        "tool_call",
+        input.tool,
+        null,
+        tags,
+      );
+    },
+
+    // ── M2.5 + C1: message events ────────────────────────────────────────
+    event: async ({ event }) => {
+      if (!event || event.type !== "message.updated") return;
+      const props = (event as any).properties;
+      const info = props?.info;
+      if (!info) return;
+      // EventMessageUpdated.properties carries only `info`; sessionID lives
+      // on the message itself.
+      const sessionID = props?.sessionID || info.sessionID;
+
+      // C1: assistant token usage — context growth metrics (doc 19).
+      if (info.role === "assistant") {
+        await recordTurn(directory, info);
+      }
+
+      // M2.5: the escape-kill is a verdict.
+      if (info.error && info.error.name === "MessageAbortedError") {
+        if (!sessionID) return;
+        const killed = messageText(info);
+        const id = await recordAbort(
+          directory,
+          sessionID,
+          killed || "aborted generation",
+        );
+        if (id !== null) {
+          pendingAborts.set(sessionID, id);
+        }
+      }
+    },
+
+    // ── M2.5 + C2: new user message ──────────────────────────────────────
+    "chat.message": async (input, output) => {
+      const sessionID = input.sessionID;
+
+      // C2: claim a prune request written by the nvim console, shape the
+      // compaction (hook below), and trigger it. On failure the request is
+      // kept so the next message retries.
+      const reqTs = await hasPendingPrune(directory);
+      if (reqTs !== null && sessionID) {
+        pruneShaped.add(sessionID);
+        try {
+          await (client as any).session.summarize({ path: { id: sessionID } });
+          await markPruneConsumed(directory, sessionID, reqTs);
+        } catch (e) {
+          console.error(
+            "[manage] prune: summarize failed (request kept): " + String(e),
+          );
+        }
+      }
+
+      // M2.5: pair the user's correction with the pending abort.
+      const pendingId = pendingAborts.get(sessionID);
+      if (pendingId === undefined) return;
+      const correction = (output.parts || [])
+        .filter(
+          (p: any) => p && p.type === "text" && typeof p.text === "string",
+        )
+        .map((p: any) => p.text)
+        .join("\n")
+        .trim();
+      if (!correction) return;
+      await attachCorrection(directory, pendingId, correction);
+      pendingAborts.delete(sessionID);
+    },
+
+    // ── C2: shape a user-requested compaction ────────────────────────────
+    "experimental.session.compacting": async (input, output) => {
+      const sessionID = (input as any)?.sessionID;
+      if (!sessionID || !pruneShaped.has(sessionID)) return;
+      pruneShaped.delete(sessionID);
+      output.context.push(
+        "[prune] User-requested prune. Keep: verified state, accepted and " +
+          "rejected outcomes, decisions, changed file paths, open questions, " +
+          "the current task and its scope. Drop: exploration and dead ends, " +
+          "superseded code and plans, tool-call noise, resolved discussion " +
+          "already captured above.",
+      );
+      output.prompt =
+        "Summarize this session for continuation after a user-requested prune. " +
+        "Preserve verified facts, decisions, file paths, and the current task; " +
+        "omit exploration, tool output, and superseded code.";
+    },
+
+    // ── M2 verdict injection: loop-breaking at the message boundary ──────
+    "experimental.chat.messages.transform": async (_input, output) => {
+      const verdicts = await loadRecentVerdicts(directory, 5);
+      if (!verdicts.length) return;
+
+      const block =
+        "[verdicts] " +
+        verdicts
+          .map((v) => {
+            const target = v.path || v.reason || "conversation";
+            if (v.verdict === "aborted" && v.applied_content) {
+              return `aborted: ${target} (you said: ${v.applied_content.slice(0, 60)})`;
+            }
+            if (
+              v.verdict === "corrected" &&
+              v.proposed_content &&
+              v.applied_content
+            ) {
+              // Trailing whitespace is not a change: compare trimmed bodies,
+              // then report how much changed and the first changed line pair
+              // so the correction carries substance, not just a label.
+              const a = v.proposed_content.replace(/\s+$/, "").split("\n");
+              const b = v.applied_content.replace(/\s+$/, "").split("\n");
+              let changed = 0;
+              let firstOld = "";
+              let firstNew = "";
+              const n = Math.max(a.length, b.length);
+              for (let i = 0; i < n; i++) {
+                if (a[i] !== b[i]) {
+                  changed++;
+                  if (!firstOld && !firstNew) {
+                    firstOld = (a[i] ?? "").trim().slice(0, 60);
+                    firstNew = (b[i] ?? "").trim().slice(0, 60);
+                  }
+                  if (changed >= 3) break;
+                }
+              }
+              if (changed === 0) {
+                return `corrected: ${target}`;
+              }
+              return `corrected: ${target} (${changed} line(s): -${firstOld || "…"} +${firstNew || "…"})`;
+            }
+            return `${v.verdict}: ${target}${v.reason ? ` (${v.reason})` : ""}`;
+          })
+          .join(" · ");
+
+      const msgs = output.messages;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (m.info.role === "user") {
+          m.parts.push({
+            id: `verdicts-${Date.now()}`,
+            sessionID: m.info.sessionID,
+            messageID: m.info.id,
+            type: "text",
+            text: block,
+            synthetic: true,
+          });
+          break;
+        }
+      }
+    },
+
+    // ── R1a + SL1: focus-routed hints (docs 20, 22) ──────────────────────
+    "experimental.chat.system.transform": async (_input, output) => {
+      try {
+        const focus = loadFocus(directory);
+        if (!focus) return;
+        const lines: string[] = [];
+
+        const refs = matchRefs(directory, focus);
+        if (refs.length) {
+          lines.push(
+            `[refs] focus=${focus.path} — ${refs.length} reference(s) available; ` +
+              `call ref_lookup with subject="${deriveSubject(focus.path)}" or ` +
+              `path="${focus.path}" to see the user's own code for this area.`,
+          );
+        }
+
+        // SL1: tier-filtered skill routing — one line, at most 3 entries.
+        // Each match carries its SKILL.md path; skill_load (SL3) reads it
+        // directly, so a process-cached native registry never blocks a
+        // freshly applied skill. The manifest and this hint are read per
+        // call — always live.
+        const skills = matchSkills(directory, focus.path);
+        if (skills.length) {
+          lines.push(
+            `[skills] focus=${focus.path} — matched: ${skills
+              .map((s) => `${s.name} (${s.tier}) → ${s.path}`)
+              .join(", ")}; load with skill_load (always fresh) or the skill tool when the registry has it.`,
+          );
+        }
+
+        if (lines.length) output.system.push(lines.join("\n"));
+      } catch {
+        // fail-open: refs/skills hints must never break a call
+      }
+    },
+
+    tool: {
+      // ── The only code write channel: structured proposal ──────────────
+      emit_proposal: tool({
+        description:
+          "Propose a file change for the user to review and apply manually. " +
+          "This tool writes NOTHING to disk — it records a structured proposal " +
+          "the user accepts or rejects. This is your ONLY write channel: " +
+          "bash/edit/write/patch are permanently denied, so do not attempt them. " +
+          "For a task touching multiple files, call this once per file and give " +
+          "every call the same `group` slug so the change stays reviewable and " +
+          "revertible as one unit. " +
+          "Before proposing changes to any shared/central module, run " +
+          "lsp_find_references on the symbols you will change and populate " +
+          "`impact` with the real consumers." +
+          buildRegistrySummary(directory),
+        args: {
+          path: tool.schema
+            .string()
+            .describe(
+              "Absolute file path (must start with /). Relative paths are rejected. Update ops (replace/edit_range/delete) require the target to exist on disk; create requires it absent with an existing parent directory.",
+            ),
+          operation: tool.schema
+            .string()
+            .describe(
+              "Type of change: 'create' (new file), 'replace' (full-file), " +
+                "'edit_range' (replace lines start_line..end_line), 'delete'",
+            ),
+          content: tool.schema
+            .string()
+            .describe(
+              "Full new file content (for create/replace) or the replacement block",
+            ),
+          reason: tool.schema
+            .string()
+            .describe("Why this change — so the user can review intent"),
+          group: tool.schema
+            .string()
+            .describe(
+              "Short slug tying this proposal to one logical change across files " +
+                "(e.g. 'add-metrics-service'). All files of one task share one group.",
+            ),
+          start_line: tool.schema
+            .string()
+            .describe(
+              "For edit_range: first line to replace (1-based). Empty string if unused.",
+            ),
+          end_line: tool.schema
+            .string()
+            .describe(
+              "For edit_range: last line to replace (1-based). Empty string if unused.",
+            ),
+          impact: tool.schema
+            .string()
+            .describe(
+              "JSON array of impact entries — REQUIRED when the target path is a " +
+                'registered shared module. Each entry: {"path": string, "symbol": string, ' +
+                '"relation": string}. Gather via lsp_find_references / ' +
+                "lsp_goto_definition before proposing. Every path must exist on disk.",
+            ),
+          reuses: tool.schema
+            .string()
+            .describe(
+              "Optional: canonical implementations this change reuses, to prove no " +
+                'duplication. JSON array of {"path": string, "symbol": string}. ' +
+                "Prefer the registry's canonical entries over reimplementing.",
+            ),
+        },
+        async execute(args, context) {
+          const sessionID = context.sessionID;
+          const registry = loadRegistry(directory);
+          const sharedHit = matchesSharedPath(registry.shared, args.path);
+
+          // Structural impact requirement: touching a shared module without
+          // evidence of what it affects is a REQUIREMENTS error, not a denial.
+          let impact: ImpactEntry[] = [];
+          // Hardening: the impact arg is schema-typed string, but a typed
+          // array from a misbehaving client once crashed validation with
+          // "args.impact.trim is not a function". Coerce before trim; a
+          // non-string impact is treated as absent.
+          const impactRaw = typeof args.impact === "string" ? args.impact : "";
+          if (sharedHit && impactRaw.trim() === "") {
+            throw new Error(impactRequiredMessage(args.path));
+          }
+          if (impactRaw.trim() !== "") {
+            impact = parseImpact(directory, impactRaw);
+          }
+
+          const proposal = {
+            ts: Date.now(),
+            sessionID,
+            group: args.group || "misc",
+            path: args.path,
+            operation: args.operation,
+            reason: args.reason,
+            start_line: args.start_line ? parseInt(args.start_line, 10) : null,
+            end_line: args.end_line ? parseInt(args.end_line, 10) : null,
+            content: args.content,
+            impact,
+            reuses: args.reuses || null,
+            status: "pending", // pending | accepted | rejected (user/nvim sets this)
+          };
+          appendProposal(directory, sessionID, proposal);
+          await recordEvent(
+            directory,
+            sessionID,
+            "proposal",
+            `${proposal.group}: ${args.path}`,
+            null,
+          );
+          return JSON.stringify(
+            {
+              ok: true,
+              message:
+                `Proposal recorded (${args.operation}) for ${args.path} ` +
+                `[group: ${proposal.group}, impact: ${impact.length} ` +
+                `${impact.length === 1 ? "entry" : "entries"}]. ` +
+                `Nothing was written. The user must apply it manually.`,
+              proposal_id: proposal.ts,
+              manifest: proposalsFile(directory, sessionID),
+            },
+            null,
+            2,
+          );
+        },
+      }),
+
+      // ── Registry write channel (M1r): submit entries through review ────
+      registry_propose: tool({
+        description:
+          "Submit a registry entry for review — the write channel for the project's " +
+          "shared-logic registry (.opencode/manage.registry.json). Use this when you " +
+          "notice duplicated logic, a reusable pattern, or a change touching " +
+          "central/shared code: the registry is how this project avoids reinventing " +
+          "the wheel. " +
+          "This tool writes NOTHING to the registry — it appends to a pending queue " +
+          "the user reviews and merges. " +
+          "kinds: 'shared' (central module — future proposals touching it will require " +
+          "impact), 'canonical' (concept → implementation to reuse; needs 'concept'), " +
+          "'modularize' (repeated code that should be extracted into a module), " +
+          "'consolidations' (2+ similar paths that could merge; needs 'paths'). " +
+          "Run lsp_goto_definition / lsp_find_references on the symbols first and record " +
+          "the real usage sites in 'refs'. Every path must exist on disk. " +
+          "Validation errors are REQUIREMENTS retries — fix the input and re-emit." +
+          buildRegistrySummary(directory),
+        args: {
+          kind: tool.schema
+            .string()
+            .describe(
+              "'shared' | 'canonical' | 'modularize' | 'consolidations'",
+            ),
+          path: tool.schema
+            .string()
+            .describe(
+              "Project-relative path to the module (shared/canonical/modularize). Empty for consolidations.",
+            ),
+          paths: tool.schema
+            .string()
+            .describe(
+              "For consolidations only: JSON array of 2+ existing project-relative paths. Empty otherwise.",
+            ),
+          symbols: tool.schema
+            .string()
+            .describe(
+              "JSON array of symbol names — REQUIRED for shared and canonical. " +
+                "Verify each resolves via lsp_goto_definition first.",
+            ),
+          concept: tool.schema
+            .string()
+            .describe(
+              "For canonical only: the concept this implementation is the canonical " +
+                "answer for (e.g. 'time formatting').",
+            ),
+          rationale: tool.schema
+            .string()
+            .describe(
+              "WHY this entry belongs in the registry — shown in the summary MD.",
+            ),
+          refs: tool.schema
+            .string()
+            .describe(
+              'Optional: JSON array of {"path","symbol","relation"} usage sites gathered ' +
+                "via lsp_find_references. Every path must exist on disk.",
+            ),
+          fragile: tool.schema
+            .string()
+            .describe(
+              "For shared only: 'true' or 'false' — marks high-risk central logic [FRAGILE].",
+            ),
+          constraints: tool.schema
+            .string()
+            .describe(
+              "For shared only: rules the model must follow when touching this module " +
+                "(e.g. 'additive changes only').",
+            ),
+          suggested_target: tool.schema
+            .string()
+            .describe(
+              "For consolidations only: the proposed merged target path (optional).",
+            ),
+          group: tool.schema
+            .string()
+            .describe("Optional M1g slug tying this entry to a task group."),
+        },
+        async execute(args, context) {
+          const sessionID = context.sessionID;
+          const kind = (args.kind || "").trim();
+          if (!(REGISTRY_KINDS as readonly string[]).includes(kind)) {
+            throw new Error(
+              `[manage] ⚠️ registry_propose "kind" must be one of: ${REGISTRY_KINDS.join(", ")} — got "${kind}". ` +
+                `Re-emit with "kind" set to one of these.`,
+            );
+          }
+          if (!args.rationale || args.rationale.trim() === "") {
+            throw new Error(
+              '[manage] ⚠️ registry_propose needs "rationale" — the WHY that shows in the summary. ' +
+                "Re-emit with a one-line rationale explaining why this belongs in the registry.",
+            );
+          }
+
+          const path = (args.path || "").trim();
+          let paths: string[] = [];
+          if (kind === "consolidations") {
+            paths = parseStringList(args.paths, "paths");
+            if (paths.length < 2) {
+              throw new Error(
+                '[manage] ⚠️ "consolidations" needs "paths" with at least 2 existing files. ' +
+                  'Re-emit with "paths" listing 2+ files that exist on disk (verify each with lsp_goto_definition).',
+              );
+            }
+          } else {
+            if (!path) {
+              throw new Error(
+                `[manage] ⚠️ registry_propose for kind "${kind}" needs "path". ` +
+                  `Re-emit with the module path — it must exist on disk.`,
+              );
+            }
+            paths = [path];
+          }
+
+          // Every target must exist on disk — no invented entries.
+          for (const p of paths) {
+            const target = isAbsolute(p) ? p : join(directory, p);
+            if (!existsSync(target)) {
+              throw new Error(
+                `[manage] ⚠️ Path "${p}" does not exist on disk — registry entries must target real code. ` +
+                  `Verify it with lsp_goto_definition, then re-emit with the real path.`,
+              );
+            }
+          }
+
+          const symbols = parseStringList(args.symbols, "symbols");
+          if (
+            (kind === "shared" || kind === "canonical") &&
+            symbols.length === 0
+          ) {
+            throw new Error(
+              `[manage] ⚠️ kind "${kind}" needs "symbols" — the entry names the actual symbols. ` +
+                `Re-emit with the symbol names, each verified via lsp_goto_definition.`,
+            );
+          }
+          if (
+            kind === "canonical" &&
+            (!args.concept || args.concept.trim() === "")
+          ) {
+            throw new Error(
+              '[manage] ⚠️ kind "canonical" needs "concept" — the concept this implementation is canonical for. ' +
+                'Re-emit with a short concept phrase (e.g. "time formatting").',
+            );
+          }
+
+          let refs: RefEntry[] = [];
+          if (args.refs && args.refs.trim() !== "") {
+            refs = parseRefs(directory, args.refs);
+          }
+
+          let fragile = false;
+          if (args.fragile && args.fragile.trim() !== "") {
+            if (args.fragile.trim() === "true") fragile = true;
+            else if (args.fragile.trim() !== "false") {
+              throw new Error(
+                '[manage] ⚠️ "fragile" must be "true" or "false". Re-emit with "fragile" set to "true" or "false".',
+              );
+            }
+          }
+
+          // Duplicate detection against the registry AND the pending queue.
+          const key = entryKey(kind, path, paths);
+          if (entryExists(directory, kind, key)) {
+            throw new Error(
+              `[manage] Entry "${key}" (${kind}) is already registered or pending — ` +
+                "no re-emit needed; the registry already covers it.",
+            );
+          }
+
+          const entry = {
+            ts: Date.now(),
+            sessionID,
+            kind,
+            path: kind === "consolidations" ? null : path,
+            paths: kind === "consolidations" ? paths : [],
+            symbols,
+            concept: kind === "canonical" ? args.concept.trim() : null,
+            rationale: args.rationale.trim(),
+            refs,
+            fragile: kind === "shared" ? fragile : false,
+            constraints:
+              kind === "shared" ? args.constraints?.trim() || null : null,
+            suggested_target:
+              kind === "consolidations"
+                ? args.suggested_target?.trim() || null
+                : null,
+            group: args.group || "misc",
+            status: "pending", // pending | merged | rejected (user/nvim sets this)
+          };
+          appendPending(directory, sessionID, entry);
+          await recordEvent(
+            directory,
+            sessionID,
+            "registry_proposal",
+            `${kind}: ${paths.join(", ")}`,
+            null,
+          );
+          return JSON.stringify(
+            {
+              ok: true,
+              message:
+                `Registry proposal recorded (${kind}) for ${paths.join(", ")} — ` +
+                "pending review. Nothing was written to the registry; accept " +
+                "via the review console to merge.",
+              entry_id: entry.ts,
+              queue: registryPendingFile(directory),
+            },
+            null,
+            2,
+          );
+        },
+      }),
+
+      // ── SL1 (doc 22): skills intake — body + routing manifest ──────────
+      emit_skill: tool({
+        description:
+          "Propose a skill for review — the reviewed intake for procedures that " +
+          "proved repeatable. This tool writes NOTHING to disk: it queues TWO " +
+          "proposals in one group (review together, apply together) — the skill " +
+          "body at ~/.config/opencode/skills/<name>/SKILL.md (or " +
+          "<project>/.opencode/skills/<name>/ when scope=project) and the routing " +
+          "entry in skills.policy.json (tier + subject). " +
+          "The body must be the markdown AFTER the frontmatter — frontmatter " +
+          "(name, description) is composed by this tool. " +
+          "Subjects are the routing key and share the refs vocabulary (doc 20): " +
+          "directory + extension, e.g. 'opencode-manage lua'. " +
+          "Tiers: default (hinted by subject), conditional (exact subject only), " +
+          "emergency (always hinted), explicit (never hinted), legacy (kept, never " +
+          "hinted). Emit one skill, apply it, then emit the next — the manifest " +
+          "row merges at emit time. " +
+          "Validation errors are REQUIREMENTS retries — fix the input and re-emit." +
+          buildSkillsSummary(directory),
+        args: {
+          name: tool.schema
+            .string()
+            .describe(
+              "Kebab-case skill name (a-z, 0-9, -, max 64 chars) — the directory name and the skill tool's lookup key.",
+            ),
+          description: tool.schema
+            .string()
+            .describe(
+              "One sentence on when to use the skill. Becomes the SKILL.md frontmatter description (what the model sees when choosing).",
+            ),
+          content: tool.schema
+            .string()
+            .describe(
+              "The skill BODY (markdown after the frontmatter). emit_skill composes the frontmatter from name/description.",
+            ),
+          tier: tool.schema
+            .string()
+            .describe(
+              "'default' | 'conditional' | 'emergency' | 'explicit' | 'legacy' — routing behavior (see the tool description). Defaults to 'default'.",
+            ),
+          subject: tool.schema
+            .string()
+            .describe(
+              'JSON array of subjects, e.g. ["templ", "opencode-manage lua"]. Required — subjects route the skill and join the refs vocabulary.',
+            ),
+          scope: tool.schema
+            .string()
+            .describe(
+              "'global' (default; ~/.config/opencode/skills) or 'project' (<project>/.opencode/skills).",
+            ),
+        },
+        async execute(args, context) {
+          const sessionID = context.sessionID;
+          // Hardening (same class as the impact crash): schema-typed string
+          // args can arrive as non-strings from a misbehaving client. Coerce
+          // before any .trim(); a non-string is treated as absent.
+          const s = (v: unknown) => (typeof v === "string" ? v : "");
+          const name = s(args.name).trim();
+          if (!name) {
+            throw new Error(
+              '[manage] ⚠️ emit_skill needs "name" — the skill directory and the ' +
+                "skill tool's lookup key. Re-emit with a kebab-case slug, e.g. 'query-pattern'.",
+            );
+          }
+          if (!slugValid(name)) {
+            throw new Error(
+              `[manage] ⚠️ emit_skill "name" must be a kebab-case slug (a-z, 0-9, -, max 64 chars) — got "${name}". ` +
+                "Re-emit with a slug like 'query-pattern' (it becomes the directory name).",
+            );
+          }
+          const description = s(args.description).trim();
+          if (!description) {
+            throw new Error(
+              '[manage] ⚠️ emit_skill needs "description" — it becomes the frontmatter text the model sees when choosing skills. ' +
+                "Re-emit with one sentence covering when to use it.",
+            );
+          }
+          const rawContent = s(args.content);
+          if (!rawContent.trim()) {
+            throw new Error(
+              '[manage] ⚠️ emit_skill needs "content" — the skill body (markdown after the frontmatter). ' +
+                "Re-emit with the full procedure.",
+            );
+          }
+          if (rawContent.trimStart().startsWith("---")) {
+            throw new Error(
+              '[manage] ⚠️ emit_skill "content" must be the BODY only — frontmatter in the body would duplicate the composed one. ' +
+                "Re-emit with the markdown that follows the frontmatter (name/description come from the args).",
+            );
+          }
+          const tierRaw = s(args.tier).trim();
+          const tier = tierRaw === "" ? "default" : tierRaw;
+          if (!(TIERS as readonly string[]).includes(tier)) {
+            throw new Error(
+              `[manage] ⚠️ emit_skill "tier" must be one of: ${TIERS.join(", ")} — got "${tier}". ` +
+                "Re-emit with the tier matching the routing intent (default: hinted by subject; conditional: exact subject only; " +
+                "emergency: always hinted; explicit: never hinted; legacy: kept, never hinted).",
+            );
+          }
+          const scopeRaw = s(args.scope).trim();
+          if (
+            scopeRaw !== "" &&
+            scopeRaw !== "global" &&
+            scopeRaw !== "project"
+          ) {
+            throw new Error(
+              `[manage] ⚠️ emit_skill "scope" must be "global" or "project" — got "${scopeRaw}". ` +
+                "Re-emit, or omit it (defaults to global).",
+            );
+          }
+          const scope: SkillScope =
+            scopeRaw === "project" ? "project" : "global";
+          // Recovery, not rejection: an array here is the natural client
+          // shape for "JSON array of subjects" — stringify and let the
+          // parser validate the entries.
+          const subject = parseSubjectArg(
+            typeof args.subject === "string"
+              ? args.subject
+              : Array.isArray(args.subject)
+                ? JSON.stringify(args.subject)
+                : undefined,
+          );
+          const group = `skill-${name}`;
+
+          const skillPath = join(skillsDir(directory, scope), name, "SKILL.md");
+          const manifestFile = skillManifestFile(directory, scope);
+          const skillExists = existsSync(skillPath);
+          const manifestExists = existsSync(manifestFile);
+
+          // A manifest that exists but does not parse must never be silently
+          // replaced by a single-entry version — that would drop other skills.
+          if (manifestExists && readManifest(directory, scope) === null) {
+            throw new Error(
+              `[manage] ⚠️ The ${scope} skills manifest exists but does not parse: ${manifestFile}. ` +
+                "Refusing to overwrite it with a single entry. Fix the JSON (or delete the file), then re-emit.",
+            );
+          }
+
+          const ts = Date.now();
+
+          // Row 1: the skill body. The path is tool-constructed under the
+          // skills root and slug-validated, so create may rely on the apply
+          // side's mkdir -p (allowMissingParent); model-supplied paths keep
+          // the strict rule (doc 21, doc 22).
+          appendProposal(
+            directory,
+            sessionID,
+            {
+              ts,
+              sessionID,
+              group,
+              path: skillPath,
+              operation: skillExists ? "replace" : "create",
+              reason: `${skillExists ? "Update" : "New"} skill "${name}" (${tier}) — routes on: ${subject.join(", ")}.`,
+              start_line: null,
+              end_line: null,
+              content: composeSkillMd(name, description, rawContent),
+              impact: [],
+              reuses: null,
+              status: "pending",
+            },
+            { allowMissingParent: !skillExists },
+          );
+
+          // Row 2: the routing manifest, merged (existing entries kept).
+          appendProposal(directory, sessionID, {
+            ts: ts + 1,
+            sessionID,
+            group,
+            path: manifestFile,
+            operation: manifestExists ? "replace" : "create",
+            reason: `Routing entry for skill "${name}": tier=${tier}, subject=[${subject.join(", ")}] (${scope} manifest, merged).`,
+            start_line: null,
+            end_line: null,
+            content: mergedManifest(directory, scope, name, tier, subject),
+            impact: [],
+            reuses: null,
+            status: "pending",
+          });
+
+          await recordEvent(
+            directory,
+            sessionID,
+            "skill_proposal",
+            `${name} (${tier})`,
+            null,
+            [
+              { tag: name, kind: "skill" },
+              ...subject.map((s2) => ({ tag: s2, kind: "subject" })),
+            ],
+          );
+
+          return JSON.stringify(
+            {
+              ok: true,
+              message:
+                `Skill proposal recorded for "${name}" (${tier}) — two rows, ` +
+                `group ${group}: the SKILL.md and the ${scope} manifest entry. ` +
+                "Nothing was written; review both rows together, then apply.",
+              skill: skillPath,
+              manifest: manifestFile,
+              group,
+            },
+            null,
+            2,
+          );
+        },
+      }),
+
+      // ── SL3 (doc 22): the always-fresh skill reader ────────────────────
+      skill_load: tool({
+        description:
+          "Load a skill's full SKILL.md from disk — the manage plugin's " +
+          "always-fresh reader (doc 22, SL3). Use it when the native skill tool " +
+          "reports the skill unknown: opencode's skill registry is process-cached, " +
+          "so a skill applied mid-session is not loadable by name until the next " +
+          "opencode restart — this tool reads the manifest + file directly and " +
+          "works immediately. It also records the load with the skill's routing " +
+          "subjects (objects mode, doc 19). Read-only; nothing executes. Called " +
+          "without a name it lists the governed skills instead.",
+        args: {
+          name: tool.schema
+            .string()
+            .describe(
+              "Skill name (kebab-case). Empty string to list the governed skills instead.",
+            ),
+        },
+        async execute(args, context) {
+          const sessionID = context.sessionID;
+          const wanted =
+            typeof args.name === "string" ? args.name.trim() : "";
+          const metas = loadSkillMeta(directory);
+
+          // No name: the governed list — names, tiers, subjects, paths.
+          if (!wanted) {
+            return JSON.stringify(
+              {
+                ok: true,
+                count: metas.length,
+                skills: metas.map((m) => ({
+                  name: m.name,
+                  tier: m.tier,
+                  scope: m.scope,
+                  subject: m.subject,
+                  path: m.path,
+                  exists: existsSync(m.path),
+                })),
+              },
+              null,
+              2,
+            );
+          }
+
+          const meta = metas.find((m) => m.name === wanted);
+          if (!meta) {
+            throw new Error(
+              `[manage] ⚠️ skill_load: no governed skill named "${wanted}". ` +
+                `Available: ${metas.map((m) => m.name).join(", ") || "(none)"}. ` +
+                "Call it again with one of these names, or emit_skill to propose a new one.",
+            );
+          }
+
+          let content = "";
+          try {
+            content = readFileSync(meta.path, "utf8");
+          } catch {
+            throw new Error(
+              `[manage] ⚠️ skill_load: the manifest entry exists but the file is not readable: ${meta.path}. ` +
+                "Re-apply the skill proposal (or fix the path), then retry.",
+            );
+          }
+
+          await recordEvent(
+            directory,
+            sessionID,
+            "skill_load",
+            meta.name,
+            null,
+            [
+              { tag: meta.name, kind: "skill" },
+              ...meta.subject.map((s) => ({ tag: s, kind: "subject" })),
+            ],
+          );
+
+          return JSON.stringify(
+            {
+              ok: true,
+              name: meta.name,
+              tier: meta.tier,
+              subject: meta.subject,
+              scope: meta.scope,
+              path: meta.path,
+              note: "loaded by manage (always fresh); the native skill tool serves this skill after the next opencode restart.",
+              content: content.slice(0, 20000),
+            },
+            null,
+            2,
+          );
+        },
+      }),
+
+      // ── R1a: reference lookup (doc 20) — read-only pointers + blocks ───
+      ref_lookup: tool({
+        description:
+          "Look up the user's own style references (doc 20). Live pointers " +
+          "(source index|pin) return path (+symbol) — read those files to see " +
+          "current code in the user's own style. Frozen blocks (source " +
+          "correction) return content inline: the user's own edits, the " +
+          "strongest style signal. Use when writing code for a subject: match " +
+          "the user's syntax, structure, and meaning rather than inventing. " +
+          "Read-only; nothing executes; empty results mean nothing is indexed.",
+        args: {
+          subject: tool.schema
+            .string()
+            .describe(
+              "Subject filter, e.g. 'opencode-manage lua' or 'templ'. Empty if unused.",
+            ),
+          path: tool.schema
+            .string()
+            .describe("Path filter (substring). Empty if unused."),
+          symbol: tool.schema
+            .string()
+            .describe("Symbol filter (substring). Empty if unused."),
+        },
+        async execute(args, context) {
+          const q: { subject?: string; path?: string; symbol?: string } = {};
+          if (args.subject && args.subject.trim())
+            q.subject = args.subject.trim();
+          if (args.path && args.path.trim()) q.path = args.path.trim();
+          if (args.symbol && args.symbol.trim()) q.symbol = args.symbol.trim();
+          const rows = lookupRefs(directory, q);
+          const looked =
+            [q.subject, q.path, q.symbol].filter(Boolean).join(" · ") || "all";
+          await recordEvent(
+            directory,
+            context.sessionID,
+            "ref_lookup",
+            looked,
+            null,
+            q.subject ? [{ tag: q.subject, kind: "subject" }] : [],
+          );
+          return JSON.stringify(
+            {
+              ok: true,
+              count: rows.length,
+              refs: rows.map((r) => ({
+                source: r.source,
+                kind: r.kind,
+                subject: r.subject,
+                path: r.path,
+                symbol: r.symbol,
+                uses: r.uses,
+                last_used: r.last_used,
+                content:
+                  r.source === "correction" && r.content
+                    ? r.content.slice(0, 4000)
+                    : undefined,
+              })),
+            },
+            null,
+            2,
+          );
+        },
+      }),
+    },
+  };
+};
+
+// V1 plugin shape — the loader's modern path (readV1Plugin). Bypasses the
+// legacy getLegacyPlugins path entirely, making loading deterministic.
+export default {
+  id: "manage",
+  server: ManagePlugin,
+};

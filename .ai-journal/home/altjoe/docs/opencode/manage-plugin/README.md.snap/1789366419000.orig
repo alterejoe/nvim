@@ -1,0 +1,65 @@
+# /home/altjoe/docs/opencode/manage-plugin/README.md FINAL
+---
+title: Manage — OpenCode Management Plugin (Index)
+status: proposed
+links: [01-core-principle, 02-airlock-gate, 03-proposals, 04-rules-file, 05-snapshots-journal, 06-preferences, 07-knowledge-prompts, 08-session-search, 09-tag-context, 10-skills-gating, 11-nvim-companion, 12-hooks-stability, 13-honest-limits, 14-build-order, 15-open-questions, 16-out-of-scope, 17-impact-registry, 18-staged-workflow, 19-context-metrics-and-removal, 20-references, 21-handoff-proposal-path-validation, 22-skills, 23-permissions-manager, 24-secrets-redaction, 25-ui-layout-contract]
+---
+
+# Manage — OpenCode Management Plugin
+
+A modular opencode plugin acting as an **airlock between the AI and the
+filesystem**, plus session/preferences/knowledge management. The user is the
+only writer; the AI proposes, the user applies.
+
+## The one-sentence contract
+
+**The AI cannot touch your filesystem, ever. Its only output is structured
+proposals. You are the only writer.**
+
+## Document map
+
+| Doc | Point |
+|---|---|
+| [01-core-principle](01-core-principle.md) | Structural, not heuristic — why this design |
+| [02-airlock-gate](02-airlock-gate.md) | Deny bash/edit/write/patch at the hook level |
+| [03-proposals](03-proposals.md) | `emit_proposal` — the only write channel; `group` field for multi-file changes; `impact`/`reuses` for shared-code changes |
+| [04-rules-file](04-rules-file.md) | Fail-closed per-project configuration |
+| [05-snapshots-journal](05-snapshots-journal.md) | Undotree-style safety net, no git; group revert |
+| [06-preferences](06-preferences.md) | Auto-inject your preferences every session |
+| [07-knowledge-prompts](07-knowledge-prompts.md) | Pluggable evaluation scenarios + tagged notes |
+| [08-session-search](08-session-search.md) | Find sessions, search content, AI recall |
+| [09-tag-context](09-tag-context.md) | Tag-based context filtering (stretch) |
+| ~~[10-skills-gating](10-skills-gating.md)~~ | Superseded by [22-skills](22-skills.md) |
+| [11-nvim-companion](11-nvim-companion.md) | The review console: diffs, journal, picker |
+| [12-hooks-stability](12-hooks-stability.md) | Which hooks, and how stable they are |
+| [13-honest-limits](13-honest-limits.md) | What this does and doesn't do |
+| [14-build-order](14-build-order.md) | Milestones with a kill switch |
+| [15-open-questions](15-open-questions.md) | Decisions still to make |
+| [16-out-of-scope](16-out-of-scope.md) | Deliberately not doing |
+| [17-impact-registry](17-impact-registry.md) | Shared-code awareness + `registry_propose`: LSP-backed impact requirement AND the reviewed write channel that grows the registry |
+| [18-staged-workflow](18-staged-workflow.md) | Staged workflow: plan/execute/verify state machine, nvim-console control, state.db slices, proposal readback verification, context pruning, handoffs — S0 verdict store fix first |
+| [19-context-metrics-and-removal](19-context-metrics-and-removal.md) | Context metrics + removal: measure tokens/events in state.db (C1), prune verified slices via compaction (C2), objects/tags (O1), selective reclamation of stale tool payloads (C4), verdict-derived retention stats (C3) |
+| [20-references](20-references.md) | References (R1): live pointers to the user's own code + frozen correction blocks; focus routing, `ref_lookup`, prune-with-reason as context |
+| [21-handoff-proposal-path-validation](21-handoff-proposal-path-validation.md) | Handoff: absolute-path + update-existence validation for `emit_proposal` (web/web relative-path incident) |
+| [22-skills](22-skills.md) | Skills (SL1–SL3): tier/subject manifest, `emit_skill` through the review queue, focus-routed `[skills]` hint (paths included), lifecycle viewer (`<leader>ak`), manage-side `skill_load` |
+| [23-permissions-manager](23-permissions-manager.md) | Permissions manager (PM): folder memory in state.db, journaled sync + drift verify for `permission.external_directory`, gitignore-respecting capture/index, approval indexes refs |
+| [24-secrets-redaction](24-secrets-redaction.md) | Secrets redaction (RX): env-file registry → dictionary + pattern matching, contextual `[REDACTED:LABEL preview…]` markers, redact events in the metrics store |
+| [25-ui-layout-contract](25-ui-layout-contract.md) | UI layout contract (LC1 LC3 built): per-project manage.ui.json + emit-time validation (templ `?=` attrs, hx-target existence, OOB coverage) — catches the volleyball htmx defect class before queueing; layout_manifest + served-DOM diff pending (LC2/LC4/LC5) |
+
+## Status legend
+
+- **M1** = gate + proposals (Short) — the airlock
+- **M1g** = `group` field + grouped review + group revert (Short, builds on M1)
+- **M1i** = impact registry — LSP-backed impact requirement on shared-code proposals (Short, builds on M1g)
+- **M1r** = `registry_propose` — reviewed write channel for registry entries + summary MD (Short, builds on M1i)
+- **M2** = prefs (Quick)
+- **M3** = snapshots + journal (Medium) — the safety net
+- **M4** = knowledge + session search (Medium)
+- **Stretch** = tags, skills, control panel (Large)
+- **S0–S6** = staged workflow slices (see 18-staged-workflow)
+- **C1–C4** = context metrics/removal slices (see 19-context-metrics-and-removal)
+- **R1** = references slices (see 20-references)
+- **SL1–SL3** = skills slices (see 22-skills)
+- **PM1–PM3** = permissions manager slices (see 23-permissions-manager)
+- **RX1–RX3** = secrets redaction slices (see 24-secrets-redaction)
+- **LC1–LC5** = UI layout contract + emit-time validation slices (see 25-ui-layout-contract)
