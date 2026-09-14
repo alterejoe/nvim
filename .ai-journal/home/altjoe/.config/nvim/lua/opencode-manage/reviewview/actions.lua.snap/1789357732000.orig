@@ -1,9 +1,5 @@
 -- opencode-manage.reviewview.actions — accept/reject/apply/copy/open.
 -- User actions on the selected proposal. Takes the shared state table.
--- REVISION ORDERING (internal, derived): for one target (group + path) only
--- the newest pending/accepted row acts. da on an older revision is refused;
--- ga skips older revisions. Nothing is written for a skip — reject the
--- newest row and the older one becomes actionable again on the next refresh.
 
 local proposals = require("opencode-manage.proposals")
 local render = require("opencode-manage.reviewview.render")
@@ -13,10 +9,6 @@ local M = {}
 --- @param target string
 --- @return boolean
 function M.ensure_dirs(target)
-	if target == "" then
-		vim.notify("❌ Refused: legacy relative proposal path — re-emit with an absolute path", vim.log.levels.ERROR)
-		return false
-	end
 	local parent = vim.fn.fnamemodify(target, ":h")
 	if vim.fn.isdirectory(parent) ~= 1 then
 		local create = vim.fn.confirm(
@@ -95,8 +87,6 @@ end
 --- da: accept the selected proposal. Writes the RIGHT pane verbatim —
 --- for edit_range that pane is the full file with the range applied, so
 --- partials are safe. Rerun guard confirms before clobbering newer work.
---- Older revisions of a target are refused automatically (revision
---- ordering is an internal function — never the user's job to order rows).
 --- @param state table
 function M.accept_current(state)
 	local p = state.items[state.idx]
@@ -105,19 +95,6 @@ function M.accept_current(state)
 	end
 	if state.row_states[state.idx] == "applied" then
 		vim.notify("ℹ️ Already applied: " .. p.path, vim.log.levels.INFO)
-		return
-	end
-	if state.row_states[state.idx] == "superseded" then
-		-- Derived, not persisted: nothing is written for the skip. Rejecting
-		-- the newest row makes this one actionable again on the next refresh.
-		vim.notify(
-			string.format(
-				"⏭ Skipped: %s is an older revision — the newest row for this " ..
-					"target is the one that counts (ordering is automatic).",
-				p._rel or p.path
-			),
-			vim.log.levels.WARN
-		)
 		return
 	end
 	if p.operation == "delete" then
@@ -160,13 +137,9 @@ function M.reject_current(state)
 	render.refresh_items(state)
 end
 
---- ga: apply the current group. Revision ordering is INTERNAL: per target
---- (group + path) only the NEWEST pending row applies; older pending
---- siblings are skipped as [superseded] (a derived state — nothing is
---- written for a skip; reject the newest and the older row becomes live
---- again). Staleness is computed from ALL visible rows, not the filtered
---- list, so a filtered view can never apply an older revision. Delete rows
---- still prompt; each row is computed against the file state at apply time.
+--- ga: apply EVERY pending row in the current group, in display order.
+--- Each row is computed against the file state at apply time (fresh read),
+--- so a multi-file group applies cleanly in one pass. Delete rows prompt.
 --- @param state table
 function M.apply_group(state)
 	local p = state.items[state.idx]
@@ -174,14 +147,11 @@ function M.apply_group(state)
 		return
 	end
 	local group = p.group or "misc"
-	local newest = render.newest_revisions(proposals.list_visible("all"))
-	local applied, skipped, superseded = 0, 0, 0
+	local applied, skipped = 0, 0
 	for _, it in ipairs(state.items) do
 		if (it.group or "misc") == group then
 			if render.row_state(it) == "applied" then
 				skipped = skipped + 1
-			elseif render.is_stale(it, newest) then
-				superseded = superseded + 1
 			elseif it.operation == "delete" then
 				M.handle_delete(it)
 			else
@@ -195,13 +165,7 @@ function M.apply_group(state)
 	end
 	render.refresh_items(state)
 	vim.notify(
-		string.format(
-			"✅ Group %s: %d applied, %d already applied, %d superseded (older revisions skipped)",
-			group,
-			applied,
-			skipped,
-			superseded
-		),
+		string.format("✅ Group %s: %d applied, %d already applied", group, applied, skipped),
 		vim.log.levels.INFO
 	)
 end

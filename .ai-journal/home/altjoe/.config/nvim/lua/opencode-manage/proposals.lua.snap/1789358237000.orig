@@ -15,10 +15,6 @@
 -- A relative path is refused with a loud message — joining it to any root
 -- is how web/web copies were born. The emit side enforces the same rules
 -- (lib/proposals.ts validateProposalTarget).
--- DELIMITER GUARD: edit_range accepts on .ts/.tsx/.js/.lua files with grossly
--- unbalanced braces/parens warn with a confirm gate — an unbalanced apply can
--- break a file (or a plugin) at load. Heuristic: strings and comments can
--- false-positive, so it asks, never silently refuses (default is No).
 -- Two per-proposal cwd predicates drive the viewer's 4-state filter:
 --   _cwd       = the proposal's manifest dir is reachable from cwd
 --                ("session in the cwd" — walk-up + glob-down discovery)
@@ -194,8 +190,8 @@ end
 
 --- Resolve a proposal path to absolute, FAIL CLOSED (doc 21): only absolute
 --- paths resolve. Relative paths return nil and every write path refuses
---- them with a visible message — joining it to any root is how the
---- web/web copies were born.
+--- them with a visible message — joining a relative path to any root is how
+--- the web/web copies were born.
 --- @param proposal table
 --- @return string|nil
 local function resolve_path(proposal)
@@ -286,38 +282,6 @@ function M.accept(proposal, content_override, baseline_override)
 	local snap = journal.snapshot(path)
 
 	local content = content_override or proposal.content or ""
-	-- Delimiter balance guard (doc 21 follow-up): an edit_range that leaves
-	-- braces/parens unbalanced can kill a plugin at load — that is not
-	-- hypothetical, it happened. Strings and comments can false-positive
-	-- here, so this warns with a confirm gate instead of hard-blocking.
-	if op == "edit_range" then
-		local ext = vim.fn.fnamemodify(path, ":e"):lower()
-		if ext == "ts" or ext == "tsx" or ext == "js" or ext == "lua" then
-			local depth = 0
-			for ch in content:gmatch("[%{%(}%)]") do
-				if ch == "{" or ch == "(" then
-					depth = depth + 1
-				else
-					depth = depth - 1
-				end
-			end
-			if depth ~= 0 then
-				local choice = vim.fn.confirm(
-					string.format(
-						"⚠️ Delimiter balance is off (%+d) after this edit:\n  %s\n\nAn unbalanced apply can kill the plugin at load. Apply anyway?",
-						depth,
-						path
-					),
-					"&No\n&Yes",
-					1
-				)
-				if choice ~= 2 then
-					vim.notify("❌ Refused: unbalanced edit — review the range and re-emit", vim.log.levels.WARN)
-					return false
-				end
-			end
-		end
-	end
 	local lines = vim.split(content, "\n", { plain = true })
 	if lines[#lines] == "" then
 		table.remove(lines) -- writefile adds the trailing newline itself

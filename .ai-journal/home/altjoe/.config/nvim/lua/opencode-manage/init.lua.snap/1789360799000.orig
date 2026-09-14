@@ -1,13 +1,13 @@
 -- /home/altjoe/.config/nvim/lua/opencode-manage/init.lua FINAL
 -- opencode-manage — the review console for the opencode manage plugin.
 -- Proposal review + change journal + registry review + verdict store/viewer
--- + metrics interface + references + skills lifecycle.
+-- + metrics interface + references.
 -- Completely separate from opencode-ext (the chat viewer) — no overlap.
 --
 -- VIEWERS: proposals (<leader>ap / <leader>ac), journal (<leader>aj),
 -- registry (<leader>ar), verdicts (<leader>av), metrics (<leader>at),
--- references (<leader>af), skills (<leader>ak) — all persistent two-pane
--- viewers with live previews, no bland pickers.
+-- references (<leader>af) — all persistent two-pane viewers with live
+-- previews, no bland pickers.
 -- COMMANDS: :ManageMetrics (summary), :ManagePrune [note] (shaped prune),
 -- :ManageIndex [root] / :ManageRef [path] / :ManageRefs /
 -- :ManageRefPrune <id> <why> (references, doc 20).
@@ -22,8 +22,6 @@ local metrics = require("opencode-manage.metrics")
 local metricsview = require("opencode-manage.metricsview")
 local refs = require("opencode-manage.refs")
 local refsview = require("opencode-manage.refsview")
-local skills = require("opencode-manage.skills")
-local skillsview = require("opencode-manage.skillsview")
 
 -- Keymaps
 vim.keymap.set("n", "<leader>ap", reviewview.open, { desc = "Manage: review proposals" })
@@ -33,7 +31,6 @@ vim.keymap.set("n", "<leader>ar", registryview.open, { desc = "Manage: registry 
 vim.keymap.set("n", "<leader>av", verdictview.open, { desc = "Manage: verdict viewer" })
 vim.keymap.set("n", "<leader>at", metricsview.open, { desc = "Manage: metrics viewer (turns + objects)" })
 vim.keymap.set("n", "<leader>af", refsview.open, { desc = "Manage: references viewer" })
-vim.keymap.set("n", "<leader>ak", skillsview.open, { desc = "Manage: skills lifecycle" })
 
 -- Stable commands (path resolution lives in code, not in pasted one-liners)
 vim.api.nvim_create_user_command("ManageMetrics", function()
@@ -95,8 +92,6 @@ return {
 	metricsview = metricsview,
 	refs = refs,
 	refsview = refsview,
-	skills = skills,
-	skillsview = skillsview,
 	proposals = require("opencode-manage.proposals"),
 	journal = require("opencode-manage.journal"),
 	registry = require("opencode-manage.registry"),

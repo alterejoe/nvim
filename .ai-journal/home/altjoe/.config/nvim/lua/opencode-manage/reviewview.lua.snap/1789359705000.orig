@@ -3,14 +3,12 @@
 --   j/k move · gg/G jump · [/] hunks · f scope filter (all / session /
 --   files / neither) · r refresh · o/CR open in origin · da accept
 --   (snapshot + write the RIGHT pane) · dr reject (status only) ·
---   rr rerun (open for re-eval) · ga GROUP-APPLY (the newest row per
---   target in the current group; older revisions are skipped
---   automatically — revision ordering is internal, never your job) ·
+--   rr rerun (open for re-eval) · ga GROUP-APPLY (every pending row in
+--   the current group, each against the freshly-written file) ·
 --   y copy+open · Q kill.
 -- ALL keys are mapped on every buffer — nothing is dead by focus.
 -- ACCEPTED ROWS STAY: the list shows pending + accepted rows; accepted
--- ones render dim-green [applied] and older revisions render dim-struck
--- [superseded], so the review history is explicit.
+-- ones render dim-green [applied] so the review history is explicit.
 -- Partial (edit_range) rows: LEFT pane = the unified diff itself
 -- (@@ header, context, - removed red / + added green); RIGHT pane = the
 -- full file with the range applied (editable — da writes it verbatim, so
@@ -18,7 +16,7 @@
 -- unified diff (disk vs proposed), RIGHT = proposed content. Panes open
 -- positioned at the first change; [ / ] jumps between hunks.
 -- Row colors: green=NEW · blue=EDIT · magenta=RERUN · red=DELETE ·
--- dim=APPLIED · strike=REJECTED · strike-italic=SUPERSEDED · yellow=MISMATCH.
+-- dim=APPLIED · strike=REJECTED · yellow=MISMATCH.
 -- The cursor stays on the selected PROPOSAL across refreshes (identity-
 -- based restore), and row ordering is fully deterministic.
 --

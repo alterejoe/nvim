@@ -1,0 +1,354 @@
+// /home/altjoe/.config/opencode/plugins/lib/registry.ts FINAL
+/**
+ * Shared-logic registry (M1i + M1r). Loads .opencode/manage.registry.json,
+ * validates impact/refs structurally (paths must exist on disk), and
+ * manages the pending queue (.opencode/manage.registry.pending.jsonl).
+ */
+
+import { mkdirSync, appendFileSync, readFileSync, existsSync } from "fs";
+import { join, dirname, isAbsolute } from "path";
+
+export interface RefEntry {
+  path: string;
+  symbol?: string;
+  relation?: string;
+}
+
+export interface RegistryEntry {
+  path?: string;
+  symbols?: string[];
+  fragile?: boolean;
+  constraints?: string;
+  rationale?: string;
+  refs?: RefEntry[];
+}
+
+export interface CanonicalEntry {
+  concept?: string;
+  path?: string;
+  symbols?: string[];
+  rationale?: string;
+  refs?: RefEntry[];
+}
+
+export interface ModularizeEntry {
+  path?: string;
+  symbols?: string[];
+  rationale?: string;
+}
+
+export interface ConsolidationEntry {
+  paths?: string[];
+  rationale?: string;
+  suggested_target?: string;
+}
+
+export interface Registry {
+  shared: RegistryEntry[];
+  canonical: CanonicalEntry[];
+  modularize: ModularizeEntry[];
+  consolidations: ConsolidationEntry[];
+}
+
+const EMPTY_REGISTRY: Registry = {
+  shared: [],
+  canonical: [],
+  modularize: [],
+  consolidations: [],
+};
+
+export function loadRegistry(directory: string): Registry {
+  const registryPath = join(directory, ".opencode", "manage.registry.json");
+  try {
+    const parsed = JSON.parse(readFileSync(registryPath, "utf8"));
+    return {
+      shared: Array.isArray(parsed.shared) ? parsed.shared : [],
+      canonical: Array.isArray(parsed.canonical) ? parsed.canonical : [],
+      modularize: Array.isArray(parsed.modularize) ? parsed.modularize : [],
+      consolidations: Array.isArray(parsed.consolidations)
+        ? parsed.consolidations
+        : [],
+    };
+  } catch {
+    // No registry file → fail open: no shared modules registered.
+    return EMPTY_REGISTRY;
+  }
+}
+
+// Exact path match, or anything nested under the shared path.
+export function matchesSharedPath(
+  shared: RegistryEntry[],
+  targetPath: string,
+): RegistryEntry | null {
+  const norm = targetPath.replace(/^\.\//, "");
+  for (const entry of shared) {
+    if (!entry.path) continue;
+    const p = entry.path.replace(/^\.\//, "").replace(/\/+$/, "");
+    if (norm === p || norm.startsWith(p + "/")) return entry;
+  }
+  return null;
+}
+
+export function buildRegistrySummary(directory: string): string {
+  const reg = loadRegistry(directory);
+  const lines: string[] = [];
+  for (const s of reg.shared) {
+    const symbols =
+      s.symbols && s.symbols.length ? s.symbols.join(", ") : "shared logic";
+    const fragile = s.fragile ? " [FRAGILE]" : "";
+    const constraints = s.constraints ? ` constraints: ${s.constraints}` : "";
+    lines.push(`- ${s.path}${fragile} — ${symbols};${constraints}`);
+  }
+  for (const c of reg.canonical) {
+    const symbols =
+      c.symbols && c.symbols.length ? ` (${c.symbols.join(", ")})` : "";
+    lines.push(
+      `- ${c.concept}: reuse ${c.path}${symbols} — do not reimplement`,
+    );
+  }
+  for (const m of reg.modularize) {
+    const symbols =
+      m.symbols && m.symbols.length ? ` (${m.symbols.join(", ")})` : "";
+    lines.push(
+      `- MODULARIZE: ${m.path}${symbols} — ${m.rationale || "repeated code; candidate for extraction"}`,
+    );
+  }
+  for (const c of reg.consolidations) {
+    const paths = (c.paths || []).join(", ");
+    lines.push(
+      `- CONSOLIDATE: ${paths} — ${c.rationale || "similar implementations; merge candidate"}` +
+        (c.suggested_target ? ` → ${c.suggested_target}` : ""),
+    );
+  }
+  if (!lines.length) return "";
+  return (
+    "\n\nProject shared-logic registry (.opencode/manage.registry.json):\n" +
+    lines.join("\n")
+  );
+}
+
+// ── Registry pending queue (M1r write channel) ─────────────────────────────
+
+export interface PendingEntry {
+  ts: number;
+  sessionID: string;
+  kind: string;
+  path: string | null;
+  paths: string[];
+  status: string;
+}
+
+export function registryPendingFile(directory: string): string {
+  return join(directory, ".opencode", "manage.registry.pending.jsonl");
+}
+
+export function loadPending(directory: string): PendingEntry[] {
+  try {
+    const raw = readFileSync(registryPendingFile(directory), "utf8");
+    return raw
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line) as PendingEntry;
+        } catch {
+          return null;
+        }
+      })
+      .filter((e): e is PendingEntry => e !== null);
+  } catch {
+    return [];
+  }
+}
+
+export function appendPending(
+  directory: string,
+  sessionID: string,
+  entry: unknown,
+) {
+  const file = registryPendingFile(directory);
+  mkdirSync(dirname(file), { recursive: true });
+  appendFileSync(file, JSON.stringify(entry) + "\n", "utf8");
+}
+
+export const REGISTRY_KINDS = [
+  "shared",
+  "canonical",
+  "modularize",
+  "consolidations",
+] as const;
+
+// Duplicate-detection key: the path for single-path kinds, the sorted path
+// set for consolidations.
+export function entryKey(
+  kind: string,
+  path: string | null,
+  paths: string[],
+): string {
+  return kind === "consolidations" ? [...paths].sort().join("|") : path || "";
+}
+
+export function entryExists(
+  directory: string,
+  kind: string,
+  key: string,
+): boolean {
+  const reg = loadRegistry(directory);
+  let inRegistry = false;
+  if (kind === "shared")
+    inRegistry = reg.shared.some(
+      (e) => entryKey(kind, e.path || "", []) === key,
+    );
+  else if (kind === "canonical")
+    inRegistry = reg.canonical.some(
+      (e) => entryKey(kind, e.path || "", []) === key,
+    );
+  else if (kind === "modularize")
+    inRegistry = reg.modularize.some(
+      (e) => entryKey(kind, e.path || "", []) === key,
+    );
+  else if (kind === "consolidations")
+    inRegistry = reg.consolidations.some(
+      (e) => entryKey(kind, null, e.paths || []) === key,
+    );
+  if (inRegistry) return true;
+  return loadPending(directory).some(
+    (p) => p.kind === kind && entryKey(kind, p.path, p.paths || []) === key,
+  );
+}
+
+// ── Shared arg parsing (JSON strings, same pattern as impact/reuses) ───────
+
+export function parseStringList(
+  raw: string | undefined,
+  label: string,
+): string[] {
+  if (!raw || raw.trim() === "") return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `[manage] ⚠️ "${label}" must be a JSON array of strings — it failed to parse. Re-emit.`,
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(
+      `[manage] ⚠️ "${label}" must be a JSON array of strings — got ${typeof parsed}. Re-emit.`,
+    );
+  }
+  const out: string[] = [];
+  for (const item of parsed) {
+    if (typeof item !== "string" || item.trim() === "") {
+      throw new Error(
+        `[manage] ⚠️ Every "${label}" entry must be a non-empty string. Re-emit.`,
+      );
+    }
+    out.push(item.trim());
+  }
+  return out;
+}
+
+export function parseRefs(directory: string, raw: string): RefEntry[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `[manage] ⚠️ "refs" must be a JSON array of {"path","symbol","relation"} objects — ` +
+        `it failed to parse. Run lsp_find_references on the symbols and re-emit.`,
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(
+      `[manage] ⚠️ "refs" must be a JSON array — got ${typeof parsed}. Re-emit.`,
+    );
+  }
+  const entries: RefEntry[] = [];
+  for (const item of parsed) {
+    if (!item || typeof item.path !== "string") {
+      throw new Error(
+        `[manage] ⚠️ Every "refs" entry needs a string "path". Re-emit.`,
+      );
+    }
+    const target = isAbsolute(item.path)
+      ? item.path
+      : join(directory, item.path);
+    if (!existsSync(target)) {
+      throw new Error(
+        `[manage] ⚠️ Refs path "${item.path}" does not exist on disk — refs must come from real ` +
+          `lsp_find_references results, not invention. Re-run the LSP queries and re-emit.`,
+      );
+    }
+    entries.push({
+      path: item.path,
+      symbol: typeof item.symbol === "string" ? item.symbol : undefined,
+      relation:
+        typeof item.relation === "string" ? item.relation : "referenced-by",
+    });
+  }
+  return entries;
+}
+
+// ── Impact: structural requirement before touching shared code ─────────────
+
+export interface ImpactEntry {
+  path: string;
+  symbol: string;
+  relation: string;
+}
+
+export function parseImpact(directory: string, raw: string): ImpactEntry[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `[manage] ⚠️ "impact" must be a JSON array of {"path","symbol","relation"} objects — ` +
+        `it failed to parse. Run lsp_find_references on the symbols you are changing and re-emit.`,
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(
+      `[manage] ⚠️ "impact" must be a JSON array — got ${typeof parsed}. Re-emit with a valid impact list.`,
+    );
+  }
+  const entries: ImpactEntry[] = [];
+  for (const item of parsed) {
+    if (
+      !item ||
+      typeof item.path !== "string" ||
+      typeof item.symbol !== "string"
+    ) {
+      throw new Error(
+        `[manage] ⚠️ Every "impact" entry needs a string "path" and a string "symbol". Re-emit.`,
+      );
+    }
+    const target = isAbsolute(item.path)
+      ? item.path
+      : join(directory, item.path);
+    if (!existsSync(target)) {
+      throw new Error(
+        `[manage] ⚠️ Impact path "${item.path}" does not exist on disk — impact must come from real ` +
+          `lsp_find_references results, not invention. Re-run the LSP queries and re-emit.`,
+      );
+    }
+    entries.push({
+      path: item.path,
+      symbol: item.symbol,
+      relation:
+        typeof item.relation === "string" ? item.relation : "referenced-by",
+    });
+  }
+  return entries;
+}
+
+export function impactRequiredMessage(path: string): string {
+  return (
+    `[manage] ⚠️ Proposal for "${path}" touches a registered SHARED module, so it needs a valid ` +
+    `"impact" list. Run lsp_find_references (and lsp_goto_definition) on the symbols you are ` +
+    `changing, then re-emit emit_proposal with "impact" as a JSON array of ` +
+    `{"path","symbol","relation"} entries. Every path must exist on disk. ` +
+    `This is a REQUIREMENTS retry — the proposal is NOT recorded until impact is valid.`
+  );
+}

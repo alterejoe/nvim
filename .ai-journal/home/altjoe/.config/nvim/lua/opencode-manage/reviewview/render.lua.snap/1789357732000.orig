@@ -1,11 +1,6 @@
 -- opencode-manage.reviewview.render — list + preview rendering.
 -- Row classification (row_state), the CURRENT/AFTER preview panes, and
 -- the list. Pure-ish: takes the shared state table as a parameter.
--- REVISION ORDERING (derived, internal): rows sharing a target
--- (group + path) are revisions of one change. Only the newest pending or
--- accepted row is actionable; older pending siblings render [superseded]
--- and are never applied. Nothing is written for a skip — reject the newest
--- and the older row becomes live again. See newest_revisions / is_stale.
 
 local diff = require("opencode-manage.reviewview.diff")
 
@@ -72,7 +67,7 @@ end
 --- file on disk: content first (bytes are truth), then mtime (context
 --- staleness), then existence/op structure.
 --- @param p table
---- @return string  "new" | "edit" | "rerun" | "delete" | "applied" | "rejected" | "superseded" | "mismatch"
+--- @return string  "new" | "edit" | "rerun" | "delete" | "applied" | "rejected" | "mismatch"
 function M.row_state(p)
 	local st = p.status or "pending"
 
@@ -86,16 +81,7 @@ function M.row_state(p)
 		return "applied"
 	end
 
-	-- Superseded: an older revision of a target a newer row owns. Also a
-	-- persisted status value, for any future explicit marking.
-	if st == "superseded" then
-		return "superseded"
-	end
-
 	local path = M.resolve_path(p)
-	if path == "" then
-		return "mismatch" -- legacy relative path: unresolvable, fail closed
-	end
 	local exists = vim.fn.filereadable(path) == 1
 
 	-- delete/move: applied once the file is gone (moved to _old/)
@@ -138,61 +124,13 @@ function M.row_state(p)
 	return "mismatch"
 end
 
---- Newest revision candidate per (group + path): pending and accepted rows.
---- Several pending rows for one target in one group are revisions of a single
---- change — only the newest is actionable. Accepted rows count so a pending
---- row older than an APPLIED revision is obsolete too. Keyed WITHOUT the
---- session id: a re-emission from a fresh session (a "fresh pending set")
---- supersedes the old set on purpose.
---- @param items table[]
---- @return table<string, table>  key -> newest candidate
-function M.newest_revisions(items)
-	local newest = {}
-	for _, p in ipairs(items) do
-		local st = p.status or "pending"
-		if st == "pending" or st == "accepted" then
-			local key = (p.group or "misc") .. "\0" .. (p.path or "")
-			local cur = newest[key]
-			if not cur or (p.ts or 0) > (cur.ts or 0) then
-				newest[key] = p
-			end
-		end
-	end
-	return newest
-end
-
---- Is this pending row an older revision of its target? Derived, not
---- persisted: nothing is written when a row is skipped; if the newest row is
---- rejected, the older one becomes actionable again on the next refresh.
---- @param p table
---- @param newest table<string, table>
---- @return boolean
-function M.is_stale(p, newest)
-	if (p.status or "pending") ~= "pending" then
-		return false
-	end
-	local top = newest[(p.group or "misc") .. "\0" .. (p.path or "")]
-	return top ~= nil and (top.ts or 0) > (p.ts or 0)
-end
-
 --- Precompute the derived state for every item. Called once per refresh —
 --- the ONLY place row_state runs. Rendering reads state.row_states.
---- Revision ordering is derived here: a pending row with a newer pending or
---- accepted sibling for the same (group + path) renders as [superseded] and
---- can never be applied. The revision map is computed over ALL visible rows
---- (one extra manifest scan, cheap at this size) so a scope filter can never
---- hide the newer row and let the older one through.
 --- @param state table
 function M.compute_row_states(state)
-	local proposals = require("opencode-manage.proposals")
-	local newest = M.newest_revisions(proposals.list_visible("all"))
 	state.row_states = {}
 	for i, p in ipairs(state.items) do
-		local st = M.row_state(p)
-		if M.is_stale(p, newest) then
-			st = "superseded"
-		end
-		state.row_states[i] = st
+		state.row_states[i] = M.row_state(p)
 	end
 end
 
@@ -207,7 +145,6 @@ function M.state_tag(st)
 		new = "new",
 		delete = "delete",
 		rejected = "rejected",
-		superseded = "superseded",
 		mismatch = "mismatch",
 	}
 	return tags[st] or st
@@ -465,11 +402,9 @@ function M.render_previews(state)
 end
 
 --- Display-order indices: groups ordered by their NEWEST proposal's time
---- (descending), proposals within a group newest-first — so the actionable
---- (newest) revision of a target always sits ABOVE its superseded siblings.
---- The comparator is TOTAL (path tiebreaker) — table.sort is unstable, and
---- equal timestamps would otherwise reorder rows between refreshes, moving
---- the cursor.
+--- (descending), proposals within a group newest-first. The comparator is
+--- TOTAL (path tiebreaker) — table.sort is unstable, and equal timestamps
+--- would otherwise reorder rows between refreshes, moving the cursor.
 --- @param state table
 --- @return number[]
 function M.display_order(state)
@@ -560,7 +495,7 @@ function M.render_list(state)
 	vim.api.nvim_buf_clear_namespace(state.list_buf, ns, 0, -1)
 	for ln, st in pairs(row_of) do
 		local hl = M.hl_for(st)
-		if hl ~= "ManageApplied" and hl ~= "ManageRejected" and hl ~= "ManageSuperseded" then
+		if hl ~= "ManageApplied" and hl ~= "ManageRejected" then
 			vim.api.nvim_buf_add_highlight(state.list_buf, ns, hl, ln - 1, 0, -1)
 		else
 			vim.api.nvim_buf_add_highlight(state.list_buf, ns, hl, ln - 1, 2, -1)
@@ -644,7 +579,7 @@ function M.set_legend(state)
 	)
 	vim.wo[state.list_win].winbar = table.concat({
 		"%#ManageNew#██%*new  %#ManageEdit#██%*edit  %#ManageRerun#██%*rerun  %#ManageDelete#██%*delete  "
-			.. "%#ManageApplied#██%*applied  %#ManageRejected#██%*rejected  %#ManageSuperseded#██%*superseded  %#ManageMismatch#██%*mismatch",
+			.. "%#ManageApplied#██%*applied  %#ManageRejected#██%*rejected  %#ManageMismatch#██%*mismatch",
 		line2,
 	}, "\n")
 end
@@ -658,7 +593,6 @@ function M.define_hls()
 	hl(0, "ManageDelete", { fg = "#f44747" }) -- red: delete/move
 	hl(0, "ManageApplied", { fg = "#6a9955" }) -- dim green: already applied
 	hl(0, "ManageRejected", { fg = "#808080", strikethrough = true }) -- dim: rejected
-	hl(0, "ManageSuperseded", { fg = "#6e6e6e", italic = true, strikethrough = true }) -- dim: older revision
 	hl(0, "ManageMismatch", { fg = "#dcdcaa", bold = true }) -- yellow: mismatch
 	hl(0, "ManageGroup", { fg = "#808080", italic = true }) -- group headers
 	-- Diff-pane backgrounds: what a partial deletes (left) / adds (right).
