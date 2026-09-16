@@ -1,6 +1,4 @@
 -- /home/jmeyer/.config/nvim/after/plugin/which-key.lua FINAL
-
--- after/plugin/which-key.lua
 -- Group labels and descriptions for all keymaps.
 
 local wk = require("which-key")
@@ -11,12 +9,30 @@ wk.add({
 	{ "<leader>f", group = "find" },
 	{ "<leader>g", group = "git" },
 	{ "<leader>r", group = "air / reload" },
-	{ "<leader>s", group = "split / shell" },
+	{ "<leader>s", group = "csvgen / shell" },
 	{ "<leader>t", group = "tmux" },
 	{ "<leader>w", group = "browser session" },
 	{ "<leader>c", group = "ai" },
 	{ "<leader>x", group = "emmet" },
 
+	-- csvgen generators
+	{ "<leader>sc", desc = "CSVGen: contest choices from pattern", mode = "v" },
+	{ "<leader>sg", desc = "CSVGen: contest template from ranges", mode = "v" },
+	{ "<leader>sn", desc = "CSVGen: generate ShortName from Name", mode = "v" },
+	{ "<leader>sm", desc = "CSVGen: contest→precinct split", mode = "v" },
+	{ "<leader>sd", desc = "CSVGen: contest→district", mode = "v" },
+	{ "<leader>sx", desc = "CSVGen: district→precinct split", mode = "v" },
+	{ "<leader>sa", desc = "CSVGen: poll place→precinct split", mode = "v" },
+	{ "<leader>sp", desc = "CSVGen: precinct CSV from pattern", mode = { "n", "v" } },
+	{ "<leader>sb", desc = "CSVGen: ballot→precinct split CSV", mode = { "n", "v" } },
+	{ "<leader>sv", desc = "CSVGen: ballot→district CSV", mode = { "n", "v" } },
+	{ "<leader>se", desc = "CSVGen: Excel paste→CSV", mode = "n" },
+	{ "<leader>ec", desc = "CSVGen: Excel→CSV (selection)", mode = "v" },
+	{ "<leader>sk", desc = "CSVGen: show keybinds" },
+	{ "<leader>sD", desc = "CSVGen: district→precinct by name match" },
+	{ "<leader>sP", desc = "CSVGen: contest→precinct by name match" },
+	{ "<leader>sC", desc = "CSVGen: contest→district by name match" },
+	{ "<leader>sL", desc = "CSVGen: polling place→precinct by name match" },
 	-- grapple slots
 	{ "<leader>j", desc = "Grapple slot 1" },
 	{ "<leader>k", desc = "Grapple slot 2" },

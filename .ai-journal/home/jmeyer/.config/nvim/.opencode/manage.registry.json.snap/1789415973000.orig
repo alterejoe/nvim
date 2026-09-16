@@ -1,0 +1,35 @@
+{
+  "canonical": [],
+  "consolidations": [],
+  "modularize": [],
+  "shared": [
+    {
+      "constraints": "Keep public results absolute for explicit home-relative live refs. Leave correction paths and legacy foreign absolute paths unchanged. Preserve schema, ranking, pruning, usage counters and fail-open behavior.",
+      "fragile": true,
+      "path": "../opencode/plugins/lib/refs.ts",
+      "rationale": "Shared reference-reading boundary for manage focus routing and ref_lookup. It must resolve explicit home-relative live refs without rewriting correction paths or proposal/verdict history.",
+      "refs": [
+        {
+          "path": "../opencode/plugins/manage.ts",
+          "relation": "loads active focus for system hints",
+          "symbol": "loadFocus"
+        },
+        {
+          "path": "../opencode/plugins/manage.ts",
+          "relation": "selects refs for focus hints",
+          "symbol": "matchRefs"
+        },
+        {
+          "path": "../opencode/plugins/manage.ts",
+          "relation": "implements ref_lookup",
+          "symbol": "lookupRefs"
+        }
+      ],
+      "symbols": [
+        "loadFocus",
+        "matchRefs",
+        "lookupRefs"
+      ]
+    }
+  ]
+}

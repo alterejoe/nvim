@@ -1,0 +1,70 @@
+{
+  "canonical": [],
+  "consolidations": [],
+  "modularize": [],
+  "shared": [
+    {
+      "constraints": "Keep public results absolute for explicit home-relative live refs. Leave correction paths and legacy foreign absolute paths unchanged. Preserve schema, ranking, pruning, usage counters and fail-open behavior.",
+      "fragile": true,
+      "path": "../opencode/plugins/lib/refs.ts",
+      "rationale": "Shared reference-reading boundary for manage focus routing and ref_lookup. It must resolve explicit home-relative live refs without rewriting correction paths or proposal/verdict history.",
+      "refs": [
+        {
+          "path": "../opencode/plugins/manage.ts",
+          "relation": "loads active focus for system hints",
+          "symbol": "loadFocus"
+        },
+        {
+          "path": "../opencode/plugins/manage.ts",
+          "relation": "selects refs for focus hints",
+          "symbol": "matchRefs"
+        },
+        {
+          "path": "../opencode/plugins/manage.ts",
+          "relation": "implements ref_lookup",
+          "symbol": "lookupRefs"
+        }
+      ],
+      "symbols": [
+        "loadFocus",
+        "matchRefs",
+        "lookupRefs"
+      ]
+    },
+    {
+      "constraints": "Keep consumers receiving absolute paths. Resolve only explicit home-relative refs; never remap another user's absolute home or alter proposal/verdict targets. Preserve pruning and usage metadata.",
+      "fragile": true,
+      "path": "lua/opencode-manage/refs.lua",
+      "rationale": "The reference store is shared by commands, focus updates and both viewers. Home-relative storage must resolve at this boundary so callers still receive absolute paths; proposal/verdict history is outside its scope.",
+      "refs": [
+        {
+          "path": "lua/opencode-manage/init.lua",
+          "relation": "commands and BufEnter",
+          "symbol": "index / pin / request_focus"
+        },
+        {
+          "path": "lua/opencode-manage/foldersview.lua",
+          "relation": "indexes approved folders",
+          "symbol": "index"
+        },
+        {
+          "path": "lua/opencode-manage/refsview.lua",
+          "relation": "renders and opens project refs",
+          "symbol": "list"
+        },
+        {
+          "path": "lua/opencode-manage/vaultview.lua",
+          "relation": "renders, opens and indexes vault refs",
+          "symbol": "list_global / index"
+        }
+      ],
+      "symbols": [
+        "index",
+        "pin",
+        "request_focus",
+        "list",
+        "list_global"
+      ]
+    }
+  ]
+}

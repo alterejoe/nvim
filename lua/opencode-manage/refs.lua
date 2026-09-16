@@ -1,4 +1,4 @@
--- /home/altjoe/.config/nvim/lua/opencode-manage/refs.lua FINAL
+-- /home/jmeyer/.config/nvim/lua/opencode-manage/refs.lua FINAL
 -- opencode-manage.refs — the reference index (doc 20, R1a).
 -- Live pointers to the user's own working code + frozen blocks from
 -- corrections. Nvim builds the index (the filesystem is the user's); the
@@ -12,6 +12,8 @@
 -- Writer commands CREATE the store (dir + file + refs schema) — indexing a
 -- project must never require a pre-existing state.db.
 -- COLON FIX: sqlite:open(path) — the dot form silently opens in-memory.
+-- Live refs/focus inside HOME are stored as ~/ paths and resolved on read.
+-- Foreign absolute paths and frozen corrections are never remapped.
 
 local M = {}
 
@@ -62,6 +64,48 @@ CREATE TABLE IF NOT EXISTS focus (
   dir TEXT
 );
 ]]
+
+local function home_dir()
+	local home = vim.env.HOME or ""
+	return home == "/" and home or home:gsub("/+$", "")
+end
+
+local function resolve_path(path)
+	local home = home_dir()
+	if home == "" then
+		return path
+	end
+	if path == "~" then
+		return home
+	end
+	if path:sub(1, 2) == "~/" then
+		return home:gsub("/$", "") .. path:sub(2)
+	end
+	return path
+end
+
+local function portable_path(path)
+	local home = home_dir()
+	if home == "" or home == "/" then
+		return path
+	end
+	if path == home then
+		return "~"
+	end
+	if path:sub(1, #home + 1) == home .. "/" then
+		return "~" .. path:sub(#home + 1)
+	end
+	return path
+end
+
+local function resolve_rows(rows)
+	for _, row in ipairs(rows) do
+		if (row.source == "index" or row.source == "pin") and type(row.path) == "string" then
+			row.path = resolve_path(row.path)
+		end
+	end
+	return rows
+end
 
 --- Nearest state.db: walk up from cwd looking for .opencode; stop at the
 --- project root (first dir with .git). Never creates directories.
@@ -133,7 +177,11 @@ end
 --- (CV1, doc 20).
 --- @return table|nil
 local function open_global_writable()
-	local path = (vim.env.HOME or "") .. "/.config/opencode/state.db"
+	if home_dir() == "" then
+		vim.notify("❌ refs: HOME is unavailable; cannot open the global store", vim.log.levels.ERROR)
+		return nil
+	end
+	local path = resolve_path("~/.config/opencode/state.db")
 	vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
 	local ok, db = pcall(function()
 		if not sqlite then
@@ -163,7 +211,8 @@ function M.subject(path)
 end
 
 --- Index files under a root. Live pointers only; pruned entries are not
---- resurrected and existing entries are skipped. Creates the store.
+--- resurrected. Matching local absolute live refs are converted in place,
+--- keeping IDs, usage and pruning metadata; foreign paths are not guessed.
 --- opts.global = true writes the GLOBAL store with scope 'global' (the
 --- vault); default stays the project store.
 --- @param root string
@@ -171,7 +220,13 @@ end
 --- @return number  inserted count
 function M.index(root, opts)
 	opts = opts or {}
-	local db = opts.global and open_global_writable() or open_writable()
+	root = vim.fn.fnamemodify(resolve_path(root), ":p")
+	local db
+	if opts.global then
+		db = open_global_writable()
+	else
+		db = open_writable()
+	end
 	if not db then
 		return 0
 	end
@@ -188,7 +243,7 @@ function M.index(root, opts)
 				end
 			end
 			if not skip then
-				files[#files + 1] = f
+				files[#files + 1] = vim.fn.fnamemodify(f, ":p")
 			end
 			if #files >= 800 then
 				break
@@ -200,33 +255,64 @@ function M.index(root, opts)
 	end
 
 	local inserted = 0
+	local portable = 0
+	local converted = 0
 	local now = os.time() * 1000
-	pcall(function()
-		db:execute("BEGIN")
+	local ok, err = pcall(function()
+		assert(db:execute("BEGIN") ~= false, "could not begin indexing transaction")
 		for _, f in ipairs(files) do
-			local exists = false
-			local rows = db:eval("SELECT id FROM refs WHERE path = :path LIMIT 1", { path = f })
+			local stored = portable_path(f)
+			local rows = db:eval(
+				"SELECT id, source, path FROM refs WHERE path = :portable OR path = :absolute",
+				{ portable = stored, absolute = f }
+			)
+			assert(rows ~= false, "could not look up existing reference")
 			if type(rows) == "table" and rows[1] then
-				exists = true
-			end
-			if not exists then
+				for _, row in ipairs(rows) do
+					if stored ~= f and row.path == f and (row.source == "index" or row.source == "pin") then
+						assert(
+							db:eval("UPDATE refs SET path = ? WHERE id = ?", { stored, row.id }) ~= false,
+							"could not convert local reference path"
+						)
+						converted = converted + 1
+					end
+				end
+			else
 				local res = db:eval(
 					"INSERT INTO refs (ts, source, kind, path, subject, scope) "
 						.. "VALUES (?, 'index', 'file', ?, ?, ?)",
-					{ now, f, M.subject(f), scope }
+					{ now, stored, M.subject(f), scope }
 				)
-				if res ~= false then
-					inserted = inserted + 1
+				assert(res ~= false, "could not insert reference")
+				inserted = inserted + 1
+				if stored ~= f then
+					portable = portable + 1
 				end
 			end
 		end
-		db:execute("COMMIT")
+		assert(db:execute("COMMIT") ~= false, "could not commit indexing transaction")
 	end)
+	if not ok then
+		pcall(function()
+			db:execute("ROLLBACK")
+		end)
+	end
 	pcall(function()
 		db:close()
 	end)
+	if not ok then
+		vim.notify("❌ refs: indexing failed under " .. root .. ": " .. tostring(err), vim.log.levels.ERROR)
+		return 0
+	end
 	vim.notify(
-		string.format("📚 refs: indexed %d new file(s) under %s (%s)", inserted, root, scope),
+		string.format(
+			"📚 refs: indexed %d new file(s) under %s (%s; %d home-relative new, %d converted)",
+			inserted,
+			root,
+			scope,
+			portable,
+			converted
+		),
 		vim.log.levels.INFO
 	)
 	return inserted
@@ -236,22 +322,29 @@ end
 --- @param path string
 --- @return boolean
 function M.pin(path)
+	path = vim.fn.fnamemodify(resolve_path(path), ":p")
+	local stored = portable_path(path)
 	local db = open_writable()
 	if not db then
 		return false
 	end
-	local ok = pcall(function()
-		db:eval(
-			"INSERT INTO refs (ts, source, kind, path, subject, scope) "
-				.. "VALUES (?, 'pin', 'file', ?, ?, 'project')",
-			{ os.time() * 1000, path, M.subject(path) }
+	local ok, err = pcall(function()
+		assert(
+			db:eval(
+				"INSERT INTO refs (ts, source, kind, path, subject, scope) "
+					.. "VALUES (?, 'pin', 'file', ?, ?, 'project')",
+				{ os.time() * 1000, stored, M.subject(path) }
+			) ~= false,
+			"could not insert pinned reference"
 		)
 	end)
 	pcall(function()
 		db:close()
 	end)
 	if ok then
-		vim.notify("📌 ref pinned: " .. path, vim.log.levels.INFO)
+		vim.notify("📌 ref pinned: " .. path .. " (stored as " .. stored .. ")", vim.log.levels.INFO)
+	else
+		vim.notify("❌ refs: pin failed for " .. path .. ": " .. tostring(err), vim.log.levels.ERROR)
 	end
 	return ok
 end
@@ -260,30 +353,41 @@ end
 --- Skips silently when the project has no store yet.
 --- @param path string
 function M.request_focus(path)
-	if not path or path == "" or path == last_focus then
+	if not path or path == "" then
 		return
 	end
 	if path:find("^%w+://") or path:find("term://", 1, true) then
+		return
+	end
+	path = vim.fn.fnamemodify(resolve_path(path), ":p")
+	if path == last_focus then
 		return
 	end
 	local db = open()
 	if not db then
 		return
 	end
-	last_focus = path
-	pcall(function()
-		db:eval(
-			"INSERT INTO focus (id, ts, path, dir) VALUES (1, ?, ?, ?) "
-				.. "ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, path=excluded.path, dir=excluded.dir",
-			{ os.time() * 1000, path, vim.fn.fnamemodify(path, ":h") }
+	local ok, err = pcall(function()
+		assert(
+			db:eval(
+				"INSERT INTO focus (id, ts, path, dir) VALUES (1, ?, ?, ?) "
+					.. "ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, path=excluded.path, dir=excluded.dir",
+				{ os.time() * 1000, portable_path(path), portable_path(vim.fn.fnamemodify(path, ":h")) }
+			) ~= false,
+			"could not record focus"
 		)
 	end)
 	pcall(function()
 		db:close()
 	end)
+	if ok then
+		last_focus = path
+	else
+		vim.notify("❌ refs: focus update failed for " .. path .. ": " .. tostring(err), vim.log.levels.ERROR)
+	end
 end
 
---- References list (unpruned first, most used first).
+--- References list (unpruned first, most used first), with local live paths.
 --- @return table[]
 function M.list()
 	local db = open()
@@ -303,13 +407,16 @@ function M.list()
 	pcall(function()
 		db:close()
 	end)
-	return rows
+	return resolve_rows(rows)
 end
 
 --- Read-only open of the global vault store (nil when absent/unusable).
 --- @return table|nil
 local function open_global()
-	local path = (vim.env.HOME or "") .. "/.config/opencode/state.db"
+	if home_dir() == "" then
+		return nil
+	end
+	local path = resolve_path("~/.config/opencode/state.db")
 	if vim.fn.filereadable(path) ~= 1 then
 		return nil
 	end
@@ -328,7 +435,7 @@ local function open_global()
 	return db
 end
 
---- Global vault list (unpruned first, most used first).
+--- Global vault list (unpruned first, most used first), with local live paths.
 --- @return table[]
 function M.list_global()
 	local db = open_global()
@@ -348,7 +455,7 @@ function M.list_global()
 	pcall(function()
 		db:close()
 	end)
-	return rows
+	return resolve_rows(rows)
 end
 
 --- Prune a GLOBAL vault ref (reason kept; the vault viewer's `d`).
