@@ -11,11 +11,7 @@
 -- from proposed_content vs applied_content.
 -- PATH VALIDATION (doc 21): the apply side FAILS CLOSED. Only absolute
 -- proposal paths apply; update ops (replace/edit_range/delete) require a
--- readable target and are refused otherwise. Only create may create a
--- missing parent chain, and only after an explicit y/n (default No) — the
--- emit side records the chain as `mkdirs`, and the apply side recomputes it
--- when absent so legacy rows are covered too. Directories are never created
--- silently.
+-- readable target and are refused otherwise; only create may mkdir parents.
 -- A relative path is refused with a loud message — joining it to any root
 -- is how web/web copies were born. The emit side enforces the same rules
 -- (lib/proposals.ts validateProposalTarget).
@@ -244,8 +240,7 @@ end
 --- Accept a proposal: snapshot → write → journal → verdict → status flip.
 --- The write is a USER-initiated action from nvim, never the AI.
 --- Fail closed (doc 21): absolute path required; update ops require a
---- readable target; create may create a missing parent chain only after the
---- y/n prompt (default No).
+--- readable target; only create may mkdir parents.
 --- T2: editing the buffer before accepting makes the verdict `corrected` —
 --- the diff between INTENDED and applied content is the structural fact.
 --- @param proposal table
@@ -272,32 +267,6 @@ function M.accept(proposal, content_override, baseline_override)
 		end
 		local parent = vim.fn.fnamemodify(path, ":h")
 		if vim.fn.isdirectory(parent) ~= 1 then
-			-- New directories need explicit consent: list `mkdirs` (recorded
-			-- by the emit side) or recompute for legacy rows, then ask y/n.
-			-- Default No — nothing is created or written without a Yes.
-			local dirs = type(proposal.mkdirs) == "table" and proposal.mkdirs or {}
-			if #dirs == 0 then
-				local d = parent
-				while vim.fn.isdirectory(d) ~= 1 do
-					table.insert(dirs, 1, d)
-					local up = vim.fn.fnamemodify(d, ":h")
-					if up == d then
-						break
-					end
-					d = up
-				end
-			end
-			local choice = vim.fn.confirm(
-				"New directories needed by this create:\n  "
-					.. table.concat(dirs, "\n  ")
-					.. "\n\nCreate them and write the file?",
-				"&No\n&Yes",
-				1
-			)
-			if choice ~= 2 then
-				vim.notify("❌ Cancelled — no directory created, nothing written", vim.log.levels.WARN)
-				return false
-			end
 			vim.fn.mkdir(parent, "p")
 		end
 	else

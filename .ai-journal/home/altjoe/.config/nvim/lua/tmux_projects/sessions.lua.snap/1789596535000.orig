@@ -1,51 +1,25 @@
--- lua/tmux_projects/sessions.lua FINAL-14
+-- lua/tmux_projects/sessions.lua FINAL-10
 -- Live workspace board (<leader>ts) plus tmux session keymaps.
 --
 -- The board is an Oil-style browser over one workspace:
---   * live sessions show ● (with a relative last-activity age), saved-but-dead
---     sessions show ○
+--   * live sessions show ●, saved-but-dead sessions show ○
 --   * folders are virtual and stored in the workspace
---   * a session in folder "block" named "test" owns the tmux session
---     "block/test"; root sessions keep their bare name, so the same name in
---     different folders is two different sessions
---   * opening the board (ts) always re-reads the store first, so sessions
---     created by other nvim instances show up immediately
---   * rows are pointers: creating, copying or renaming rows never touches
---     tmux. Legacy bare-named sessions are adopted into their folder
---     namespace once, on board open (rename-session)
---   * a changed path rebuilds that row's own live session on W
---   * removing a row or a folder kills its tmux session only on an explicit
---     save (W); navigation commits never kill anything
---   * a live session with no row pointing at it ("<folder>/<name>" orphans,
---     e.g. after its row was moved or deleted) is homed into its folder on
---     board open: a pointer is added, the session is untouched
 --   * dd a session row, enter a folder, gp to move it; W commits the level, <C-W> saves the workspace
---   * W prompts for missing session paths via a fuzzy picker
+--   * W prompts for missing session paths via a fuzzy picker and recreates
+--     live sessions whose path was edited
+--   * a session lives in exactly one folder; the root never duplicates
+--     sessions that live in a folder
+--   * deleting a folder or a session row deletes it in tmux too
 --   * A / O toggle panels listing the hidden air / opencode sessions;
---     deleting a row there and saving (W) kills that session, and r / <C-l>
---     refresh re-reads the live tmux state
---   * Enter on a session opens it, saves its row as a pointer, and closes
---     the board
+--     deleting a row there and saving (W) kills that session
+--   * Enter on a session opens it and closes the board
 --   * sessions handed off from the palette (tp) are merged into the draft
---   * + saves the session on the current row to the palette (projects/),
---     remembering which board folder it came from
---   * <C-l> / r refresh (re-reads store + live state), "-" / <leader>e go up
---     a level, <Tab> hops name/path (normal mode; insert mode is nvim-cmp's)
+--   * + saves the session on the current row to the palette (projects/)
+--   * <C-l>/r refresh, "-"/<leader>e go up a level, <Tab> toggles name/path
 
 local state = require("tmux_projects.state")
 local browser = require("tmux_projects.browser")
 local scratchbuf = require("scratchbuf")
-
--- A session in folder "block" named "test" owns the tmux session
--- "block/test"; root sessions (folder "") keep their bare name. tmux session
--- names are server-global, so the folder prefix is what keeps same-name
--- sessions in different folders apart.
-local function qualified(folder, name)
-	if folder and folder ~= "" then
-		return folder .. "/" .. name
-	end
-	return name
-end
 
 local M_sub = {}
 
@@ -157,20 +131,18 @@ function M_sub.setup(M)
 	local pending_board = {}
 
 	-- Sessions handed off from the palette (tp) are merged into the draft the
-	-- next time the board opens. `folder` carries the originating folder so
-	-- workspace handoffs land in the right place.
-	function M.add_to_board(name, path, folder)
+	-- next time the board opens.
+	function M.add_to_board(name, path)
 		if not name or name == "" then
 			return
 		end
-		folder = folder or ""
 		for _, entry in ipairs(pending_board) do
-			if entry.name == name and (entry.folder or "") == folder then
+			if entry.name == name then
 				entry.path = path
 				return
 			end
 		end
-		table.insert(pending_board, { name = name, path = path, folder = folder })
+		table.insert(pending_board, { name = name, path = path })
 	end
 
 	local function find_session_path(name)
@@ -187,24 +159,21 @@ function M_sub.setup(M)
 	local function live_set()
 		local all = browser.live_sessions()
 		local visible = {}
-		for name, meta in pairs(all) do
+		for name in pairs(all) do
 			local hidden = name:find("^opencode%-")
 				or name:find("^air%-")
 				or name:find("^browser%-")
 				or name:find("^devproxy%-")
 			if M.get_show_hidden() or not hidden then
-				visible[name] = meta
+				visible[name] = true
 			end
 		end
 		return visible
 	end
 
-	-- Is there a draft row for this (folder, name) pair? Sessions are
-	-- addressed by their folder-qualified tmux name.
-	local function in_draft(name, folder)
-		local q = qualified(folder or "", name)
+	local function in_draft(name)
 		for _, session in ipairs(draft.sessions) do
-			if qualified(session.folder or "", session.name) == q then
+			if session.name == name then
 				return true
 			end
 		end
@@ -225,12 +194,8 @@ function M_sub.setup(M)
 		-- Merge sessions handed off from the palette.
 		if #pending_board > 0 then
 			for _, entry in ipairs(pending_board) do
-				local folder = entry.folder or ""
-				if not in_draft(entry.name, folder) then
-					table.insert(draft.sessions, { name = entry.name, path = entry.path, folder = folder })
-					if folder ~= "" and not vim.tbl_contains(draft.folders, folder) then
-						table.insert(draft.folders, folder)
-					end
+				if not in_draft(entry.name) then
+					table.insert(draft.sessions, { name = entry.name, path = entry.path, folder = "" })
 				end
 			end
 			pending_board = {}
@@ -288,16 +253,12 @@ function M_sub.setup(M)
 		end
 		if prefix == "" then
 			-- Root shows only live sessions that are saved nowhere: sessions
-			-- living in a board folder (under any qualified name) or a palette
-			-- folder never appear at the root.
-			local claimed = {}
-			for _, session in ipairs(draft.sessions) do
-				claimed[qualified(session.folder or "", session.name)] = true
-			end
+			-- living in a workboard folder or a palette folder never appear
+			-- at the root.
 			local visible = live_set()
 			local live_only = {}
 			for name in pairs(visible) do
-				if not claimed[name] and not find_session_path(name) then
+				if not in_draft(name) and not find_session_path(name) then
 					table.insert(live_only, name)
 				end
 			end
@@ -321,7 +282,6 @@ function M_sub.setup(M)
 
 		local live = browser.live_sessions()
 		local new_sessions = {}
-		local index_by_name = {}
 		local kept_folders = {}
 		for _, line in ipairs(lines) do
 			local raw = vim.trim(line)
@@ -344,47 +304,39 @@ function M_sub.setup(M)
 						-- Ephemeral live rows (live but not in the draft) are
 						-- only captured on explicit save (W); navigation never
 						-- adds them to the draft, so no root duplicates.
-						local ephemeral = live[qualified(prefix, name)] and not in_draft(name, prefix)
+						local ephemeral = live[name] and not in_draft(name)
 						if not (ephemeral and not prompt_paths) then
 							local existing = find_session_path(name)
-							local entry = {
+							table.insert(new_sessions, {
 								name = name,
 								path = path ~= "" and path or (existing or ""),
 								folder = prefix,
-							}
-							-- Duplicate rows in the same level: last edit wins.
-							if index_by_name[name] then
-								new_sessions[index_by_name[name]] = entry
-							else
-								index_by_name[name] = #new_sessions + 1
-								table.insert(new_sessions, entry)
-							end
+							})
 						end
 					end
 				end
 			end
 		end
 
-		-- On explicit save (W): a changed path rebuilds the row's own live
-		-- session at the new path. Nothing else touches tmux here: rows are
-		-- pointers, so creating, copying or naming rows never renames or
-		-- adopts another live session.
+		-- On explicit save (W): recreate live sessions whose base path changed.
 		if prompt_paths then
 			for _, session in ipairs(new_sessions) do
 				local old = old_by_name[session.name]
-				local q = qualified(session.folder or "", session.name)
-				if old and old.path ~= session.path and session.path ~= "" and state.session_exists(q) then
-					browser.recreate_session(q, session.path)
+				if old and old.path ~= session.path and session.path ~= "" and state.session_exists(session.name) then
+					browser.recreate_session(session.name, session.path)
 				end
 			end
-			browser.invalidate_live()
 		end
 
-		-- Sessions removed from this level (killed only on explicit saves).
+		-- Keep sessions that live outside this level, dropping same-name
+		-- entries so a session lives in exactly one folder (no duplicates).
 		local new_names = {}
 		for _, session in ipairs(new_sessions) do
 			new_names[session.name] = true
 		end
+
+		-- Sessions deleted at this level are killed in tmux too, so they do
+		-- not reappear at the root as live sessions.
 		local deleted_sessions = {}
 		for name, old in pairs(old_by_name) do
 			if not new_names[name] then
@@ -392,12 +344,9 @@ function M_sub.setup(M)
 			end
 		end
 
-		-- Keep sessions that live outside this level. Same-name sessions in
-		-- other folders are distinct rows now (folder-scoped tmux names), so
-		-- they are never dropped here.
 		local kept_sessions = {}
 		for _, session in ipairs(draft.sessions) do
-			if (session.folder or "") ~= prefix then
+			if (session.folder or "") ~= prefix and not new_names[session.name] then
 				table.insert(kept_sessions, session)
 			end
 		end
@@ -421,8 +370,7 @@ function M_sub.setup(M)
 			return false
 		end
 
-		-- Sessions inside deleted folders are deleted too (killed only on
-		-- explicit saves).
+		-- Sessions inside deleted folders are deleted too (killed in tmux).
 		local doomed_sessions = {}
 		for _, session in ipairs(draft.sessions) do
 			if is_removed(session.folder or "") then
@@ -464,26 +412,20 @@ function M_sub.setup(M)
 		end
 		M.save_store()
 
-		-- Rows are pointers: silent (navigation) commits never touch tmux.
-		-- Only an explicit save (W) that removes a row or a folder kills its
-		-- session, so cutting/pasting rows (moves and copies) can never
-		-- delete another session.
-		if prompt_paths then
-			for _, session in ipairs(doomed_sessions) do
-				local q = qualified(session.folder or "", session.name)
-				if state.session_exists(q) then
-					state.tmux("kill-session -t " .. vim.fn.shellescape(q))
-				end
+		-- Kill the tmux sessions of deleted folders and deleted session rows
+		-- so they do not reappear at the root as live sessions.
+		for _, session in ipairs(doomed_sessions) do
+			if state.session_exists(session.name) then
+				state.tmux("kill-session -t " .. vim.fn.shellescape(session.name))
 			end
-			for _, session in ipairs(deleted_sessions) do
-				local q = qualified(session.folder or "", session.name)
-				if state.session_exists(q) then
-					state.tmux("kill-session -t " .. vim.fn.shellescape(q))
-				end
+		end
+		for _, session in ipairs(deleted_sessions) do
+			if state.session_exists(session.name) then
+				state.tmux("kill-session -t " .. vim.fn.shellescape(session.name))
 			end
-			if #doomed_sessions > 0 or #deleted_sessions > 0 then
-				browser.invalidate_live()
-			end
+		end
+		if #doomed_sessions > 0 or #deleted_sessions > 0 then
+			browser.invalidate_live()
 		end
 		return true
 	end
@@ -503,122 +445,8 @@ function M_sub.setup(M)
 		vim.notify("tmux: workspace '" .. workspace_name .. "' saved", vim.log.levels.INFO)
 	end
 
-	-- Idempotent upgrade for stores written before folder-qualified names: a
-	-- folder row still live under its bare name is renamed to "<folder>/<name>".
-	-- Runs on every board open; no-ops once everything matches. A bare name
-	-- claimed by another row (e.g. a root session of the same name) is left
-	-- alone so the migration never steals it.
-	local function migrate_qualified()
-		local claimed = {}
-		local function collect(list)
-			for _, session in ipairs(list or {}) do
-				claimed[qualified(session.folder or "", session.name)] = true
-			end
-		end
-		collect(M.board.sessions)
-		for _, workspace in pairs(M.workspaces) do
-			collect(workspace.sessions)
-		end
-
-		local renamed = {}
-		local function migrate_list(list)
-			for _, session in ipairs(list or {}) do
-				local folder = session.folder or ""
-				local q = qualified(folder, session.name)
-				if
-					folder ~= ""
-					and not claimed[session.name]
-					and not state.session_exists(q)
-					and state.session_exists(session.name)
-				then
-					state.tmux(
-						"rename-session -t " .. vim.fn.shellescape(session.name) .. " " .. vim.fn.shellescape(q)
-					)
-					table.insert(renamed, { old = session.name, new = q })
-				end
-			end
-		end
-		migrate_list(M.board.sessions)
-		for _, workspace in pairs(M.workspaces) do
-			migrate_list(workspace.sessions)
-		end
-		if #renamed == 0 then
-			return
-		end
-		local slots = M.load_order()
-		for _, entry in ipairs(renamed) do
-			for i, slot in ipairs(slots) do
-				if slot == entry.old then
-					slots[i] = entry.new
-					break
-				end
-			end
-		end
-		M.save_order(slots)
-		browser.invalidate_live()
-		vim.notify("tmux: moved " .. #renamed .. " session(s) to folder-qualified names", vim.log.levels.INFO)
-	end
-
-	-- Orphaned folder-qualified live sessions: a tmux session named
-	-- "<folder>/<name>" with no row pointing at it (its row was moved or
-	-- deleted; per the pointer rules the session survived). Home it into the
-	-- folder its name claims so it stops surfacing at the root as a
-	-- qualified-name row. Only a pointer is added; tmux is never touched.
-	local function adopt_orphans()
-		local claimed = {}
-		for _, session in ipairs(draft.sessions) do
-			claimed[qualified(session.folder or "", session.name)] = true
-		end
-		local paths = live_paths()
-		local adopted = 0
-		for name in pairs(browser.live_sessions()) do
-			local hidden = name:find("^opencode%-")
-				or name:find("^air%-")
-				or name:find("^browser%-")
-				or name:find("^devproxy%-")
-			if not hidden and name:find("/") and not claimed[name] then
-				-- Longest existing board-folder prefix of the qualified name
-				-- wins; no folders are invented.
-				local folder, bare = nil, nil
-				local scan = name
-				local cut = scan:find("/[^/]*$")
-				while cut do
-					local candidate = scan:sub(1, cut - 1)
-					if vim.tbl_contains(draft.folders, candidate) then
-						folder = candidate
-						bare = name:sub(#candidate + 2)
-						break
-					end
-					scan = candidate
-					cut = scan:find("/[^/]*$")
-				end
-				if folder and bare and bare ~= "" then
-					table.insert(draft.sessions, { name = bare, path = paths[name] or "", folder = folder })
-					claimed[name] = true
-					adopted = adopted + 1
-				end
-			end
-		end
-		if adopted == 0 then
-			return
-		end
-		M.board = vim.deepcopy(draft)
-		if workspace_name then
-			M.workspaces[workspace_name] = vim.deepcopy(draft)
-		end
-		M.save_store()
-		vim.notify("tmux: homed " .. adopted .. " orphaned session(s) in their folders", vim.log.levels.INFO)
-	end
-
 	function M.open_workboard()
-		-- Always start from the on-disk truth so sessions created or edited by
-		-- other nvim instances show up, adopt legacy bare names, and home
-		-- orphaned qualified sessions into their folders.
-		M.refresh_from_disk()
-		migrate_qualified()
-		browser.invalidate_live()
 		load_draft()
-		adopt_orphans()
 		-- Open where the user already is: if the current tmux session lives
 		-- in a workspace folder, open that folder and highlight its row.
 		local current = nil
@@ -631,17 +459,11 @@ function M_sub.setup(M)
 		local open_prefix = ""
 		if current then
 			for _, session in ipairs(draft.sessions) do
-				if qualified(session.folder or "", session.name) == current then
+				if session.name == current then
 					open_prefix = session.folder or ""
 					break
 				end
 			end
-		end
-		-- Replace a stale open board instead of focusing it; a buffer with
-		-- unsaved edits wins (the helper focuses it and returns false).
-		if not browser.close_title("Workspace") then
-			vim.notify("tmux: board has unsaved changes (W saves, Q closes)", vim.log.levels.WARN)
-			return
 		end
 		browser.open_level({
 			title_root = workspace_name and ("Workspace: " .. workspace_name) or "Workspace (unsaved)",
@@ -651,20 +473,13 @@ function M_sub.setup(M)
 			render = render,
 			commit = commit,
 			live = live_set,
-			reload = function()
-				M.refresh_from_disk()
-				migrate_qualified()
-				load_draft()
-				adopt_orphans()
-			end,
-			open_session = function(name, path, prefix)
-				local q = qualified(prefix or "", name)
+			open_session = function(name, path)
 				local resolved = path
 				if resolved == "" then
 					resolved = find_session_path(name) or ""
 				end
 				if resolved == "" then
-					resolved = state.get_session_path(q) or ""
+					resolved = state.get_session_path(name) or ""
 				end
 				if resolved == "" then
 					local entered = vim.fn.input("Path for [" .. name .. "]: ", "", "dir")
@@ -674,27 +489,15 @@ function M_sub.setup(M)
 					end
 					resolved = vim.trim(entered)
 				end
-				if not state.session_exists(q) then
+				if not state.session_exists(name) then
 					state.tmux(
 						"new-session -ds "
-							.. vim.fn.shellescape(q)
+							.. vim.fn.shellescape(name)
 							.. " -c "
 							.. vim.fn.shellescape(vim.fn.expand(resolved))
 					)
 				end
-				state.tmux("switch-client -t " .. vim.fn.shellescape(q))
-				-- Opening a folder row makes it a permanent pointer: the
-				-- session is live now, so persist the row (tmux untouched).
-				-- Root rows are left alone; qualified root sessions are homed
-				-- by adopt_orphans instead.
-				if prefix ~= "" and not in_draft(name, prefix) then
-					table.insert(draft.sessions, { name = name, path = resolved, folder = prefix })
-					M.board = vim.deepcopy(draft)
-					if workspace_name then
-						M.workspaces[workspace_name] = vim.deepcopy(draft)
-					end
-					M.save_store()
-				end
+				state.tmux("switch-client -t " .. vim.fn.shellescape(name))
 				browser.invalidate_live()
 				return true
 			end,
@@ -719,9 +522,7 @@ function M_sub.setup(M)
 						end
 						local session = missing[i]
 						browser.pick_path(
-							find_session_path(session.name)
-								or state.get_session_path(qualified(session.folder or "", session.name))
-								or "",
+							find_session_path(session.name) or state.get_session_path(session.name) or "",
 							function(path)
 								if path and path ~= "" then
 									session.path = path
@@ -756,29 +557,27 @@ function M_sub.setup(M)
 					if name == "" then
 						return
 					end
-					local q = qualified(prefix, name)
 					if path == "" then
-						path = find_session_path(name) or state.get_session_path(q) or ""
+						path = find_session_path(name) or state.get_session_path(name) or ""
 					end
 					if path == "" then
 						vim.notify("tmux: no path for '" .. name .. "'", vim.log.levels.WARN)
 						return
 					end
 					path = vim.fn.expand(path)
-					local answer = vim.fn.confirm(
-						"Restart tmux session?\n  " .. q .. "\n  " .. path,
+				local answer = vim.fn.confirm(
+						"Restart tmux session?\n  " .. name .. "\n  " .. path,
 						"&Restart\n&Cancel",
 						1
 					)
 					if answer == 1 then
-						browser.recreate_session(q, path)
+						browser.recreate_session(name, path)
 					end
 				end, { buffer = buf, nowait = true, noremap = true, silent = true, desc = "Restart tmux session" })
 
 				-- A / O toggle panels listing the hidden air / opencode
 				-- sessions that are filtered out of the main window.
-				-- Deleting a row there and saving (W) kills that session;
-				-- r / <C-l> refresh re-reads the live tmux state.
+				-- Deleting a row there and saving (W) kills that session.
 				local function toggle_panel(title, filter)
 					for _, w in ipairs(vim.api.nvim_list_wins()) do
 						local b = vim.api.nvim_win_get_buf(w)
@@ -810,7 +609,6 @@ function M_sub.setup(M)
 						title = title,
 						lines = lines,
 						refresh = function()
-							browser.invalidate_live()
 							return list()
 						end,
 						on_open = function(entry)
@@ -861,15 +659,9 @@ function M_sub.setup(M)
 					if name == "" then
 						return
 					end
-					local q = qualified(prefix, name)
 					if path == "" then
-						path = find_session_path(name) or state.get_session_path(q) or ""
+						path = find_session_path(name) or state.get_session_path(name) or ""
 					end
-					-- The palette entry keeps the bare name and remembers the
-					-- board folder it came from, so launching it later lands
-					-- in the same folder instead of creating a qualified-name
-					-- root row.
-					local entry_folder = prefix ~= "" and prefix or nil
 					local folders = vim.tbl_keys(M.projects)
 					table.sort(folders)
 					local choices = { "(new folder)" }
@@ -889,13 +681,12 @@ function M_sub.setup(M)
 						for _, entry in ipairs(M.projects[target]) do
 							if entry.name == name then
 								entry.path = path
-								entry.folder = entry_folder
 								M.save_store()
 								vim.notify("tmux: updated " .. name .. " in " .. target, vim.log.levels.INFO)
 								return
 							end
 						end
-						table.insert(M.projects[target], { name = name, path = path, folder = entry_folder })
+						table.insert(M.projects[target], { name = name, path = path })
 						M.save_store()
 						vim.notify("tmux: saved " .. name .. " to " .. target, vim.log.levels.INFO)
 					end)
@@ -923,7 +714,6 @@ function M_sub.setup(M)
 			title = "All Tmux Sessions (incl. air)",
 			lines = all,
 			refresh = function()
-				browser.invalidate_live()
 				return vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null")
 			end,
 			on_open = function(entry)

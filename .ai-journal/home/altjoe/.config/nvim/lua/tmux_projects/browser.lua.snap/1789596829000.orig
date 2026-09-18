@@ -1,4 +1,4 @@
--- lua/tmux_projects/browser.lua FINAL-9
+-- lua/tmux_projects/browser.lua FINAL-7
 -- Shared Oil-style level browser built on scratchbuf.
 --
 -- Model (mirrors oil.nvim):
@@ -8,12 +8,10 @@
 --   * <CR> on a session opens it and closes the browser window.
 --   * "-" / <leader>e commit the level and return to the parent; the folder
 --     just left is highlighted so it is obvious where you came from.
---   * <C-l> / r refresh the current level: reload the owner's state, refetch
---     tmux live state, re-render and re-decorate. r and <C-l> are equivalent.
+--   * <C-l> / r refresh the current level; live tmux state is cached.
 --   * dd cuts a session row, gp/gP paste it. Moving a session between folders:
 --     dd at the source level, <CR> into the target folder, gp, W.
---   * <Tab> (normal mode) hops between the name and path parts of a row and
---     opens the path part on a fresh row; insert-mode Tab is left to nvim-cmp.
+--   * <Tab> jumps the cursor between the name and path fields of a row.
 --   * ● marks live sessions with a relative last-activity age (5m, 3h, 2d);
 --     ○ marks saved-but-dead sessions.
 --   * The plugin owning a level provides render/commit/open_session and keeps
@@ -247,7 +245,6 @@ function M.open_level(opts)
 	local prefix = opts.prefix or ""
 	local origin = opts.origin
 	local live = opts.live or M.live_sessions
-	local redecorate = nil
 
 	local function title()
 		if prefix == "" then
@@ -258,19 +255,6 @@ function M.open_level(opts)
 
 	local function render()
 		return opts.render(prefix)
-	end
-
-	-- Reload the owning plugin's state (store, draft) before a refresh. A
-	-- failing reload must not block the refresh itself, so surface the error
-	-- and continue with whatever state is in memory.
-	local function reload_state()
-		if not opts.reload then
-			return
-		end
-		local ok, err = pcall(opts.reload)
-		if not ok then
-			vim.notify("tmux: reload failed: " .. tostring(err), vim.log.levels.ERROR)
-		end
 	end
 
 	local function navigate(child, child_origin)
@@ -302,13 +286,10 @@ function M.open_level(opts)
 		lines = render(),
 		close_on_open = false,
 		refresh = function()
-			reload_state()
-			M.invalidate_live()
-			if redecorate then
-				-- Runs after scratchbuf replaced the lines, so markers, ages
-				-- and highlights survive every refresh path (r, post-save).
-				vim.schedule(redecorate)
+			if opts.reload then
+				opts.reload()
 			end
+			M.invalidate_live()
 			return render()
 		end,
 		on_open = function(line)
@@ -385,9 +366,6 @@ function M.open_level(opts)
 			end
 
 			local function decorate()
-				if not vim.api.nvim_buf_is_valid(buf) then
-					return
-				end
 				vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 				local live_set = live()
 				for row, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
@@ -429,7 +407,6 @@ function M.open_level(opts)
 
 			vim.api.nvim_set_hl(0, "TmuxCurrentSession", { link = "ScratchbufVisual" })
 			vim.api.nvim_set_hl(0, "ScratchbufOrigin", { link = "ScratchbufVisual" })
-			redecorate = decorate
 
 			decorate()
 			local row = current_row() or origin_row()
@@ -460,7 +437,9 @@ function M.open_level(opts)
 			})
 
 			vim.keymap.set("n", "<C-l>", function()
-				reload_state()
+				if opts.reload then
+					opts.reload()
+				end
 				M.invalidate_live()
 				vim.api.nvim_buf_set_lines(buf, 0, -1, false, render())
 				vim.bo[buf].modified = false
@@ -475,42 +454,29 @@ function M.open_level(opts)
 				desc = "Parent level",
 			})
 
-			-- Tab hops between the name and path parts of a row. On a fresh
-			-- row (no separator yet) it opens the path part by appending the
-			-- separator, so a path can never glue onto the name. Insert mode
-			-- is deliberately not mapped: there a bare Tab inserts the
-			-- separator character, or drives nvim-cmp when its menu is open.
-			local function tab_hop()
+			-- Tab jumps between the name and path fields of a session row.
+			local function toggle_field()
 				local line = vim.api.nvim_get_current_line()
-				if line == "" or is_folder(line) then
-					return
-				end
 				local row = vim.api.nvim_win_get_cursor(0)[1]
 				local col = vim.api.nvim_win_get_cursor(0)[2]
 				local ws_start, ws_end = line:find("%s+")
 				if not ws_start then
-					local new = line .. "\t"
-					vim.api.nvim_buf_set_lines(buf, row - 1, row, false, { new })
-					vim.api.nvim_win_set_cursor(0, { row, #new })
-					vim.bo[buf].modified = true
-					decorate()
 					return
 				end
-				local target
-				if col < ws_start - 1 then
-					target = ws_end
-				elseif ws_end >= #line then
-					target = ws_end
-				else
-					target = 0
-				end
+				local target = col < ws_start - 1 and ws_end or 0
 				vim.api.nvim_win_set_cursor(0, { row, target })
 			end
-			vim.keymap.set("n", "<Tab>", tab_hop, {
+			vim.keymap.set("n", "<Tab>", toggle_field, {
 				buffer = buf,
 				nowait = true,
 				noremap = true,
-				desc = "Name/path hop (creates path on a fresh row)",
+				desc = "Toggle name/path",
+			})
+			vim.keymap.set("i", "<Tab>", toggle_field, {
+				buffer = buf,
+				nowait = true,
+				noremap = true,
+				desc = "Toggle name/path",
 			})
 
 			local function paste(above)

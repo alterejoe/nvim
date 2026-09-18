@@ -1,4 +1,4 @@
--- lua/tmux_projects/browser.lua FINAL-9
+-- lua/tmux_projects/browser.lua FINAL-6
 -- Shared Oil-style level browser built on scratchbuf.
 --
 -- Model (mirrors oil.nvim):
@@ -6,16 +6,11 @@
 --     sessions in the "name<TAB>path" format.
 --   * <CR> on a folder commits the level, closes the view and opens the child.
 --   * <CR> on a session opens it and closes the browser window.
---   * "-" / <leader>e commit the level and return to the parent; the folder
---     just left is highlighted so it is obvious where you came from.
---   * <C-l> / r refresh the current level: reload the owner's state, refetch
---     tmux live state, re-render and re-decorate. r and <C-l> are equivalent.
+--   * "-" / <leader>e commit the level and return to the parent.
+--   * <C-l> / r refresh the current level; live tmux state is cached.
 --   * dd cuts a session row, gp/gP paste it. Moving a session between folders:
 --     dd at the source level, <CR> into the target folder, gp, W.
---   * <Tab> (normal mode) hops between the name and path parts of a row and
---     opens the path part on a fresh row; insert-mode Tab is left to nvim-cmp.
---   * ● marks live sessions with a relative last-activity age (5m, 3h, 2d);
---     ○ marks saved-but-dead sessions.
+--   * <Tab> jumps the cursor between the name and path fields of a row.
 --   * The plugin owning a level provides render/commit/open_session and keeps
 --     all state; this module only handles navigation and presentation.
 
@@ -26,33 +21,11 @@ local M = {}
 local live_cache = nil
 local dir_cache = nil
 
--- Relative age for a tmux session_activity timestamp: "now", "5m", "3h", "2d".
-function M.fmt_age(ts)
-	local t = tonumber(ts)
-	if not t or t <= 0 then
-		return ""
-	end
-	local age = os.time() - t
-	if age < 60 then
-		return "now"
-	elseif age < 3600 then
-		return math.floor(age / 60) .. "m"
-	elseif age < 86400 then
-		return math.floor(age / 3600) .. "h"
-	end
-	return math.floor(age / 86400) .. "d"
-end
-
--- Live sessions with their last-activity stamp:
---   { [name] = { activity = <unix seconds> } }
 function M.live_sessions()
 	if not live_cache then
 		live_cache = {}
-		for _, line in ipairs(vim.fn.systemlist("tmux list-sessions -F '#S|#{session_activity}' 2>/dev/null")) do
-			local name, activity = line:match("^([^|]+)|(.*)$")
-			if name and name ~= "" then
-				live_cache[name] = { activity = tonumber(activity) }
-			end
+		for _, name in ipairs(vim.fn.systemlist("tmux list-sessions -F '#S' 2>/dev/null")) do
+			live_cache[name] = true
 		end
 	end
 	return live_cache
@@ -60,50 +33,6 @@ end
 
 function M.invalidate_live()
 	live_cache = nil
-end
-
--- Close scratchbuf windows whose title starts with one of the given prefixes.
--- Returns false (focusing the offending window) when a buffer holds unsaved
--- changes, so callers warn instead of silently discarding edits.
-function M.close_title(prefixes)
-	if type(prefixes) == "string" then
-		prefixes = { prefixes }
-	end
-	local function matches(title)
-		for _, prefix in ipairs(prefixes) do
-			if vim.startswith(title, prefix) then
-				return true
-			end
-		end
-		return false
-	end
-	local found = {}
-	for _, w in ipairs(vim.api.nvim_list_wins()) do
-		local b = vim.api.nvim_win_get_buf(w)
-		local title = vim.b[b]._scratchbuf
-		if title and matches(title) then
-			if vim.bo[b].modified then
-				vim.api.nvim_set_current_win(w)
-				return false
-			end
-			table.insert(found, { win = w, buf = b })
-		end
-	end
-	for _, entry in ipairs(found) do
-		if vim.api.nvim_win_is_valid(entry.win) then
-			local closed = pcall(vim.api.nvim_win_close, entry.win, true)
-			if not closed and vim.api.nvim_buf_is_valid(entry.buf) then
-				-- Last window in the tabpage: swap the buffer out so it can
-				-- be discarded; the reopen fills the window again.
-				local scratch = vim.api.nvim_create_buf(true, true)
-				pcall(vim.api.nvim_win_set_buf, entry.win, scratch)
-			end
-		end
-		if vim.api.nvim_buf_is_valid(entry.buf) then
-			pcall(vim.api.nvim_buf_delete, entry.buf, { force = true })
-		end
-	end
-	return true
 end
 
 -- Switch the client to a nvim session (never opencode/air/browser/devproxy),
@@ -245,9 +174,7 @@ end
 
 function M.open_level(opts)
 	local prefix = opts.prefix or ""
-	local origin = opts.origin
 	local live = opts.live or M.live_sessions
-	local redecorate = nil
 
 	local function title()
 		if prefix == "" then
@@ -260,24 +187,8 @@ function M.open_level(opts)
 		return opts.render(prefix)
 	end
 
-	-- Reload the owning plugin's state (store, draft) before a refresh. A
-	-- failing reload must not block the refresh itself, so surface the error
-	-- and continue with whatever state is in memory.
-	local function reload_state()
-		if not opts.reload then
-			return
-		end
-		local ok, err = pcall(opts.reload)
-		if not ok then
-			vim.notify("tmux: reload failed: " .. tostring(err), vim.log.levels.ERROR)
-		end
-	end
-
-	local function navigate(child, child_origin)
-		local next_opts = vim.tbl_extend("force", opts, { prefix = child })
-		-- Assigning nil removes the key, so origin never leaks across levels.
-		next_opts.origin = child_origin
-		M.open_level(next_opts)
+	local function navigate(child)
+		M.open_level(vim.tbl_extend("force", opts, { prefix = child }))
 	end
 
 	-- prompt_paths is true only for explicit saves (W), so navigation never
@@ -290,10 +201,10 @@ function M.open_level(opts)
 		return ok
 	end
 
-	local function leave(buf, target, target_origin)
+	local function leave(buf, target)
 		vim.schedule(function()
 			close_view(buf)
-			navigate(target, target_origin)
+			navigate(target)
 		end)
 	end
 
@@ -302,13 +213,7 @@ function M.open_level(opts)
 		lines = render(),
 		close_on_open = false,
 		refresh = function()
-			reload_state()
 			M.invalidate_live()
-			if redecorate then
-				-- Runs after scratchbuf replaced the lines, so markers, ages
-				-- and highlights survive every refresh path (r, post-save).
-				vim.schedule(redecorate)
-			end
 			return render()
 		end,
 		on_open = function(line)
@@ -349,9 +254,7 @@ function M.open_level(opts)
 			local ns = vim.api.nvim_create_namespace("tmux_browser_" .. buf)
 
 			-- Row of the session we are currently attached to (opts.current),
-			-- if it lives at this level. Sessions are addressed by their
-			-- folder-qualified tmux name, so qualify the row the same way.
-			-- Used to highlight + focus it.
+			-- if it lives at this level. Used to highlight + focus it.
 			local function current_row()
 				if not opts.current or opts.current == "" then
 					return nil
@@ -360,8 +263,7 @@ function M.open_level(opts)
 					local text = vim.trim(line)
 					if text ~= "" and not is_folder(text) then
 						local name = text:match("^(.-)%s") or text
-						local qualified = prefix ~= "" and (prefix .. "/" .. name) or name
-						if qualified == opts.current then
+						if name == opts.current then
 							return row
 						end
 					end
@@ -369,25 +271,7 @@ function M.open_level(opts)
 				return nil
 			end
 
-			-- Row of the folder we just came up from (opts.origin), if shown
-			-- at this level. Highlighted so the user keeps their bearings.
-			local function origin_row()
-				if not origin or origin == "" then
-					return nil
-				end
-				local wanted = origin .. "/"
-				for row, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
-					if vim.trim(line) == wanted then
-						return row
-					end
-				end
-				return nil
-			end
-
 			local function decorate()
-				if not vim.api.nvim_buf_is_valid(buf) then
-					return
-				end
 				vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 				local live_set = live()
 				for row, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
@@ -397,29 +281,14 @@ function M.open_level(opts)
 							vim.api.nvim_buf_add_highlight(buf, ns, "Directory", row - 1, 0, -1)
 						else
 							local name = text:match("^(.-)%s") or text
-							local meta = live_set[name]
-							if meta then
-								local chunks = { { " ●", "DiagnosticOk" } }
-								local age = type(meta) == "table" and M.fmt_age(meta.activity) or ""
-								if age ~= "" then
-									table.insert(chunks, { " " .. age, "Comment" })
-								end
-								vim.api.nvim_buf_set_extmark(buf, ns, row - 1, 0, {
-									virt_text = chunks,
-									virt_text_pos = "eol",
-								})
-							else
-								vim.api.nvim_buf_set_extmark(buf, ns, row - 1, 0, {
-									virt_text = { { " ○", "Comment" } },
-									virt_text_pos = "eol",
-								})
-							end
+							local marker = live_set[name] and " ●" or " ○"
+							local hl = live_set[name] and "DiagnosticOk" or "Comment"
+							vim.api.nvim_buf_set_extmark(buf, ns, row - 1, 0, {
+								virt_text = { { marker, hl } },
+								virt_text_pos = "eol",
+							})
 						end
 					end
-				end
-				local orow = origin_row()
-				if orow then
-					vim.api.nvim_buf_add_highlight(buf, ns, "ScratchbufOrigin", orow - 1, 0, -1)
 				end
 				local row = current_row()
 				if row then
@@ -428,11 +297,9 @@ function M.open_level(opts)
 			end
 
 			vim.api.nvim_set_hl(0, "TmuxCurrentSession", { link = "ScratchbufVisual" })
-			vim.api.nvim_set_hl(0, "ScratchbufOrigin", { link = "ScratchbufVisual" })
-			redecorate = decorate
 
 			decorate()
-			local row = current_row() or origin_row()
+			local row = current_row()
 			if row and win and vim.api.nvim_win_is_valid(win) then
 				pcall(vim.api.nvim_win_set_cursor, win, { row, 0 })
 			end
@@ -447,8 +314,7 @@ function M.open_level(opts)
 					return
 				end
 				if commit(buf, false) then
-					-- The child we are leaving becomes the highlight target.
-					leave(buf, parent, prefix:match("([^/]+)$"))
+					leave(buf, parent)
 				end
 			end
 
@@ -460,7 +326,6 @@ function M.open_level(opts)
 			})
 
 			vim.keymap.set("n", "<C-l>", function()
-				reload_state()
 				M.invalidate_live()
 				vim.api.nvim_buf_set_lines(buf, 0, -1, false, render())
 				vim.bo[buf].modified = false
@@ -475,42 +340,29 @@ function M.open_level(opts)
 				desc = "Parent level",
 			})
 
-			-- Tab hops between the name and path parts of a row. On a fresh
-			-- row (no separator yet) it opens the path part by appending the
-			-- separator, so a path can never glue onto the name. Insert mode
-			-- is deliberately not mapped: there a bare Tab inserts the
-			-- separator character, or drives nvim-cmp when its menu is open.
-			local function tab_hop()
+			-- Tab jumps between the name and path fields of a session row.
+			local function toggle_field()
 				local line = vim.api.nvim_get_current_line()
-				if line == "" or is_folder(line) then
-					return
-				end
 				local row = vim.api.nvim_win_get_cursor(0)[1]
 				local col = vim.api.nvim_win_get_cursor(0)[2]
 				local ws_start, ws_end = line:find("%s+")
 				if not ws_start then
-					local new = line .. "\t"
-					vim.api.nvim_buf_set_lines(buf, row - 1, row, false, { new })
-					vim.api.nvim_win_set_cursor(0, { row, #new })
-					vim.bo[buf].modified = true
-					decorate()
 					return
 				end
-				local target
-				if col < ws_start - 1 then
-					target = ws_end
-				elseif ws_end >= #line then
-					target = ws_end
-				else
-					target = 0
-				end
+				local target = col < ws_start - 1 and ws_end or 0
 				vim.api.nvim_win_set_cursor(0, { row, target })
 			end
-			vim.keymap.set("n", "<Tab>", tab_hop, {
+			vim.keymap.set("n", "<Tab>", toggle_field, {
 				buffer = buf,
 				nowait = true,
 				noremap = true,
-				desc = "Name/path hop (creates path on a fresh row)",
+				desc = "Toggle name/path",
+			})
+			vim.keymap.set("i", "<Tab>", toggle_field, {
+				buffer = buf,
+				nowait = true,
+				noremap = true,
+				desc = "Toggle name/path",
 			})
 
 			local function paste(above)

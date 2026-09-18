@@ -1,4 +1,4 @@
--- lua/tmux_projects/projects.lua FINAL-13
+-- lua/tmux_projects/projects.lua FINAL-12
 -- Tmux palette: saved sessions, folders and workspaces (<leader>tp).
 --
 -- The palette is a launcher, not a session holder. Enter on a session or
@@ -14,11 +14,9 @@
 -- path changed. Folders are independent lists: the same name may live in
 -- several folders (they resolve to the same tmux session), and creating a row
 -- never deletes another. Removing a row or folder kills its tmux session only
--- on explicit save (W), never on navigation. Entries saved from the board (+)
--- remember the board folder they came from, and launching them here hands
--- them back to that folder. Opening the palette re-reads the store and
--- replaces a stale window instead of focusing it; r / <C-l> refresh re-reads
--- the store too.
+-- on explicit save (W), never on navigation. Opening the palette re-reads the
+-- store and replaces a stale window instead of focusing it; r / <C-l> refresh
+-- re-reads the store too.
 
 local state = require("tmux_projects.state")
 local browser = require("tmux_projects.browser")
@@ -169,9 +167,6 @@ function M_sub.setup(M)
 						table.insert(new_sessions, {
 							name = name,
 							path = path ~= "" and path or (old and old.path or ""),
-							-- The board folder this entry came from (set by
-							-- the board's + key), carried across edits.
-							folder = old and old.folder,
 						})
 					end
 				end
@@ -242,9 +237,8 @@ function M_sub.setup(M)
 	end
 
 	-- Launch a saved session into the board: create it if missing, hand it to
-	-- the board with its remembered folder, and let the board open in the
-	-- palette's place.
-	local function open_saved_session(name, path, folder)
+	-- the board, and let the board open in the palette's place.
+	local function open_saved_session(name, path)
 		local resolved = path
 		if resolved == "" then
 			resolved = find_session_path(name) or ""
@@ -260,7 +254,7 @@ function M_sub.setup(M)
 		if not state.session_exists(name) then
 			state.tmux("new-session -ds " .. shell(name) .. " -c " .. shell(vim.fn.expand(resolved)))
 		end
-		M.add_to_board(name, resolved, folder or "")
+		M.add_to_board(name, resolved)
 		browser.invalidate_live()
 		return true
 	end
@@ -373,18 +367,7 @@ function M_sub.setup(M)
 				if prefix == "workspaces" then
 					ok = open_workspace(name)
 				else
-					-- Hand the board the folder this entry was saved from, so
-					-- the session lands back in its folder (bare name + folder
-					-- instead of a qualified-name root row).
-					local key = is_project_level(prefix) and project_key(prefix) or ""
-					local folder = ""
-					for _, entry in ipairs(M.projects[key] or {}) do
-						if entry.name == name then
-							folder = entry.folder or ""
-							break
-						end
-					end
-					ok = open_saved_session(name, path, folder)
+					ok = open_saved_session(name, path)
 				end
 				if ok then
 					-- Hand off to the board: it opens after the palette closes.

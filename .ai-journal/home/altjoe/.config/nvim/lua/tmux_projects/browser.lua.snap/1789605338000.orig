@@ -1,4 +1,4 @@
--- lua/tmux_projects/browser.lua FINAL-9
+-- lua/tmux_projects/browser.lua FINAL-8
 -- Shared Oil-style level browser built on scratchbuf.
 --
 -- Model (mirrors oil.nvim):
@@ -12,8 +12,7 @@
 --     tmux live state, re-render and re-decorate. r and <C-l> are equivalent.
 --   * dd cuts a session row, gp/gP paste it. Moving a session between folders:
 --     dd at the source level, <CR> into the target folder, gp, W.
---   * <Tab> (normal mode) hops between the name and path parts of a row and
---     opens the path part on a fresh row; insert-mode Tab is left to nvim-cmp.
+--   * <Tab> jumps the cursor between the name and path fields of a row.
 --   * ● marks live sessions with a relative last-activity age (5m, 3h, 2d);
 --     ○ marks saved-but-dead sessions.
 --   * The plugin owning a level provides render/commit/open_session and keeps
@@ -475,42 +474,29 @@ function M.open_level(opts)
 				desc = "Parent level",
 			})
 
-			-- Tab hops between the name and path parts of a row. On a fresh
-			-- row (no separator yet) it opens the path part by appending the
-			-- separator, so a path can never glue onto the name. Insert mode
-			-- is deliberately not mapped: there a bare Tab inserts the
-			-- separator character, or drives nvim-cmp when its menu is open.
-			local function tab_hop()
+			-- Tab jumps between the name and path fields of a session row.
+			local function toggle_field()
 				local line = vim.api.nvim_get_current_line()
-				if line == "" or is_folder(line) then
-					return
-				end
 				local row = vim.api.nvim_win_get_cursor(0)[1]
 				local col = vim.api.nvim_win_get_cursor(0)[2]
 				local ws_start, ws_end = line:find("%s+")
 				if not ws_start then
-					local new = line .. "\t"
-					vim.api.nvim_buf_set_lines(buf, row - 1, row, false, { new })
-					vim.api.nvim_win_set_cursor(0, { row, #new })
-					vim.bo[buf].modified = true
-					decorate()
 					return
 				end
-				local target
-				if col < ws_start - 1 then
-					target = ws_end
-				elseif ws_end >= #line then
-					target = ws_end
-				else
-					target = 0
-				end
+				local target = col < ws_start - 1 and ws_end or 0
 				vim.api.nvim_win_set_cursor(0, { row, target })
 			end
-			vim.keymap.set("n", "<Tab>", tab_hop, {
+			vim.keymap.set("n", "<Tab>", toggle_field, {
 				buffer = buf,
 				nowait = true,
 				noremap = true,
-				desc = "Name/path hop (creates path on a fresh row)",
+				desc = "Toggle name/path",
+			})
+			vim.keymap.set("i", "<Tab>", toggle_field, {
+				buffer = buf,
+				nowait = true,
+				noremap = true,
+				desc = "Toggle name/path",
 			})
 
 			local function paste(above)

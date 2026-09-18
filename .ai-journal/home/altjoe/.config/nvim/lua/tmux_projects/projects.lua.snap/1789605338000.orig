@@ -1,4 +1,4 @@
--- lua/tmux_projects/projects.lua FINAL-13
+-- lua/tmux_projects/projects.lua FINAL-11
 -- Tmux palette: saved sessions, folders and workspaces (<leader>tp).
 --
 -- The palette is a launcher, not a session holder. Enter on a session or
@@ -11,14 +11,10 @@
 --
 -- Folders are edited Oil-style: change the text, W to apply. W prompts for
 -- missing session paths via a fuzzy picker and recreates live sessions whose
--- path changed. Folders are independent lists: the same name may live in
--- several folders (they resolve to the same tmux session), and creating a row
--- never deletes another. Removing a row or folder kills its tmux session only
--- on explicit save (W), never on navigation. Entries saved from the board (+)
--- remember the board folder they came from, and launching them here hands
--- them back to that folder. Opening the palette re-reads the store and
--- replaces a stale window instead of focusing it; r / <C-l> refresh re-reads
--- the store too.
+-- path changed. A session lives in exactly one palette folder. Deleting a
+-- folder or a session row deletes it in tmux too. Opening the palette
+-- re-reads the store and replaces a stale window instead of focusing it;
+-- r / <C-l> refresh re-reads the store too.
 
 local state = require("tmux_projects.state")
 local browser = require("tmux_projects.browser")
@@ -69,9 +65,8 @@ function M_sub.setup(M)
 		return folders
 	end
 
-	-- Delete a folder tree. Its sessions are killed only when `kill` is set
-	-- (explicit save); navigation commits just drop the entries.
-	local function delete_tree(key, kill)
+	-- Delete a folder tree and kill the tmux sessions of its sessions.
+	local function delete_tree(key)
 		local doomed = {}
 		for name in pairs(M.projects) do
 			if name == key or vim.startswith(name, key .. "/") then
@@ -85,15 +80,13 @@ function M_sub.setup(M)
 			end
 			M.projects[name] = nil
 		end
-		if kill then
-			for _, entry in ipairs(sessions_to_kill) do
-				if state.session_exists(entry.name) then
-					state.tmux("kill-session -t " .. shell(entry.name))
-				end
+		for _, entry in ipairs(sessions_to_kill) do
+			if state.session_exists(entry.name) then
+				state.tmux("kill-session -t " .. shell(entry.name))
 			end
-			if #sessions_to_kill > 0 then
-				browser.invalidate_live()
-			end
+		end
+		if #sessions_to_kill > 0 then
+			browser.invalidate_live()
 		end
 	end
 
@@ -169,28 +162,37 @@ function M_sub.setup(M)
 						table.insert(new_sessions, {
 							name = name,
 							path = path ~= "" and path or (old and old.path or ""),
-							-- The board folder this entry came from (set by
-							-- the board's + key), carried across edits.
-							folder = old and old.folder,
 						})
 					end
 				end
 			end
 		end
 
-		-- Same-name entries in other palette folders are left alone: folders
-		-- are independent lists, and a shared name resolves to the same tmux
-		-- session, so creating a row never deletes another.
+		-- A session lives in exactly one palette folder: drop same-name
+		-- entries from every other folder so moves/creates never duplicate.
 		local new_names = {}
 		for _, session in ipairs(new_sessions) do
 			new_names[session.name] = true
 		end
 
-		-- Sessions removed from this level (killed only on explicit saves).
+		-- Sessions deleted at this level are killed in tmux too, so they do
+		-- not reappear at the board root as live sessions.
 		local deleted_sessions = {}
 		for name, old in pairs(old_by_name) do
 			if not new_names[name] then
 				table.insert(deleted_sessions, old)
+			end
+		end
+
+		for other_key, entries in pairs(M.projects) do
+			if other_key ~= key then
+				local filtered = {}
+				for _, entry in ipairs(entries) do
+					if not new_names[entry.name] then
+						table.insert(filtered, entry)
+					end
+				end
+				M.projects[other_key] = filtered
 			end
 		end
 
@@ -208,7 +210,7 @@ function M_sub.setup(M)
 		for _, child_name in ipairs(old_children) do
 			local child = key == "" and child_name or (key .. "/" .. child_name)
 			if not kept_folders[child] then
-				delete_tree(child, prompt_paths)
+				delete_tree(child)
 			end
 		end
 		for child in pairs(kept_folders) do
@@ -216,17 +218,13 @@ function M_sub.setup(M)
 		end
 		M.save_store()
 
-		-- Only an explicit save (W) kills the sessions of removed rows;
-		-- navigation commits just update the list.
-		if prompt_paths then
-			for _, session in ipairs(deleted_sessions) do
-				if state.session_exists(session.name) then
-					state.tmux("kill-session -t " .. shell(session.name))
-				end
+		for _, session in ipairs(deleted_sessions) do
+			if state.session_exists(session.name) then
+				state.tmux("kill-session -t " .. shell(session.name))
 			end
-			if #deleted_sessions > 0 then
-				browser.invalidate_live()
-			end
+		end
+		if #deleted_sessions > 0 then
+			browser.invalidate_live()
 		end
 		return true
 	end
@@ -242,9 +240,8 @@ function M_sub.setup(M)
 	end
 
 	-- Launch a saved session into the board: create it if missing, hand it to
-	-- the board with its remembered folder, and let the board open in the
-	-- palette's place.
-	local function open_saved_session(name, path, folder)
+	-- the board, and let the board open in the palette's place.
+	local function open_saved_session(name, path)
 		local resolved = path
 		if resolved == "" then
 			resolved = find_session_path(name) or ""
@@ -260,7 +257,7 @@ function M_sub.setup(M)
 		if not state.session_exists(name) then
 			state.tmux("new-session -ds " .. shell(name) .. " -c " .. shell(vim.fn.expand(resolved)))
 		end
-		M.add_to_board(name, resolved, folder or "")
+		M.add_to_board(name, resolved)
 		browser.invalidate_live()
 		return true
 	end
@@ -373,18 +370,7 @@ function M_sub.setup(M)
 				if prefix == "workspaces" then
 					ok = open_workspace(name)
 				else
-					-- Hand the board the folder this entry was saved from, so
-					-- the session lands back in its folder (bare name + folder
-					-- instead of a qualified-name root row).
-					local key = is_project_level(prefix) and project_key(prefix) or ""
-					local folder = ""
-					for _, entry in ipairs(M.projects[key] or {}) do
-						if entry.name == name then
-							folder = entry.folder or ""
-							break
-						end
-					end
-					ok = open_saved_session(name, path, folder)
+					ok = open_saved_session(name, path)
 				end
 				if ok then
 					-- Hand off to the board: it opens after the palette closes.

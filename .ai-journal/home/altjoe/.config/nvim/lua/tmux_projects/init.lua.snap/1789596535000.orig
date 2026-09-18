@@ -1,4 +1,4 @@
--- lua/tmux_projects/init.lua FINAL-4
+-- lua/tmux_projects/init.lua FINAL-3
 -- Entry point and persistence for the tmux palette + workspace board.
 --
 -- The JSON store is authoritative once created:
@@ -8,8 +8,6 @@
 --   board      : the unnamed workspace board state (persisted on W)
 --
 -- Legacy flat group maps are migrated to the new shape on first load.
--- Every nvim instance shares the same file; refresh_from_disk() re-reads it
--- so board/palette opens never render stale data.
 
 local M = {}
 
@@ -176,22 +174,6 @@ function M.setup(opts)
 	end
 
 	M.project_order = ordered_group_names(M.projects, opts.project_order)
-end
-
--- Re-read the store from disk and replace the in-memory view. Other nvim
--- instances write the same file; board and palette opens call this so their
--- views never render stale data. On a missing or invalid file the in-memory
--- state is kept (returns false).
-function M.refresh_from_disk()
-	local stored = read_store()
-	if not stored or not (stored.projects or stored.workspaces) then
-		return false
-	end
-	M.projects = stored.projects or {}
-	M.workspaces = stored.workspaces or {}
-	M.board = stored.board or { folders = {}, sessions = {} }
-	M.project_order = ordered_group_names(M.projects, M.project_order)
-	return true
 end
 
 require("tmux_projects.projects").setup(M)

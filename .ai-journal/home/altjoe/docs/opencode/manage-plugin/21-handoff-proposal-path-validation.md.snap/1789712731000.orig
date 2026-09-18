@@ -1,0 +1,72 @@
+# /home/altjoe/docs/opencode/manage-plugin/21-handoff-proposal-path-validation.md FINAL
+---
+title: 21 - Handoff: proposal path validation (absolute + update existence)
+status: handoff
+links: [03-proposals, 11-nvim-companion, 18-staged-workflow]
+---
+
+# Handoff - proposal path validation
+
+## Goal
+emit_proposal must never queue a proposal whose applied target is not the
+intended file. Require absolute paths at emit time and validate the target on
+disk before queuing; the nvim apply side must fail closed.
+
+## Instructions
+- Full-file proposals only, through emit_proposal; never edit files directly.
+- Scope: ~/.config/opencode/plugins/* and ~/.config/nvim/lua/opencode-manage/*.
+- Do not touch the volleyball-new tree; the orphaned web/web/ copies are
+  evidence only and are cleaned up by the volleyball session.
+- Verify with a real emit + nvim apply; reasoning alone is not evidence.
+
+## Root cause (verified 2026-09-13, volleyball-new)
+1. Session root was /home/altjoe/projects/volleyball-new/web, so the queue
+   lived at web/.ai-proposals/<session>.jsonl.
+2. emit_proposal accepted "Absolute or project-relative" (manage.ts ~344-346)
+   and recorded args.path verbatim (~412); lib/proposals.ts appendProposal
+   validates nothing.
+3. The nvim apply side joined the relative path to the queue's project dir:
+   reviewview/render.lua resolve_path() line 24
+   (fnamemodify(p._file, ":h:h") .. "/" .. p.path);
+   proposals.lua resolve_path() (~190-197) uses vim.fn.getcwd().
+4. proposals.lua M.accept (225-240) unconditionally mkdir -p + writefile, so a
+   replace/edit_range proposal against the wrong path silently CREATED
+   .../web/web/... instead of updating the real file.
+
+Evidence: web/web/{cmd/routes.go, internal/handlers/players/players.go,
+internal/app/{state.go,state_accessors.go}, ui/html/layouts/skeleton_templ.go,
+ui/html/players/{page.templ,page_templ.go}} - their path comments claim the
+non-nested paths, and the live web/ tree was never updated. The same session
+left 13 pending flattening proposals in web/.ai-proposals/ that must not be
+applied.
+
+## Required behavior
+- R1: path must be absolute. Reject non-absolute with a REQUIREMENTS-style
+  error naming the workspace root and instructing re-emit; append nothing.
+- R2: update ops (replace, edit_range, delete) require the target to exist on
+  disk. Missing target = error, never a silent create.
+- R3: create requires the target to be absent and the parent dir to exist.
+- R4: containment - the resolved target must live under the session workspace
+  root (directory).
+- R5: nvim fails closed - accept for update ops aborts visibly when the target
+  is not filereadable; only create may mkdir parents.
+- R6: normalize before registry matching - matchesSharedPath (registry.ts
+  ~79-90) string-matches project-relative registry paths; convert
+  absolute -> relative(directory, abs) or shared modules stop being detected.
+- R7: update the tool schema/description (manage.ts ~344-346) and doc 03 so no
+  surface still advertises project-relative paths.
+
+## Files to inspect
+- /home/altjoe/.config/opencode/plugins/manage.ts (emit_proposal ~330-444)
+- /home/altjoe/.config/opencode/plugins/lib/proposals.ts (appendProposal)
+- /home/altjoe/.config/opencode/plugins/lib/registry.ts (matchesSharedPath ~79-90)
+- /home/altjoe/.config/nvim/lua/opencode-manage/reviewview/render.lua (resolve_path 19-27)
+- /home/altjoe/.config/nvim/lua/opencode-manage/reviewview/actions.lua (ensure_dirs 11-26)
+- /home/altjoe/.config/nvim/lua/opencode-manage/proposals.lua (resolve_path ~190-197, accept 225-240)
+
+## Verification
+1. emit_proposal with a relative path -> error; queue line count unchanged.
+2. emit replace, absolute path, missing file -> error; existing file -> queued.
+3. emit create on an existing file -> error; new file in an existing dir -> queued.
+4. nvim accept a replace -> only the real file changes; no directories created.
+5. Hand-crafted legacy relative proposal -> accept aborts with a visible message.
