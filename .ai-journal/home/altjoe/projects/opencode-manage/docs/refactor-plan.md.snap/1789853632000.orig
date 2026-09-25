@@ -1,0 +1,75 @@
+# /home/altjoe/projects/opencode-manage/docs/refactor-plan.md FINAL
+
+# Refactor plan — TS composition split and Go core boundary
+
+## Status
+
+PROPOSED. This plan follows the verified current behavior in the documentation
+baseline. It does not change the plugin or nvim apply path by itself.
+
+## Preconditions
+
+1. Apply the `manage-plugin-docs` group so the 14-document baseline is the
+   source of truth.
+2. Apply the `tripwire-fix` group so `manage.ts` passes `content` into
+   `validateProposalTarget`, the self-test exists, and ISSUE-003 records the
+   applied state.
+3. Restart opencode so the running plugin loads the applied tripwire change.
+4. If a TypeScript runner is available, run `bun run lib/proposals.selftest.ts`;
+   a missing runner is optional and must not block this Go extraction.
+
+## M1 — proposal target validation
+
+### Goal
+
+Extract the pure, fail-closed target-validation contract into Go while leaving
+JSONL queue writing in the existing TypeScript module. The Go package must not
+write target files, create directories, or depend on the nvim apply side.
+
+### Files
+
+- `go.mod` — module `github.com/alterejoe/opencode-manage`.
+- `internal/proposals/validate.go` — `Proposal`, `ValidationResult`, and
+  `ValidateProposalTarget`.
+- `internal/proposals/proposals_test.go` — six regression cases.
+
+### Contract
+
+`ValidateProposalTarget` mirrors the documented TypeScript validator:
+
+1. Trim and require a non-empty absolute path (R1).
+2. Reject content whose leading whitespace is followed by `[evicted:` (C4).
+3. Default an empty operation to `replace`.
+4. For `create`, reject an existing target (R3); missing parents are allowed.
+5. For every other operation, require an existing target (R2).
+6. For a valid `create`, return missing parent directories shallowest first;
+   computing them must not create them.
+
+Errors retain actionable messages with the important terms used by the
+regression tests: `ABSOLUTE`, `C4 eviction stub`, `requires the target to
+exist`, and `already exists`.
+
+### Regression cases
+
+The test suite covers:
+
+1. Exact ISSUE-003 stub payload is refused.
+2. Stub payload after leading whitespace is refused.
+3. Relative path is refused.
+4. Update operation on a missing target is refused.
+5. Create operation on an existing target is refused.
+6. Normal create succeeds and returns shallowest-first `mkdirs`.
+
+### M1 done
+
+`go test ./...` is green. No queue writer, TS composition split, nvim apply
+change, deployment, `woodpecker apply`, or `deploy-web-local` work is included
+in M1.
+
+## Follow-up slices
+
+- M2: move the JSONL row shape and queue append behind a thin adapter, with
+  parity tests against the existing TS behavior.
+- M3: split `manage.ts` into composition-root wiring and focused hook/tool
+  modules, preserving the plugin V1 export and fail-open/fail-closed split.
+- M4: add cross-language parity checks before changing runtime ownership.

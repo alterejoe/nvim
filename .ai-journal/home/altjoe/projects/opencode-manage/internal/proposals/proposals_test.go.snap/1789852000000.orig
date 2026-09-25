@@ -1,0 +1,104 @@
+// /home/altjoe/projects/opencode-manage/internal/proposals/proposals_test.go FINAL-2
+package proposals
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestValidateProposalTargetRegressionCases(t *testing.T) {
+	root := t.TempDir()
+	existing := filepath.Join(root, "existing.md")
+	if err := os.WriteFile(existing, []byte("existing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		proposal   Proposal
+		wantError  string
+		wantMkdirs []string
+	}{
+		{
+			name: "stub payload refused",
+			proposal: Proposal{
+				Path:      filepath.Join(root, "stub.md"),
+				Operation: "create",
+				Content:   "[evicted: emit_proposal payload for /tmp/x — reviewed/applied; the file on disk and the journal are the truth]",
+			},
+			wantError: "C4 eviction stub",
+		},
+		{
+			name: "stub payload with leading whitespace refused",
+			proposal: Proposal{
+				Path:      filepath.Join(root, "stub-whitespace.md"),
+				Operation: "create",
+				Content:   "\n\n[evicted: probe]",
+			},
+			wantError: "C4 eviction stub",
+		},
+		{
+			name: "relative path refused",
+			proposal: Proposal{
+				Path:      "web/ui/some.templ",
+				Operation: "replace",
+				Content:   "x",
+			},
+			wantError: "ABSOLUTE",
+		},
+		{
+			name: "update on missing target refused",
+			proposal: Proposal{
+				Path:      filepath.Join(root, "does-not-exist.md"),
+				Operation: "replace",
+				Content:   "x",
+			},
+			wantError: "requires the target to exist",
+		},
+		{
+			name: "create on existing target refused",
+			proposal: Proposal{
+				Path:      existing,
+				Operation: "create",
+				Content:   "x",
+			},
+			wantError: "already exists",
+		},
+		{
+			name: "valid create returns mkdirs",
+			proposal: Proposal{
+				Path:      filepath.Join(root, "new", "nested", "payload.md"),
+				Operation: "create",
+				Content:   "# normal payload\n",
+			},
+			wantMkdirs: []string{
+				filepath.Join(root, "new"),
+				filepath.Join(root, "new", "nested"),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := ValidateProposalTarget(test.proposal)
+			if test.wantError != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q", test.wantError)
+				}
+				if !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error %q does not contain %q", err, test.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+			if !reflect.DeepEqual(got.Mkdirs, test.wantMkdirs) {
+				t.Fatalf("mkdirs = %v, want %v", got.Mkdirs, test.wantMkdirs)
+			}
+		})
+	}
+}

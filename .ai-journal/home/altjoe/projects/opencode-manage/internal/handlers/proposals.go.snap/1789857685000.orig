@@ -1,0 +1,177 @@
+// /home/altjoe/projects/opencode-manage/internal/handlers/proposals.go FINAL-2
+// Package handlers holds the daemon's HTTP handlers.
+// M6: proposals endpoints. M7: event recording middleware + rollup.
+package handlers
+
+import (
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/alterejoe/opencode-manage/internal/proposals"
+	"github.com/alterejoe/opencode-manage/internal/store"
+)
+
+// Mount registers all /v1 endpoints on the router.
+func Mount(r chi.Router, db *sql.DB) {
+	q := store.New(db)
+	r.Use(eventRecorder(q))
+
+	r.Post("/v1/proposals/validate", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Path      string `json:"path"`
+			Operation string `json:"operation"`
+			Content   string `json:"content"`
+		}
+		if err := decode(w, r, &req); err != nil {
+			return
+		}
+		res, err := proposals.ValidateProposalTarget(proposals.Proposal{
+			Path:      req.Path,
+			Operation: req.Operation,
+			Content:   req.Content,
+		})
+		if err != nil {
+			fail(w, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mkdirs": res.Mkdirs})
+	})
+
+	r.Post("/v1/proposals", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Directory string          `json:"directory"`
+			SessionID string          `json:"session_id"`
+			Row       json.RawMessage `json:"row"`
+		}
+		if err := decode(w, r, &req); err != nil {
+			return
+		}
+		var row struct {
+			Path      string `json:"path"`
+			Operation string `json:"operation"`
+			Content   string `json:"content"`
+		}
+		if err := json.Unmarshal(req.Row, &row); err != nil {
+			fail(w, "[manage] malformed proposal row: "+err.Error())
+			return
+		}
+		res, err := proposals.ValidateProposalTarget(proposals.Proposal{
+			Path:      row.Path,
+			Operation: row.Operation,
+			Content:   row.Content,
+		})
+		if err != nil {
+			fail(w, err.Error())
+			return
+		}
+		mkdirsJSON, err := json.Marshal(res.Mkdirs)
+		if err != nil {
+			fail(w, "[manage] could not encode mkdirs: "+err.Error())
+			return
+		}
+		if _, err := q.AppendProposal(r.Context(), store.AppendProposalParams{
+			SessionID: req.SessionID,
+			Path:      row.Path,
+			Operation: row.Operation,
+			Content:   row.Content,
+			Mkdirs:    string(mkdirsJSON),
+		}); err != nil {
+			fail(w, "[manage] could not store the proposal: "+err.Error())
+			return
+		}
+		// JSONL row for the nvim review console — the daemon is the trusted
+		// writer; the AI still has no file path.
+		if req.Directory != "" {
+			if err := appendJSONL(req.Directory, req.SessionID, req.Row); err != nil {
+				fail(w, "[manage] could not append the review row: "+err.Error())
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mkdirs": res.Mkdirs})
+	})
+
+	r.Get("/v1/events/rollup", func(w http.ResponseWriter, r *http.Request) {
+		rows, err := q.RollupEvents(r.Context())
+		if err != nil {
+			fail(w, "[manage] rollup query failed: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, rows)
+	})
+}
+
+// eventRecorder records every /v1/* request (except the rollup itself) as
+// an event row: tool path, outcome, latency. M7 evaluation data.
+func eventRecorder(q *store.Queries) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			rec := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(rec, r)
+			path := r.URL.Path
+			if !strings.HasPrefix(path, "/v1/") || path == "/v1/events/rollup" {
+				return
+			}
+			outcome := "ok"
+			if rec.status >= 400 {
+				outcome = "refused"
+			}
+			_ = q.RecordEvent(r.Context(), store.RecordEventParams{
+				SessionID: r.Header.Get("X-Manage-Session"),
+				Tool:      path,
+				Outcome:   outcome,
+				LatencyMs: int32(time.Since(start).Milliseconds()),
+				Detail:    http.StatusText(rec.status),
+			})
+		})
+	}
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func decode(w http.ResponseWriter, r *http.Request, v any) error {
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		fail(w, "[manage] malformed request body: "+err.Error())
+		return err
+	}
+	return nil
+}
+
+func fail(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": msg})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func appendJSONL(directory, sessionID string, row json.RawMessage) error {
+	dir := filepath.Join(directory, ".ai-proposals")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, sessionID+".jsonl"),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(append(row, '\n'))
+	return err
+}

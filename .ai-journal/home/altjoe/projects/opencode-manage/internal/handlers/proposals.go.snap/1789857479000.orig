@@ -1,0 +1,135 @@
+// /home/altjoe/projects/opencode-manage/internal/handlers/proposals.go FINAL
+// Package handlers — M6: proposals endpoints over the daemon socket.
+// Uniform shape: decode -> validate (R1-R3 + C4) -> act -> structured JSON.
+package handlers
+
+import (
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/alterejoe/opencode-manage/internal/proposals"
+	"github.com/alterejoe/opencode-manage/internal/store"
+)
+
+type proposalTarget struct {
+	Path      string `json:"path"`
+	Operation string `json:"operation"`
+	Content   string `json:"content"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// fail is the REQUIREMENTS-style error body: the message tells the model
+// exactly what to fix and to re-emit — never a bare stack trace.
+func fail(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": msg})
+}
+
+// appendJSONL appends the row to <directory>/.ai-proposals/<session>.jsonl.
+// The DAEMON is the trusted writer here — the AI still has no file path.
+func appendJSONL(directory, sessionID string, row json.RawMessage) error {
+	dir := filepath.Join(directory, ".ai-proposals")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, sessionID+".jsonl"),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(append(row, '\n'))
+	return err
+}
+
+// Mount registers the proposals endpoints.
+func Mount(r chi.Router, db *sql.DB) {
+	q := store.New(db)
+
+	// POST /v1/proposals/validate — target contract only, no writes.
+	r.Post("/v1/proposals/validate", func(w http.ResponseWriter, r *http.Request) {
+		var req proposalRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity,
+				map[string]any{"error": "invalid JSON body: " + err.Error()})
+			return
+		}
+		res, err := proposals.ValidateProposalTarget(proposals.Proposal{
+			Path:      req.Path,
+			Operation: req.Operation,
+			Content:   req.Content,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mkdirs": res.Mkdirs})
+	})
+
+	// POST /v1/proposals — validate, insert into sqlite, and append the
+	// full row to the session JSONL the nvim review console reads.
+	r.Post("/v1/proposals", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Directory string          `json:"directory"`
+			SessionID string          `json:"session_id"`
+			Row       json.RawMessage `json:"row"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity,
+				map[string]any{"error": "invalid JSON body: " + err.Error()})
+			return
+		}
+		var target proposalRequest
+		if err := json.Unmarshal(req.Row, &target); err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity,
+				map[string]any{"error": "row is not a valid proposal object: " + err.Error()})
+			return
+		}
+		res, err := proposals.ValidateProposalTarget(proposals.Proposal{
+			Path:      target.Path,
+			Operation: target.Operation,
+			Content:   target.Content,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
+		mkdirsJSON, err := json.Marshal(res.Mkdirs)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		if _, err := q.AppendProposal(r.Context(), store.AppendProposalParams{
+			SessionID: req.SessionID,
+			Path:      target.Path,
+			Operation: target.Operation,
+			Content:   target.Content,
+			Mkdirs:    string(mkdirsJSON),
+		}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		if req.Directory != "" {
+			if err := appendJSONL(req.Directory, req.SessionID, req.Row); err != nil {
+				writeJSON(w, http.StatusInternalServerError,
+					map[string]any{"error": "queued in sqlite but JSONL append failed: " + err.Error()})
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mkdirs": res.Mkdirs})
+	})
+}
+
+type proposalRequest struct {
+	Path      string `json:"path"`
+	Operation string `json:"operation"`
+	Content   string `json:"content"`
+}

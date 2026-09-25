@@ -1,0 +1,241 @@
+/**
+ * Verdict store (M2, T2 + T2.5 — 10-verdict-capture.md).
+ * Shared SQLite, same schema as nvim's verdicts.lua. The nvim viewer
+ * writes proposal verdicts; this module records conversation verdicts
+ * (aborts + corrections) and reads for injection.
+ *
+ * DRIVER FIX (C1 follow-up): uses the shared lib/sqlite loader —
+ * bun:sqlite under Bun, node:sqlite under Node.
+ *
+ * CONTEXT FIX: the injection now needs proposed_content too, so corrected
+ * verdicts can report what actually changed (not just that something did).
+ *
+ * LOOP FIX: verdict batches are consumed once per project process. The
+ * transform hook can run at every message boundary, but an already-injected
+ * row must not be re-injected into every subsequent prompt.
+ *
+ * Fail-open: no store, no driver, or a busy DB → no-op, never a crash.
+ */
+
+import { existsSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
+import { openDatabase } from "./sqlite";
+
+export const VERDICT_SCHEMA = `
+CREATE TABLE IF NOT EXISTS verdicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  session_id TEXT,
+  proposal_id INTEGER,
+  group_name TEXT,
+  path TEXT,
+  operation TEXT,
+  verdict TEXT NOT NULL,
+  reason TEXT,
+  proposed_content TEXT,
+  applied_content TEXT,
+  project TEXT,
+  scope TEXT NOT NULL DEFAULT 'project',
+  source TEXT NOT NULL DEFAULT 'proposal'
+);
+CREATE INDEX IF NOT EXISTS idx_verdicts_path ON verdicts(path);
+CREATE INDEX IF NOT EXISTS idx_verdicts_ts ON verdicts(ts);
+`;
+
+// v1 → v2 migration: path becomes nullable, add source column.
+// Rebuild preserves existing rows (old rows are proposal-sourced).
+const VERDICT_MIGRATION = `
+BEGIN;
+ALTER TABLE verdicts RENAME TO verdicts_old;
+CREATE TABLE verdicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  session_id TEXT,
+  proposal_id INTEGER,
+  group_name TEXT,
+  path TEXT,
+  operation TEXT,
+  verdict TEXT NOT NULL,
+  reason TEXT,
+  proposed_content TEXT,
+  applied_content TEXT,
+  project TEXT,
+  scope TEXT NOT NULL DEFAULT 'project',
+  source TEXT NOT NULL DEFAULT 'proposal'
+);
+INSERT INTO verdicts (ts, session_id, proposal_id, group_name, path, operation, verdict, reason, proposed_content, applied_content, project, scope, source)
+  SELECT ts, session_id, proposal_id, group_name, path, operation, verdict, reason, proposed_content, applied_content, project, scope, 'proposal' FROM verdicts_old;
+DROP TABLE verdicts_old;
+COMMIT;
+`;
+
+export interface VerdictRow {
+  id: number;
+  ts: number;
+  path: string | null;
+  verdict: string;
+  reason: string | null;
+  source: string | null;
+  proposed_content: string | null;
+  applied_content: string | null;
+}
+
+// The message transform runs repeatedly for one conversation. Keep the
+// newest timestamp already handed to the model so old verdicts are not
+// appended again on the next transform pass.
+const injectedThrough = new Map<string, number>();
+
+/** Create + migrate the schema. No-op when already current. */
+export function ensureSchema(db: any) {
+  db.exec(VERDICT_SCHEMA);
+  const cols = db.prepare("PRAGMA table_info(verdicts)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "source")) {
+    db.exec(VERDICT_MIGRATION);
+  }
+}
+
+function openStore(path: string, write: boolean): any | null {
+  if (!write && !existsSync(path)) return null;
+  const db = openDatabase(path);
+  if (!db) return null;
+  try {
+    ensureSchema(db);
+    return db;
+  } catch {
+    try {
+      db.close();
+    } catch {
+      /* best effort */
+    }
+    return null;
+  }
+}
+
+/**
+ * Read newly observed verdicts from the project store, then the global
+ * store. Rows are deduped by path+verdict, newest first, and consumed once
+ * per project process so the next transform pass is quiet.
+ */
+export async function loadRecentVerdicts(
+  directory: string,
+  limit: number,
+): Promise<VerdictRow[]> {
+  const since = injectedThrough.get(directory) ?? 0;
+  const rows: VerdictRow[] = [];
+  const stores = [
+    join(directory, ".opencode", "state.db"),
+    join(homedir(), ".config", "opencode", "state.db"),
+  ];
+
+  for (const dbPath of stores) {
+    const db = openStore(dbPath, false);
+    if (!db) continue;
+    try {
+      const stmt = db.prepare(
+        "SELECT id, ts, path, verdict, reason, source, proposed_content, applied_content " +
+          "FROM verdicts WHERE ts > ? ORDER BY ts DESC LIMIT ?",
+      );
+      for (const row of stmt.all(since, limit) as VerdictRow[]) {
+        rows.push(row);
+      }
+      db.close();
+    } catch {
+      // busy/corrupt — skip this store, never crash the session
+      try {
+        db.close();
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+
+  rows.sort((a, b) => b.ts - a.ts);
+  if (rows.length > 0) {
+    injectedThrough.set(
+      directory,
+      rows.reduce((newest, row) => Math.max(newest, row.ts), since),
+    );
+  }
+
+  const seen = new Set<string>();
+  const out: VerdictRow[] = [];
+  for (const r of rows) {
+    const key = (r.path || "conversation") + "|" + r.verdict;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+    if (out.length >= limit) break;
+  }
+
+  if (out.length > 0) {
+    console.error(
+      `[manage] verdicts: injecting ${out.length} newly observed row(s) for ${directory}`,
+    );
+  }
+  return out;
+}
+
+/**
+ * Record a conversation verdict: the user aborted a generation (escape).
+ * proposed_content = the killed text; applied_content is attached later
+ * when the user's correction message arrives (attachCorrection).
+ * @returns the new verdict row id, or null on failure
+ */
+export async function recordAbort(
+  directory: string,
+  sessionID: string,
+  killedText: string,
+): Promise<number | null> {
+  const db = openStore(join(directory, ".opencode", "state.db"), true);
+  if (!db) return null;
+  try {
+    const stmt = db.prepare(
+      "INSERT INTO verdicts (ts, session_id, verdict, reason, proposed_content, project, scope, source) VALUES (?, ?, 'aborted', 'user aborted generation', ?, ?, 'project', 'conversation')",
+    );
+    const info = stmt.run(
+      Date.now(),
+      sessionID,
+      killedText.slice(0, 2000),
+      projectSlug(directory),
+    );
+    db.close();
+    return typeof info.lastInsertRowid === "number"
+      ? info.lastInsertRowid
+      : Number(info.lastInsertRowid);
+  } catch {
+    try {
+      db.close();
+    } catch {
+      /* best effort */
+    }
+    return null;
+  }
+}
+
+/** Attach the user's correction message to a pending abort verdict. */
+export async function attachCorrection(
+  directory: string,
+  verdictId: number,
+  correctionText: string,
+): Promise<void> {
+  const db = openStore(join(directory, ".opencode", "state.db"), true);
+  if (!db) return;
+  try {
+    db.prepare("UPDATE verdicts SET applied_content = ? WHERE id = ?").run(
+      correctionText.slice(0, 2000),
+      verdictId,
+    );
+    db.close();
+  } catch {
+    try {
+      db.close();
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+function projectSlug(directory: string): string {
+  return directory.split("/").filter(Boolean).pop() || "unknown";
+}

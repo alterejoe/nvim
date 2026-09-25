@@ -1,0 +1,132 @@
+// /home/altjoe/.config/opencode/plugins/lib/proposals.ts FINAL-2
+/**
+ * Proposal queue (M1). The AI's only code "write" channel — appends to
+ * .ai-proposals/<session>.jsonl; the user applies via the nvim viewer.
+ *
+ * PATH VALIDATION (doc 21): a proposal must never queue a target that is
+ * not the intended file. appendProposal validates BEFORE appending, so an
+ * invalid target writes NOTHING and surfaces as a REQUIREMENTS error:
+ *   - R1: path must be absolute (starting with /). Relative paths once
+ *     resolved against the wrong root and created web/web copies.
+ *   - R2: update ops (replace, edit_range, delete) require the target to
+ *     exist on disk — an update never silently creates.
+ *   - R3: create requires the target absent. A missing parent chain is
+ *     ALLOWED and recorded on the row as `mkdirs` (shallowest first); the
+ *     nvim apply side asks y/n before mkdir -p, so directories are never
+ *     created silently (doc 21, 2026-09-18 dir-consent revision).
+ * The nvim apply side fails closed on the same rules (proposals.lua).
+ *
+ * STUB TRIPWIRE (C4): content that starts with "[evicted:" is a
+ * message-boundary stub, never a payload. Copying one into content once
+ * clobbered two docs (README + doc 25) — refuse it here so that class can
+ * never queue again.
+ *
+ * CREATE + MISSING PARENTS: appendProposal records the chain (`mkdirs`) and
+ * returns it, so the tool response can name the directories up front; the
+ * nvim apply side recomputes when the field is absent (legacy rows) and the
+ * y/n prompt is the consent gate — never the emit path.
+ *
+ * Error-message contract (doc 03): what is wrong, why it matters, how to
+ * proceed. A bare "Re-emit." is not an instruction.
+ */
+
+import { mkdirSync, appendFileSync, existsSync, statSync } from "fs";
+import { join, dirname, isAbsolute } from "path";
+
+export function proposalsFile(directory: string, sessionID: string): string {
+  return join(directory, ".ai-proposals", `${sessionID}.jsonl`);
+}
+
+/** True when `p` exists and is a directory. */
+function isDir(p: string): boolean {
+  return existsSync(p) && statSync(p).isDirectory();
+}
+
+/**
+ * Absolute directories missing between an existing ancestor and `path`'s
+ * parent — shallowest first, so the apply-side prompt reads top-down.
+ * Empty when the parent chain already exists.
+ */
+function missingParentDirs(path: string): string[] {
+  const missing: string[] = [];
+  let dir = dirname(path);
+  while (dir !== dirname(dir) && !isDir(dir)) {
+    missing.unshift(dir);
+    dir = dirname(dir);
+  }
+  return missing;
+}
+
+/** Structural target validation. Throws a REQUIREMENTS-style error. */
+export function validateProposalTarget(proposal: {
+  path?: string;
+  operation?: string;
+  content?: unknown;
+}): void {
+  const path = (proposal.path || "").trim();
+  const op = proposal.operation || "replace";
+  if (!path) {
+    throw new Error(
+      "[manage] ⚠️ emit_proposal needs a path. Re-emit with the absolute path (starting with /).",
+    );
+  }
+  if (!isAbsolute(path)) {
+    throw new Error(
+      `[manage] ⚠️ emit_proposal requires an ABSOLUTE path (got "${path}"). ` +
+        `Relative paths are rejected: the apply side may resolve them against ` +
+        `the wrong root — a relative path once created web/web copies instead ` +
+        `of updating the real file. Re-emit with the full absolute path.`,
+    );
+  }
+  // C4 stub tripwire: message-boundary markers are not payloads.
+  if (
+    typeof proposal.content === "string" &&
+    proposal.content.trimStart().startsWith("[evicted:")
+  ) {
+    throw new Error(
+      `[manage] ⚠️ proposal content for ${path} looks like a C4 eviction stub, not a payload ` +
+        `(it starts with "[evicted:"). Those markers exist only in the model's message view — ` +
+        `copying one into content clobbered two docs once (README, doc 25). ` +
+        `Re-read the real file from disk (or re-compose the payload), then re-emit with the actual content.`,
+    );
+  }
+  const exists = existsSync(path);
+  if (op === "create") {
+    if (exists) {
+      throw new Error(
+        `[manage] ⚠️ emit_proposal (create) target already exists: ${path}. ` +
+          `Use 'replace' or 'edit_range' to change an existing file. Re-emit.`,
+      );
+    }
+    // Missing parents are fine: recorded as `mkdirs`, consented at apply.
+    return;
+  }
+  if (!exists) {
+    throw new Error(
+      `[manage] ⚠️ emit_proposal (${op}) requires the target to exist: ${path}. ` +
+        `Update ops never create files — verify the path (read/list) or re-emit as 'create'.`,
+    );
+  }
+}
+
+export function appendProposal(
+  directory: string,
+  sessionID: string,
+  proposal: { path?: string; operation?: string; content?: unknown },
+  // Deprecated: missing parents are always allowed now (recorded as
+  // `mkdirs`, consented at apply). Kept so the emit_skill call site needs
+  // no signature change; pass nothing in new code.
+  _opts?: { allowMissingParent?: boolean },
+): { mkdirs: string[] } {
+  // Fail closed: an invalid target must never reach the queue.
+  validateProposalTarget(proposal);
+  const file = proposalsFile(directory, sessionID);
+  mkdirSync(dirname(file), { recursive: true });
+  const mkdirs =
+    (proposal.operation || "replace") === "create"
+      ? missingParentDirs((proposal.path || "").trim())
+      : [];
+  const row = mkdirs.length ? { ...proposal, mkdirs } : proposal;
+  appendFileSync(file, JSON.stringify(row) + "\n", "utf8");
+  return { mkdirs };
+}

@@ -1,0 +1,114 @@
+// /home/altjoe/.config/opencode/plugins/lib/proposals.selftest.ts FINAL
+/**
+ * Regression self-test for lib/proposals.ts (ISSUE-003).
+ *
+ * Run:  bun run lib/proposals.selftest.ts
+ *   or: npx tsx lib/proposals.selftest.ts
+ *
+ * Exits 0 with "selftest ok" when every guard behaves; throws with the
+ * failing case otherwise. No framework, no filesystem writes (targets are
+ * probed with existsSync only).
+ */
+
+import { validateProposalTarget } from "./proposals.ts";
+
+let passed = 0;
+
+function expectThrow(label: string, fn: () => void, needle: string): void {
+  try {
+    fn();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!msg.includes(needle)) {
+      throw new Error(
+        `selftest FAIL [${label}]: threw, but message lacks "${needle}":\n${msg}`,
+      );
+    }
+    passed++;
+    return;
+  }
+  throw new Error(`selftest FAIL [${label}]: expected a throw, got none`);
+}
+
+function expectPass(label: string, fn: () => void): void {
+  try {
+    fn();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`selftest FAIL [${label}]: expected no throw, got:\n${msg}`);
+  }
+  passed++;
+}
+
+// 1. THE ISSUE-003 PAYLOAD — the exact stub shape that once queued. The
+//    tripwire must refuse it (content starts with "[evicted:").
+expectThrow(
+  "stub payload refused",
+  () =>
+    validateProposalTarget({
+      path: "/tmp/manage-selftest-stub.md",
+      operation: "create",
+      content:
+        "[evicted: emit_proposal payload for /tmp/x — reviewed/applied; the file on disk and the journal are the truth]",
+    }),
+  "C4 eviction stub",
+);
+
+// 2. Stub content after leading whitespace is still caught.
+expectThrow(
+  "stub payload (leading whitespace) refused",
+  () =>
+    validateProposalTarget({
+      path: "/tmp/manage-selftest-stub.md",
+      operation: "create",
+      content: "\n\n[evicted: probe]",
+    }),
+  "C4 eviction stub",
+);
+
+// 3. R1: relative paths are refused.
+expectThrow(
+  "relative path refused",
+  () =>
+    validateProposalTarget({
+      path: "web/ui/some.templ",
+      operation: "replace",
+      content: "x",
+    }),
+  "ABSOLUTE",
+);
+
+// 4. R2: update ops require an existing target.
+expectThrow(
+  "update on missing target refused",
+  () =>
+    validateProposalTarget({
+      path: "/tmp/manage-selftest-does-not-exist.md",
+      operation: "replace",
+      content: "x",
+    }),
+  "requires the target to exist",
+);
+
+// 5. R3: create on an existing target is refused (this file itself exists).
+expectThrow(
+  "create on existing target refused",
+  () =>
+    validateProposalTarget({
+      path: import.meta.url.replace("file://", ""),
+      operation: "create",
+      content: "x",
+    }),
+  "already exists",
+);
+
+// 6. A normal create on a nonexistent path passes (no write happens here).
+expectPass("valid create passes", () =>
+  validateProposalTarget({
+    path: "/tmp/manage-selftest-ok.md",
+    operation: "create",
+    content: "# normal payload\n",
+  }),
+);
+
+console.log(`selftest ok (${passed} assertions)`);

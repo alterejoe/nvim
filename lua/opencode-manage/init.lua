@@ -1,17 +1,20 @@
--- /home/altjoe/.config/nvim/lua/opencode-manage/init.lua FINAL
+-- /home/altjoe/.config/nvim/lua/opencode-manage/init.lua FINAL-2
 -- opencode-manage — the review console for the opencode manage plugin.
 -- Proposal review + change journal + registry review + verdict store/viewer
--- + metrics interface + references + skills lifecycle + permissions folders.
+-- + metrics interface + references + skills lifecycle + permissions folders
+-- + handoff catalogue viewer.
 -- Completely separate from opencode-ext (the chat viewer) — no overlap.
 --
 -- VIEWERS: proposals (<leader>ap / <leader>ac), journal (<leader>aj),
 -- registry (<leader>ar), verdicts (<leader>av), metrics (<leader>at),
--- references (<leader>af), vault (<leader>ag), skills (<leader>ak), folders (<leader>aa) —
+-- references (<leader>af), vault (<leader>ag), skills (<leader>ak), folders (<leader>aa),
+-- handoff (<leader>ah) —
 -- all persistent two-pane viewers with live previews, no bland pickers.
 -- COMMANDS: :ManageMetrics (summary), :ManagePrune [note] (shaped prune),
 -- :ManageFolders (permissions memory + sync + verify),
 -- :ManageIndex [root] / :ManageVault [root] / :ManageRef [path] /
--- :ManageRefs / :ManageRefPrune <id> <why> (references, doc 20).
+-- :ManageRefs / :ManageRefPrune <id> <why> (references, doc 20),
+-- :ManageHandoff (handoff catalogue + pending proposals).
 -- Focus: BufEnter writes the active file so refs can route by what you work on.
 
 local review = require("opencode-manage.review")
@@ -28,6 +31,7 @@ local skills = require("opencode-manage.skills")
 local skillsview = require("opencode-manage.skillsview")
 local folders = require("opencode-manage.folders")
 local foldersview = require("opencode-manage.foldersview")
+local handoffview = require("opencode-manage.handoffview")
 
 -- Keymaps
 vim.keymap.set("n", "<leader>ap", reviewview.open, { desc = "Manage: review proposals" })
@@ -40,6 +44,7 @@ vim.keymap.set("n", "<leader>af", refsview.open, { desc = "Manage: references vi
 vim.keymap.set("n", "<leader>ak", skillsview.open, { desc = "Manage: skills lifecycle" })
 vim.keymap.set("n", "<leader>aa", foldersview.open, { desc = "Manage: folder permissions" })
 vim.keymap.set("n", "<leader>ag", vaultview.open, { desc = "Manage: vault (global references)" })
+vim.keymap.set("n", "<leader>ah", handoffview.open, { desc = "Manage: handoff catalogue" })
 
 -- Stable commands (path resolution lives in code, not in pasted one-liners)
 vim.api.nvim_create_user_command("ManageMetrics", function()
@@ -85,6 +90,10 @@ vim.api.nvim_create_user_command("ManageRefPrune", function(opts)
 	refs.prune(tonumber(id), reason)
 end, { nargs = "+", desc = "Manage: prune a reference, keeping the reason" })
 
+vim.api.nvim_create_user_command("ManageHandoff", function()
+	handoffview.open()
+end, { desc = "Manage: show the handoff catalogue + pending proposals" })
+
 -- R1: focus routing — write the active file so refs match what you work on.
 vim.api.nvim_create_autocmd("BufEnter", {
 	callback = function()
@@ -115,6 +124,7 @@ return {
 	skillsview = skillsview,
 	folders = folders,
 	foldersview = foldersview,
+	handoffview = handoffview,
 	proposals = require("opencode-manage.proposals"),
 	journal = require("opencode-manage.journal"),
 	registry = require("opencode-manage.registry"),

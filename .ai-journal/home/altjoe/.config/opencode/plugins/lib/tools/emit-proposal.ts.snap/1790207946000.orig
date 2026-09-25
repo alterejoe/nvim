@@ -1,0 +1,225 @@
+// /home/altjoe/.config/opencode/plugins/lib/tools/emit-proposal.ts FINAL-2
+/**
+ * emit_proposal — the only code write channel: structured proposal.
+ * M6: validation and queueing delegate to the manage daemon (awaited).
+ */
+import { tool } from "@opencode-ai/plugin";
+import {
+  proposalsFile,
+  appendProposal,
+  validateProposalTarget,
+} from "../proposals";
+import { recordEvent } from "../metrics";
+import {
+  loadRegistry,
+  matchesSharedPath,
+  buildRegistrySummary,
+  parseImpact,
+  impactRequiredMessage,
+  type ImpactEntry,
+} from "../registry";
+import {
+  loadUiContract,
+  validateUiContractShape,
+  validateUiProposal,
+  isUiCandidate,
+} from "../ui";
+
+export function emitProposalTool(directory: string) {
+  return tool({
+    description:
+      "Propose a file change for the user to review and apply manually. " +
+      "This tool writes NOTHING to disk — it records a structured proposal " +
+      "the user accepts or rejects. This is your ONLY write channel: " +
+      "bash/edit/write/patch are permanently denied, so do not attempt them. " +
+      "For a task touching multiple files, call this once per file and give " +
+      "every call the same `group` slug so the change stays reviewable and " +
+      "revertible as one unit. " +
+      "A create may target a path whose parent directories do not exist yet: " +
+      "the missing chain is recorded on the row (`mkdirs`) and the review " +
+      "console asks y/n before creating directories — never silently. " +
+      "Before proposing changes to any shared/central module, run " +
+      "lsp_find_references on the symbols you will change and populate " +
+      "`impact` with the real consumers. " +
+      "Proposals touching *.templ or htmx-bearing .go files in a project " +
+      "with .opencode/manage.ui.json are validated against the UI layout " +
+      "contract (doc 25 R3) — fix the listed violations and re-emit; a " +
+      "proposed manage.ui.json is shape-checked first (LC1)." +
+      buildRegistrySummary(directory),
+    args: {
+      path: tool.schema
+        .string()
+        .describe(
+          "Absolute file path (must start with /). Relative paths are rejected. Update ops (replace/edit_range/delete) require the target to exist on disk; create requires it absent — a missing parent directory chain is allowed and created only after the user's y/n at apply.",
+        ),
+      operation: tool.schema
+        .string()
+        .describe(
+          "Type of change: 'create' (new file), 'replace' (full-file), " +
+            "'edit_range' (replace lines start_line..end_line), 'delete'",
+        ),
+      content: tool.schema
+        .string()
+        .describe(
+          "Full new file content (for create/replace) or the replacement block",
+        ),
+      reason: tool.schema
+        .string()
+        .describe("Why this change — so the user can review intent"),
+      group: tool.schema
+        .string()
+        .describe(
+          "Short slug tying this proposal to one logical change across files " +
+            "(e.g. 'add-metrics-service'). All files of one task share one group.",
+        ),
+      start_line: tool.schema
+        .string()
+        .describe(
+          "For edit_range: first line to replace (1-based). Empty string if unused.",
+        ),
+      end_line: tool.schema
+        .string()
+        .describe(
+          "For edit_range: last line to replace (1-based). Empty string if unused.",
+        ),
+      impact: tool.schema
+        .string()
+        .describe(
+          "JSON array of impact entries — REQUIRED when the target path is a " +
+            'registered shared module. Each entry: {"path": string, "symbol": string, ' +
+            '"relation": string}. Gather via lsp_find_references / ' +
+            "lsp_goto_definition before proposing. Every path must exist on disk.",
+        ),
+      reuses: tool.schema
+        .string()
+        .describe(
+          "Optional: canonical implementations this change reuses, to prove no " +
+            'duplication. JSON array of {"path": string, "symbol": string}. ' +
+            "Prefer the registry's canonical entries over reimplementing.",
+        ),
+    },
+    async execute(args: any, context: any) {
+      const sessionID = context.sessionID;
+
+      // Fail cleanly on a bad target BEFORE any consumer touches it:
+      // matchesSharedPath once crashed with a raw TypeError on a missing
+      // path — doc 03 demands a REQUIREMENTS message, not a stack trace.
+      const targetPath = typeof args.path === "string" ? args.path : "";
+      // content MUST reach the validator: the C4 stub tripwire lives on
+      // it. Omitting it here let a stub payload pass the tool boundary
+      // and only fail at queue time (ISSUE-003). Fail at the gate.
+      await validateProposalTarget({
+        path: targetPath,
+        operation: args.operation,
+        content: args.content,
+      });
+
+      const registry = loadRegistry(directory);
+      const sharedHit = matchesSharedPath(registry.shared, targetPath);
+
+      // Structural impact requirement: touching a shared module without
+      // evidence of what it affects is a REQUIREMENTS error, not a denial.
+      let impact: ImpactEntry[] = [];
+      // Hardening: the impact arg is schema-typed string, but a typed
+      // array from a misbehaving client once crashed validation with
+      // "args.impact.trim is not a function". Coerce before trim; a
+      // non-string impact is treated as absent.
+      const impactRaw = typeof args.impact === "string" ? args.impact : "";
+      if (sharedHit && impactRaw.trim() === "") {
+        throw new Error(impactRequiredMessage(targetPath));
+      }
+      if (impactRaw.trim() !== "") {
+        impact = parseImpact(directory, impactRaw);
+      }
+
+      // ── LC1/LC3 (doc 25): UI layout contract gates ─────────────────
+      const content = typeof args.content === "string" ? args.content : "";
+      // LC1: proposing the contract itself — validate its shape first so
+      // a malformed contract never lands (it would disable LC3 checks).
+      if (targetPath.endsWith("manage.ui.json")) {
+        let parsed: unknown = null;
+        try {
+          parsed = JSON.parse(content);
+        } catch {
+          parsed = null;
+        }
+        const shapeErrors =
+          parsed === null
+            ? ["the file is not valid JSON"]
+            : validateUiContractShape(parsed);
+        if (shapeErrors.length) {
+          throw new Error(
+            "[manage] ⚠️ manage.ui.json does not match the UI contract schema (doc 25 R1): " +
+              shapeErrors.slice(0, 5).join(" · ") +
+              ` Fix the listed fields, then re-emit — a malformed contract (${targetPath}) disables ` +
+              "emit-time validation for that project.",
+          );
+        }
+      }
+      // LC3: contract checks for UI-file proposals — nothing queues on a
+      // violation. Fail-open without a contract: today's behavior.
+      if (
+        args.operation !== "delete" &&
+        isUiCandidate(targetPath, content)
+      ) {
+        const contract = loadUiContract(targetPath);
+        if (contract) {
+          const violations = validateUiProposal(
+            contract,
+            targetPath,
+            content,
+          );
+          if (violations.length) {
+            throw new Error(
+              "[manage] ⚠️ UI layout contract violations (doc 25 R3) — nothing was queued:\n" +
+                violations
+                  .map((v: any) => `  • [${v.code}] ${v.message}`)
+                  .join("\n"),
+            );
+          }
+        }
+      }
+
+      const proposal = {
+        ts: Date.now(),
+        sessionID,
+        group: args.group || "misc",
+        path: targetPath,
+        operation: args.operation,
+        reason: args.reason,
+        start_line: args.start_line ? parseInt(args.start_line, 10) : null,
+        end_line: args.end_line ? parseInt(args.end_line, 10) : null,
+        content: args.content,
+        impact,
+        reuses: args.reuses || null,
+        status: "pending", // pending | accepted | rejected (user/nvim sets this)
+      };
+      const queued = await appendProposal(directory, sessionID, proposal);
+      await recordEvent(
+        directory,
+        sessionID,
+        "proposal",
+        `${proposal.group}: ${targetPath}`,
+        null,
+      );
+      const dirNote = queued.mkdirs.length
+        ? ` New directories recorded for creation on accept (y/n): ${queued.mkdirs.join(", ")}.`
+        : "";
+      return JSON.stringify(
+        {
+          ok: true,
+          message:
+            `Proposal recorded (${args.operation}) for ${targetPath} ` +
+            `[group: ${proposal.group}, impact: ${impact.length} ` +
+            `${impact.length === 1 ? "entry" : "entries"}]. ` +
+            `Nothing was written. The user must apply it manually.` +
+            dirNote,
+          proposal_id: proposal.ts,
+          manifest: proposalsFile(directory, sessionID),
+        },
+        null,
+        2,
+      );
+    },
+  });
+}

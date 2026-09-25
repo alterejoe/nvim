@@ -1,0 +1,56 @@
+// /home/altjoe/.config/opencode/plugins/manage.ts FINAL-2
+/**
+ * Manage — OpenCode Management Plugin
+ * (M1 + M1g + M1i + M1r + M2 + M2.5 + C1 + C2 + C4 + O1 + R1a + SL1 + LC1 + LC3)
+ * Composition root only: hooks + tools, wired from lib/ modules (M3 split).
+ *
+ * V1 plugin shape (PluginModule): `export default { id, server }` — the
+ * loader's modern path. The legacy function-export path is bypassed.
+ *
+ * Core principle: STRUCTURAL, not heuristic. There is no path from the AI
+ * to the filesystem. The gate denies the mutation tools outright; the AI's
+ * only "write" channels are emit_proposal, registry_propose and emit_skill,
+ * which write nothing to disk — they append to review queues the user applies.
+ *
+ * Module map (M3 composition split):
+ *   lib/hooks.ts               — all hook handlers (airlock gate, C1 capture,
+ *     M2.5 verdicts, C2 prune, C4 reclamation, R1a/SL1 hints)
+ *   lib/tools/emit-proposal.ts — the only code write channel
+ *   lib/tools/registry-propose.ts — registry write channel (M1r)
+ *   lib/tools/emit-skill.ts   — skills intake (SL1)
+ *   lib/tools/skill-load.ts   — always-fresh skill reader (SL3)
+ *   lib/tools/ref-lookup.ts   — reference lookup (R1a)
+ *
+ * DENIAL IS TERMINAL: the throw messages in the modules explicitly tell the
+ * model not to retry or work around a denied tool. The impact requirement and
+ * registry_propose/emit_skill/UI-contract validation are the deliberate
+ * exceptions: their errors are REQUIREMENTS retries — fix the input and re-emit.
+ */
+import { type Plugin } from "@opencode-ai/plugin";
+import { buildHooks } from "./lib/hooks";
+import { emitProposalTool } from "./lib/tools/emit-proposal";
+import { registryProposeTool } from "./lib/tools/registry-propose";
+import { emitSkillTool } from "./lib/tools/emit-skill";
+import { skillLoadTool } from "./lib/tools/skill-load";
+import { refLookupTool } from "./lib/tools/ref-lookup";
+
+const ManagePlugin: Plugin = async ({ directory, client }) => {
+  return {
+    ...buildHooks(directory, client),
+
+    tool: {
+      emit_proposal: emitProposalTool(directory),
+      registry_propose: registryProposeTool(directory),
+      emit_skill: emitSkillTool(directory),
+      skill_load: skillLoadTool(directory),
+      ref_lookup: refLookupTool(directory),
+    },
+  };
+};
+
+// V1 plugin shape — the loader's modern path (readV1Plugin). Bypasses the
+// legacy getLegacyPlugins path entirely, making loading deterministic.
+export default {
+  id: "manage",
+  server: ManagePlugin,
+};

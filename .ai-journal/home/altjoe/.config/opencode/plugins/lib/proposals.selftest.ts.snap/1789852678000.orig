@@ -1,0 +1,91 @@
+// /home/altjoe/.config/opencode/plugins/lib/proposals.selftest.ts FINAL-2
+/**
+ * Regression + parity self-test for lib/proposals.ts (ISSUE-003, M4).
+ *
+ * Run:  bun run lib/proposals.selftest.ts
+ *   or: npx tsx lib/proposals.selftest.ts
+ *
+ * Exits 0 with "selftest ok" when every guard behaves; throws with the
+ * failing case otherwise.
+ *
+ * M4: the six cases now come from the shared parity fixture
+ * (projects/opencode-manage/parity/cases.json) — the SAME file the Go
+ * parity test consumes, so both validators must agree case-for-case.
+ * Override the fixture location with PARITY_CASES if the repo moves.
+ */
+import { mkdtempSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { readFileSync } from "fs";
+import { validateProposalTarget } from "./proposals";
+
+const FIXTURE =
+  process.env.PARITY_CASES ||
+  "/home/altjoe/projects/opencode-manage/parity/cases.json";
+
+type Expect = { error_contains?: string; ok?: boolean; mkdirs?: string[] };
+type Case = {
+  name: string;
+  operation?: string;
+  path: string;
+  content?: string;
+  expect: Expect;
+};
+
+function assertThrows(label: string, fn: () => unknown, needle: string) {
+  try {
+    fn();
+  } catch (err: any) {
+    const msg = String(err?.message ?? err);
+    if (!msg.includes(needle)) {
+      throw new Error(
+        `selftest FAIL [${label}]: threw, but message lacks "${needle}":\n${msg}`,
+      );
+    }
+    return;
+  }
+  throw new Error(`selftest FAIL [${label}]: expected a throw, got none`);
+}
+
+function assertPass(label: string, fn: () => unknown): any {
+  try {
+    return fn();
+  } catch (err: any) {
+    throw new Error(
+      `selftest FAIL [${label}]: expected no throw, got:\n${String(err?.message ?? err)}`,
+    );
+  }
+}
+
+const fixture: { cases: Case[] } = JSON.parse(readFileSync(FIXTURE, "utf8"));
+if (!fixture.cases?.length) throw new Error(`selftest FAIL: no cases in ${FIXTURE}`);
+
+// $ROOT: fresh temp dir with the seeded existing.md the fixture assumes.
+const root = mkdtempSync(join(tmpdir(), "manage-parity-"));
+writeFileSync(join(root, "existing.md"), "seed\n", "utf8");
+const resolve = (s: string) => s.replaceAll("$ROOT", root);
+
+let passed = 0;
+for (const c of fixture.cases) {
+  const run = () =>
+    validateProposalTarget({
+      path: resolve(c.path),
+      operation: c.operation,
+      content: c.content,
+    });
+
+  if (c.expect.ok) {
+    const result = assertPass(c.name, run) as { mkdirs?: string[] };
+    const want = (c.expect.mkdirs ?? []).map(resolve);
+    if (JSON.stringify(result.mkdirs ?? []) !== JSON.stringify(want)) {
+      throw new Error(
+        `selftest FAIL [${c.name}]: mkdirs ${JSON.stringify(result.mkdirs)} != ${JSON.stringify(want)}`,
+      );
+    }
+  } else {
+    assertThrows(c.name, run, c.expect.error_contains ?? "");
+  }
+  passed++;
+}
+
+console.log(`selftest ok (${passed} parity cases from ${FIXTURE})`);

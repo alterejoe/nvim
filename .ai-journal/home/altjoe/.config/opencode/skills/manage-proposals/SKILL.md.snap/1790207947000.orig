@@ -1,0 +1,51 @@
+---
+name: manage-proposals
+description: "How the opencode manage plugin's proposal workflow works: emission rules (absolute paths, groups, full-file replaces, impact/reuses, REQUIREMENTS vs DENIALS), the review console's accept/reject/group-apply semantics with automatic revision ordering, and the derived refs/skills layers. Use when working in the opencode-manage / manage-plugin codebase or any session that emits proposals for review."
+---
+
+# Manage proposals — emission and review
+
+The opencode manage plugin airlocks the AI from the filesystem: proposals
+go to `.ai-proposals/<session>.jsonl`; the user applies them in nvim. Read
+this when emitting proposals or when the user is reviewing them.
+
+## Emission rules (AI side)
+
+- **Absolute paths only.** Relative paths are rejected at emit; the apply
+  side fails closed (doc 21).
+- **Full-file `replace` on accumulated files.** `edit_range` only with
+  coordinates from a fresh read that includes the enclosing delimiters —
+  remembered coordinates once killed an nvim startup.
+- **One `group` slug per logical change.** A revision of the same target
+  re-emits into the SAME group; the review console resolves ordering
+  internally (the newest row per target acts, older pending rows render
+  `[superseded]`). Never ask the user to reject the older row.
+- **Shared modules need `impact`** (registered in
+  `.opencode/manage.registry.json`) — gather the real consumers with
+  `lsp_find_references`. Canonical implementations go in `reuses`.
+- **REQUIREMENTS errors are retries** (path, impact, registry/emit_skill
+  shape): fix the input and re-emit. **DENIALS are terminal**: never retry
+  or work around a denied tool — bash/edit/write/patch do not exist.
+- **Every failure message says what is wrong, why it matters, how to
+  proceed** — the doc 03 contract; a bare "Re-emit." is a bug.
+
+## Review semantics (user side — the AI never applies)
+
+- `<leader>ap`: `da` accept (writes the AFTER pane verbatim), `dr` reject,
+  `ga` group-apply (newest row per target; older revisions skipped
+  automatically), `rr` re-eval, `y` snapshot+copy, `Q` close.
+- Accepts and rejects write verdicts into `state.db`; corrections are
+  captured as diffs and injected into later calls — **never re-walk a
+  rejected path**.
+- Journal snapshots are the recovery path: every accept is revertible
+  (`_old/` for deletes; `.ai-journal` snapshots otherwise).
+
+## Skills intake (emit_skill)
+
+- `emit_skill` queues TWO rows in one group: the SKILL.md and the
+  `skills.policy.json` routing entry (tier + subject). Emit one skill,
+  apply it, then emit the next — the manifest merges at emit time.
+- Subjects use the refs vocabulary (directory + extension, e.g.
+  `opencode-manage lua`). Tiers: default (hinted by subject), conditional
+  (exact subject only), emergency (always hinted), explicit (never
+  hinted), legacy (kept, never hinted).

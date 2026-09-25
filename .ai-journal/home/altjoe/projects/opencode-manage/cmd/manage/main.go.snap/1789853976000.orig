@@ -1,0 +1,111 @@
+// /home/altjoe/projects/opencode-manage/cmd/manage/main.go FINAL-3
+// Command manage runs the opencode-manage daemon: a chi HTTP server on a
+// unix socket. M5 foundation — health, shutdown, migrations on start.
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/sqlite"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
+	_ "modernc.org/sqlite"
+
+	"github.com/alterejoe/opencode-manage/db/migrations"
+)
+
+func baseDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		panic("manage: no home directory: " + err.Error())
+	}
+	return filepath.Join(home, ".local", "share", "opencode-manage")
+}
+
+func socketPath() string { return filepath.Join(baseDir(), "manage.sock") }
+func dbPath() string     { return filepath.Join(baseDir(), "manage.db") }
+
+func main() {
+	slog.Info("manage daemon starting", "socket", socketPath(), "db", dbPath())
+
+	if err := runMigrations(dbPath()); err != nil {
+		slog.Error("migrations failed", "error", err)
+		os.Exit(1)
+	}
+
+	if err := os.MkdirAll(baseDir(), 0o755); err != nil {
+		slog.Error("data directory", "error", err)
+		os.Exit(1)
+	}
+
+	stop := make(chan struct{})
+
+	r := chi.NewRouter()
+	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	r.Post("/shutdownz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("shutting down\n"))
+		go func() {
+			time.Sleep(100 * time.Millisecond) // let the response flush
+			close(stop)
+		}()
+	})
+
+	srv := &http.Server{Handler: r, ReadHeaderTimeout: 5 * time.Second}
+
+	_ = os.Remove(socketPath()) // stale socket from an unclean exit
+	ln, err := net.Listen("unix", socketPath())
+	if err != nil {
+		slog.Error("listen", "error", err)
+		os.Exit(1)
+	}
+
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		select {
+		case <-sig:
+		case <-stop:
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	slog.Info("manage ready", "socket", socketPath())
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Error("serve", "error", err)
+		os.Exit(1)
+	}
+	_ = os.Remove(socketPath())
+	slog.Info("manage stopped")
+}
+
+func runMigrations(dbPath string) error {
+	src, err := iofs.New(migrations.FS, ".")
+	if err != nil {
+		return err
+	}
+	m, err := migrate.NewWithSourceInstance("iofs", src, "sqlite://"+dbPath)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return err
+	}
+	return nil
+}

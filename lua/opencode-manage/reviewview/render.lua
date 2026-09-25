@@ -18,6 +18,19 @@ local FILTER_LABELS = {
 	neither = "🚫 NEITHER (foreign session+files)",
 }
 
+--- Coerce a proposal field to a number. The journal may store range fields
+--- as strings (or other types); math.floor/string %d need real numbers.
+--- @param v any
+--- @param fallback number
+--- @return number
+local function num(v, fallback)
+	local n = tonumber(v)
+	if n == nil then
+		return fallback
+	end
+	return n
+end
+
 --- Resolve a proposal path to absolute. Absolute paths pass through;
 --- relative paths return "" — a sentinel every consumer treats as
 --- unresolvable (filereadable("") is 0; the write path refuses it).
@@ -259,8 +272,8 @@ function M.after_content(p, path)
 		if block[#block] == "" then
 			table.remove(block)
 		end
-		local s = math.max(1, math.floor(p.start_line or 1))
-		local e = math.max(s, math.floor(p.end_line or s))
+		local s = math.max(1, math.floor(num(p.start_line, 1)))
+		local e = math.max(s, math.floor(num(p.end_line, s)))
 		lines = {}
 		for i = 1, math.min(s - 1, #disk) do
 			lines[#lines + 1] = disk[i]
@@ -318,8 +331,8 @@ function M.render_previews(state)
 			if block[#block] == "" then
 				table.remove(block)
 			end
-			local s = math.max(1, math.floor(p.start_line or 1))
-			local e = math.max(s, math.floor(p.end_line or s))
+			local s = math.max(1, math.floor(num(p.start_line, 1)))
+			local e = math.max(s, math.floor(num(p.end_line, s)))
 			local head, tail = {}, {}
 			for i = 1, math.min(s - 1, #disk) do
 				head[i] = disk[i]
@@ -423,7 +436,12 @@ function M.render_previews(state)
 	-- Winbars: what each side is, and that da writes the right one.
 	local opdesc = p.operation
 	if is_range then
-		opdesc = string.format("%s %d-%d", p.operation, p.start_line, p.end_line or p.start_line)
+		opdesc = string.format(
+			"%s %d-%d",
+			p.operation,
+			num(p.start_line, 0),
+			num(p.end_line, num(p.start_line, 0))
+		)
 	end
 	if state.cur_win and vim.api.nvim_win_is_valid(state.cur_win) then
 		vim.wo[state.cur_win].winbar = string.format("CURRENT %s  [%s]", p._rel or p.path, opdesc)

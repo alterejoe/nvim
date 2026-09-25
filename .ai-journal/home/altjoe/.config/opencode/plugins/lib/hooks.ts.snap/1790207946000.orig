@@ -1,0 +1,474 @@
+// /home/altjoe/.config/opencode/plugins/lib/hooks.ts FINAL-2
+/**
+ * Manage hooks — M2.5 verdict capture, C1 metrics, C2 prune, C4 reclamation,
+ * R1a/SL1 focus hints. Extracted from manage.ts (M3 composition split);
+ * behavior is unchanged: same fail-open/fail-closed split, same event names.
+ */
+import { loadRules } from "./airlock";
+import { loadRecentVerdicts, recordAbort, attachCorrection } from "./verdicts";
+import { recordTurn, recordEvent, hasPendingPrune, markPruneConsumed } from "./metrics";
+import { loadFocus, matchRefs, deriveSubject } from "./refs";
+import { matchSkills, skillSubjects } from "./skills";
+
+// ── M2.5 conversation verdict state ─────────────────────────────────────────
+// sessionID -> pending abort verdict id (awaiting the user's correction)
+const pendingAborts = new Map<string, number>();
+
+// ── C2 prune state ──────────────────────────────────────────────────────────
+// Sessions whose next compaction is user-requested and should be shaped.
+const pruneShaped = new Set<string>();
+
+// ── C4 context reclamation ──────────────────────────────────────────────────
+// Old, completed tool parts are stubbed at the message boundary so a long
+// session's prompt stops carrying megabytes of stale output (measured on a
+// live session: 40 read results ≈ 1.44MB, 24 proposal payloads ≈ 383KB in a
+// ~510k-token prompt). The most recent messages are never touched; stubs are
+// labeled so the model knows what was reclaimed and how to recover (re-read
+// / re-run). Reasoning parts are never touched (provider signature/continuity
+// semantics).
+const EVICT_KEEP_MESSAGES = 6;
+const EVICT_MIN_OUTPUT_CHARS = 2048;
+const EVICT_MIN_PAYLOAD_CHARS = 4096;
+const EVICT_MARK = "[evicted:";
+
+/**
+ * C4: stub old, completed tool parts in the outgoing message history. The
+ * part stays in place (call/result pairing preserved) — only its payload is
+ * replaced. Idempotent; one `evict` event per pass with work.
+ */
+async function reclaimContext(
+  directory: string,
+  messages: any[],
+): Promise<void> {
+  if (!Array.isArray(messages) || messages.length <= EVICT_KEEP_MESSAGES) {
+    return;
+  }
+  const cutoff = messages.length - EVICT_KEEP_MESSAGES;
+  let count = 0;
+  let bytes = 0;
+  let sessionID = "unknown";
+  for (let i = 0; i < cutoff; i++) {
+    const m = messages[i];
+    const parts = Array.isArray(m?.parts) ? m.parts : [];
+    if (m?.info?.sessionID && sessionID === "unknown") {
+      sessionID = m.info.sessionID;
+    }
+    for (const p of parts) {
+      const st = p?.state;
+      if (!st || st.status !== "completed") continue;
+      if (p.type !== "tool") continue;
+
+      // Result payloads: read/grep/glob output over the size threshold.
+      if (
+        typeof st.output === "string" &&
+        st.output.length > EVICT_MIN_OUTPUT_CHARS &&
+        !st.output.startsWith(EVICT_MARK)
+      ) {
+        const where =
+          typeof st.input?.filePath === "string"
+            ? st.input.filePath
+            : typeof st.input?.path === "string"
+              ? st.input.path
+              : "";
+        const how =
+          p.tool === "read" ? "re-read if needed" : "re-run if needed";
+        bytes += st.output.length;
+        st.output =
+          `${EVICT_MARK} ${p.tool}${where ? " " + where : ""} — output ` +
+          `reclaimed by manage (C4); ${how}]`;
+        count++;
+      }
+
+      // Proposal payloads: the big `content` arg of a reviewed proposal.
+      if (
+        typeof st.input?.content === "string" &&
+        st.input.content.length > EVICT_MIN_PAYLOAD_CHARS &&
+        !st.input.content.startsWith(EVICT_MARK)
+      ) {
+        const path = typeof st.input?.path === "string" ? st.input.path : "";
+        bytes += st.input.content.length;
+        st.input.content =
+          `${EVICT_MARK} ${p.tool} payload for ${path} — reviewed/applied; ` +
+          "the file on disk and the journal are the truth]";
+        count++;
+      }
+    }
+  }
+  if (count > 0) {
+    await recordEvent(
+      directory,
+      sessionID,
+      "evict",
+      `${count} part(s) · ${Math.round(bytes / 1024)}KB reclaimed`,
+      null,
+    );
+  }
+}
+
+/** Extract joined text from a message's text parts (defensive). */
+function messageText(info: any): string {
+  if (!info || !Array.isArray(info.parts)) return "";
+  return info.parts
+    .filter((p: any) => p && p.type === "text" && typeof p.text === "string")
+    .map((p: any) => p.text)
+    .join("\n")
+    .trim();
+}
+
+export function buildHooks(directory: string, client: any) {
+  return {
+    // ── Airlock gate: runs before EVERY tool call ────────────────────────
+    "tool.execute.before": async (input: any, output: any) => {
+      const rules = loadRules(directory);
+      const toolName = input.tool;
+
+      const explicitlyAllowed = rules.allow.includes(toolName);
+      const explicitlyDenied = rules.deny.includes(toolName);
+
+      // Explicit allow wins over the deny list.
+      if (explicitlyDenied && !explicitlyAllowed) {
+        throw new Error(
+          `[manage] ❌ Tool "${toolName}" is DENIED by the airlock — ` +
+            `permanently, do not retry it or attempt a workaround. ` +
+            `The AI cannot mutate the filesystem. Use emit_proposal instead.`,
+        );
+      }
+      // bash is denied by default even if a rules file forgot it.
+      if (toolName === "bash" && !explicitlyAllowed) {
+        throw new Error(
+          `[manage] ❌ bash is DENIED by the airlock — permanently, do not ` +
+            `retry it or attempt a workaround. The AI cannot run shell ` +
+            `commands. Propose changes with emit_proposal; the user runs commands.`,
+        );
+      }
+
+      // C1: the tool is proceeding — skill loads are context events.
+      // SL1: the load event carries the skill AND its routing subjects so
+      // objects mode joins skill <-> subject (doc 19 O1, doc 22).
+      if (toolName === "skill") {
+        const name = output?.args?.name;
+        if (typeof name === "string" && name) {
+          const tags: Array<{ tag: string; kind: string }> = [
+            { tag: name, kind: "skill" },
+          ];
+          try {
+            for (const s of skillSubjects(directory, name)) {
+              tags.push({ tag: s, kind: "subject" });
+            }
+          } catch {
+            // fail-open: tags are diagnostics, never a gate
+          }
+          await recordEvent(
+            directory,
+            input.sessionID,
+            "skill_load",
+            name,
+            null,
+            tags,
+          );
+        }
+      }
+    },
+
+    // ── C1 + O1: tool call capture (name + named-object tags) ────────────
+    "tool.execute.after": async (input: any) => {
+      const args = input.args || {};
+      const seen = new Set<string>();
+      const tags: Array<{ tag: string; kind: string }> = [];
+      const add = (v: unknown, kind: string) => {
+        if (typeof v !== "string") return;
+        const t = v.trim();
+        if (!t || t.length > 300) return;
+        const key = kind + "\u0000" + t;
+        if (seen.has(key)) return;
+        seen.add(key);
+        tags.push({ tag: t, kind });
+      };
+      switch (input.tool) {
+        case "read":
+          add(args.filePath, "file");
+          break;
+        case "grep":
+          add(args.path, "dir");
+          add(args.pattern, "pattern");
+          break;
+        case "glob":
+          add(args.path, "dir");
+          add(args.pattern, "pattern");
+          break;
+        case "list":
+          add(args.path, "dir");
+          break;
+        case "skill":
+          add(args.name, "skill");
+          break;
+        case "lsp_goto_definition":
+        case "lsp_find_references":
+          add(args.filePath, "file");
+          break;
+        case "lsp_symbols":
+          add(args.filePath, "file");
+          add(args.query, "symbol");
+          break;
+        case "emit_proposal":
+          add(args.path, "file");
+          add(args.group, "group");
+          break;
+        case "registry_propose": {
+          add(args.path, "file");
+          const paths = args.paths;
+          if (Array.isArray(paths)) {
+            for (const p of paths) add(p, "file");
+          }
+          break;
+        }
+        case "emit_skill": {
+          add(args.name, "skill");
+          if (typeof args.subject === "string" && args.subject.trim() !== "") {
+            try {
+              const arr = JSON.parse(args.subject);
+              if (Array.isArray(arr)) {
+                for (const s of arr) add(s, "subject");
+              }
+            } catch {
+              // malformed subject never breaks capture; emit_skill validates
+            }
+          }
+          break;
+        }
+        case "skill_load":
+          add(args.name, "skill");
+          break;
+        case "ref_lookup": {
+          if (typeof args.subject === "string" && args.subject)
+            add(args.subject, "subject");
+          if (typeof args.path === "string" && args.path) add(args.path, "ref");
+          break;
+        }
+      }
+      await recordEvent(
+        directory,
+        input.sessionID,
+        "tool_call",
+        input.tool,
+        null,
+        tags,
+      );
+    },
+
+    // ── M2.5 + C1 + C4: message + session events ─────────────────────────
+    event: async ({ event }: any) => {
+      if (!event) return;
+      const props = (event as any).properties;
+
+      // C4: compaction visibility — automatic compactions were invisible, so
+      // cache spikes could not be attributed. Record the event.
+      if (event.type === "session.compacted") {
+        await recordEvent(
+          directory,
+          props?.sessionID || props?.id || "unknown",
+          "compaction",
+          "session.compacted",
+          null,
+        );
+        return;
+      }
+
+      if (event.type !== "message.updated") return;
+      const info = props?.info;
+      if (!info) return;
+      // EventMessageUpdated.properties carries only `info`; sessionID lives
+      // on the message itself.
+      const sessionID = props?.sessionID || info.sessionID;
+
+      // C1: assistant token usage — context growth metrics (doc 19).
+      if (info.role === "assistant") {
+        await recordTurn(directory, info);
+      }
+
+      // M2.5: the escape-kill is a verdict.
+      if (info.error && info.error.name === "MessageAbortedError") {
+        if (!sessionID) return;
+        const killed = messageText(info);
+        const id = await recordAbort(
+          directory,
+          sessionID,
+          killed || "aborted generation",
+        );
+        if (id !== null) {
+          pendingAborts.set(sessionID, id);
+        }
+      }
+    },
+
+    // ── M2.5 + C2: new user message ──────────────────────────────────────
+    "chat.message": async (input: any, output: any) => {
+      const sessionID = input.sessionID;
+
+      // C2: claim a prune request written by the nvim console, shape the
+      // compaction (hook below), and trigger it. On failure the request is
+      // kept so the next message retries.
+      const reqTs = await hasPendingPrune(directory);
+      if (reqTs !== null && sessionID) {
+        pruneShaped.add(sessionID);
+        try {
+          await client.session.summarize({ path: { id: sessionID } });
+          await markPruneConsumed(directory, sessionID, reqTs);
+        } catch (e) {
+          console.error(
+            "[manage] prune: summarize failed (request kept): " + String(e),
+          );
+        }
+      }
+
+      // M2.5: pair the user's correction with the pending abort.
+      const pendingId = pendingAborts.get(sessionID);
+      if (pendingId === undefined) return;
+      const correction = (output.parts || [])
+        .filter(
+          (p: any) => p && p.type === "text" && typeof p.text === "string",
+        )
+        .map((p: any) => p.text)
+        .join("\n")
+        .trim();
+      if (!correction) return;
+      await attachCorrection(directory, pendingId, correction);
+      pendingAborts.delete(sessionID);
+    },
+
+    // ── C2: shape a user-requested compaction ────────────────────────────
+    "experimental.session.compacting": async (input: any, output: any) => {
+      const sessionID = input?.sessionID;
+      if (!sessionID || !pruneShaped.has(sessionID)) return;
+      pruneShaped.delete(sessionID);
+      output.context.push(
+        "[prune] User-requested prune. Keep: verified state, accepted and " +
+          "rejected outcomes, decisions, changed file paths, open questions, " +
+          "the current task and its scope. Drop: exploration and dead ends, " +
+          "superseded code and plans, tool-call noise, resolved discussion " +
+          "already captured above.",
+      );
+      output.prompt =
+        "Summarize this session for continuation after a user-requested prune. " +
+        "Preserve verified facts, decisions, file paths, and the current task; " +
+        "omit exploration, tool output, and superseded code.";
+    },
+
+    // ── M2 verdict injection + C4 reclamation at the message boundary ────
+    "experimental.chat.messages.transform": async (_input: any, output: any) => {
+      // C4: reclaim stale tool payloads before anything else looks at the
+      // history (old completed parts only; recent window untouched).
+      await reclaimContext(directory, output.messages);
+
+      const verdicts = await loadRecentVerdicts(directory, 5);
+      if (!verdicts.length) return;
+
+      const block =
+        "[verdicts] " +
+        verdicts
+          .map((v: any) => {
+            const target = v.path || v.reason || "conversation";
+            if (v.verdict === "aborted" && v.applied_content) {
+              return `aborted: ${target} (you said: ${v.applied_content.slice(0, 60)})`;
+            }
+            if (
+              v.verdict === "corrected" &&
+              v.proposed_content &&
+              v.applied_content
+            ) {
+              // Trailing whitespace is not a change: compare trimmed bodies,
+              // then report how much changed and the first changed line pair
+              // so the correction carries substance, not just a label.
+              const a = v.proposed_content.replace(/\s+$/, "").split("\n");
+              const b = v.applied_content.replace(/\s+$/, "").split("\n");
+              let changed = 0;
+              let firstOld = "";
+              let firstNew = "";
+              const n = Math.max(a.length, b.length);
+              for (let i = 0; i < n; i++) {
+                if (a[i] !== b[i]) {
+                  changed++;
+                  if (!firstOld && !firstNew) {
+                    firstOld = (a[i] ?? "").trim().slice(0, 60);
+                    firstNew = (b[i] ?? "").trim().slice(0, 60);
+                  }
+                  if (changed >= 3) break;
+                }
+              }
+              if (changed === 0) {
+                return `corrected: ${target}`;
+              }
+              return `corrected: ${target} (${changed} line(s): -${firstOld || "…"} +${firstNew || "…"})`;
+            }
+            return `${v.verdict}: ${target}${v.reason ? ` (${v.reason})` : ""}`;
+          })
+          .join(" · ");
+
+      const msgs = output.messages;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (m.info.role === "user") {
+          m.parts.push({
+            id: `verdicts-${Date.now()}`,
+            sessionID: m.info.sessionID,
+            messageID: m.info.id,
+            type: "text",
+            text: block,
+            synthetic: true,
+          });
+          break;
+        }
+      }
+    },
+
+    // ── R1a + SL1: focus-routed hints (docs 20, 22) ──────────────────────
+    "experimental.chat.system.transform": async (_input: any, output: any) => {
+      try {
+        // Startup default ("emits on its own"): the emission mandate is
+        // pushed on EVERY request — no focus row required — so every
+        // session starts knowing emit_proposal is the default delivery
+        // channel. The focus-routed hints below remain conditional.
+        output.system.push(
+          "[manage] Emission is the DEFAULT delivery channel for this " +
+            "session: every file change goes through emit_proposal — one " +
+            "call per file, one shared `group` slug per logical change. " +
+            "Never deliver a change as a copy-paste code block and never " +
+            "edit files directly; emit, then summarize what was queued " +
+            "for review.",
+        );
+        const focus = loadFocus(directory);
+        if (!focus) return;
+        const lines: string[] = [];
+
+        const refs = matchRefs(directory, focus);
+        if (refs.length) {
+          lines.push(
+            `[refs] focus=${focus.path} — ${refs.length} reference(s) available; ` +
+              `call ref_lookup with subject="${deriveSubject(focus.path)}" or ` +
+              `path="${focus.path}" to see the user's own code for this area.`,
+          );
+        }
+
+        // SL1: tier-filtered skill routing — one line, at most 3 entries.
+        // Each match carries its SKILL.md path; skill_load (SL3) reads it
+        // directly, so a process-cached native registry never blocks a
+        // freshly applied skill. The manifest and this hint are read per
+        // call — always live.
+        const skills = matchSkills(directory, focus.path);
+        if (skills.length) {
+          lines.push(
+            `[skills] focus=${focus.path} — matched: ${skills
+              .map((s: any) => `${s.name} (${s.tier}) → ${s.path}`)
+              .join(
+                ", ",
+              )}; load with skill_load (always fresh) or the skill tool when the registry has it.`,
+          );
+        }
+
+        if (lines.length) output.system.push(lines.join("\n"));
+      } catch {
+        // fail-open: refs/skills hints must never break a call
+      }
+    },
+  };
+}
