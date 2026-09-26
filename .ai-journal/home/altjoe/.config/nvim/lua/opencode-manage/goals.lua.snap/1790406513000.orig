@@ -1,0 +1,495 @@
+-- /home/altjoe/.config/nvim/lua/opencode-manage/goals.lua FINAL-3
+-- Durable project-local goals and milestones. This is user-owned planning
+-- state, separate from proposal evidence, file focus, and generated handoffs.
+
+local M = {}
+local sqlite = nil
+
+local SCHEMA = [[
+CREATE TABLE IF NOT EXISTS work_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id INTEGER REFERENCES work_items(id) ON DELETE SET NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('goal', 'milestone')),
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'planned',
+  importance INTEGER NOT NULL DEFAULT 3,
+  sibling_order INTEGER NOT NULL DEFAULT 0,
+  hold_reason TEXT NOT NULL DEFAULT '',
+  created_ts INTEGER NOT NULL,
+  updated_ts INTEGER NOT NULL,
+  completed_ts INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_work_items_parent_order
+  ON work_items(parent_id, sibling_order, id);
+CREATE INDEX IF NOT EXISTS idx_work_items_status
+  ON work_items(status, importance, sibling_order);
+
+CREATE TABLE IF NOT EXISTS active_work_item (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+  updated_ts INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS work_item_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+  ts INTEGER NOT NULL,
+  actor TEXT NOT NULL DEFAULT 'user',
+  event_type TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_work_item_events_item_ts
+  ON work_item_events(item_id, ts DESC);
+]]
+
+local function store_path()
+  local dir = vim.fn.getcwd()
+  for _ = 1, 12 do
+    local candidate = dir .. "/.opencode"
+    if vim.fn.isdirectory(candidate) == 1 then
+      return candidate .. "/state.db"
+    end
+    if vim.fn.isdirectory(dir .. "/.git") == 1 then
+      break
+    end
+    local parent = vim.fn.fnamemodify(dir, ":h")
+    if parent == dir then
+      break
+    end
+    dir = parent
+  end
+  return vim.fn.getcwd() .. "/.opencode/state.db"
+end
+
+local function open_writable()
+  local path = store_path()
+  vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+  local ok, db = pcall(function()
+    if not sqlite then
+      sqlite = require("sqlite")
+    end
+    return sqlite:open(path)
+  end)
+  if not ok or type(db) ~= "table" then
+    vim.notify("goals: could not open state store at " .. path, vim.log.levels.ERROR)
+    return nil
+  end
+  local schema_ok, schema_err = pcall(function()
+    db:execute(SCHEMA)
+  end)
+  if not schema_ok then
+    pcall(function()
+      db:close()
+    end)
+    vim.notify("goals: schema initialization failed: " .. tostring(schema_err), vim.log.levels.ERROR)
+    return nil
+  end
+  return db
+end
+
+local function close(db)
+  pcall(function()
+    db:close()
+  end)
+end
+
+local function timestamp()
+  return os.time() * 1000
+end
+
+local function valid_kind(kind)
+  return kind == "goal" or kind == "milestone"
+end
+
+local function valid_status(status)
+  return status == "planned"
+    or status == "in_progress"
+    or status == "on_hold"
+    or status == "completed"
+    or status == "deferred"
+    or status == "cancelled"
+end
+
+local function get_one(db, id)
+  local rows = db:eval(
+    "SELECT id, parent_id, kind, name, description, status, importance, "
+      .. "sibling_order, hold_reason, created_ts, updated_ts, completed_ts "
+      .. "FROM work_items WHERE id = ?",
+    { tonumber(id) }
+  )
+  if type(rows) == "table" then
+    return rows[1]
+  end
+  return nil
+end
+
+local function record_event(db, item_id, event_type, detail)
+  return db:eval(
+    "INSERT INTO work_item_events (item_id, ts, actor, event_type, detail) "
+      .. "VALUES (?, ?, 'user', ?, ?)",
+    { tonumber(item_id), timestamp(), event_type, detail or "" }
+  ) ~= false
+end
+
+local function sibling_rows(db, parent_id)
+  local rows = db:eval(
+    "SELECT id, sibling_order FROM work_items "
+      .. "WHERE (parent_id = ? OR (parent_id IS NULL AND ? IS NULL)) "
+      .. "ORDER BY sibling_order, id",
+    { parent_id, parent_id }
+  )
+  return type(rows) == "table" and rows or {}
+end
+
+function M.list()
+  local db = open_writable()
+  if not db then
+    return {}
+  end
+  local rows = {}
+  pcall(function()
+    local result = db:eval(
+      "SELECT id, parent_id, kind, name, description, status, importance, "
+        .. "sibling_order, hold_reason, created_ts, updated_ts, completed_ts "
+        .. "FROM work_items ORDER BY parent_id IS NOT NULL, parent_id, sibling_order, id"
+    )
+    rows = type(result) == "table" and result or {}
+  end)
+  close(db)
+  return rows
+end
+
+function M.get(id)
+  local db = open_writable()
+  if not db then
+    return nil
+  end
+  local row = get_one(db, id)
+  close(db)
+  return row
+end
+
+function M.active_id()
+  local db = open_writable()
+  if not db then
+    return nil
+  end
+  local rows = db:eval("SELECT item_id FROM active_work_item WHERE id = 1")
+  close(db)
+  if type(rows) == "table" and rows[1] then
+    return tonumber(rows[1].item_id)
+  end
+  return nil
+end
+
+function M.create(kind, name, description, parent_id)
+  if not valid_kind(kind) or not name or vim.trim(name) == "" then
+    return nil, "kind and name are required"
+  end
+  local db = open_writable()
+  if not db then
+    return nil, "state store unavailable"
+  end
+  local ok, result = pcall(function()
+    local next_rows = sibling_rows(db, parent_id)
+    local next_order = #next_rows
+    local now = timestamp()
+    local inserted = db:eval(
+      "INSERT INTO work_items "
+        .. "(parent_id, kind, name, description, importance, sibling_order, created_ts, updated_ts) "
+        .. "VALUES (?, ?, ?, ?, 3, ?, ?, ?)",
+      { parent_id, kind, vim.trim(name), description or "", next_order, now, now }
+    )
+    if inserted == false then
+      error("insert failed")
+    end
+    local rows = db:eval("SELECT last_insert_rowid() AS id")
+    local id = type(rows) == "table" and rows[1] and tonumber(rows[1].id)
+    if not id then
+      error("could not read inserted id")
+    end
+    if not record_event(db, id, "created", kind .. ": " .. vim.trim(name)) then
+      error("event insert failed")
+    end
+    return id
+  end)
+  close(db)
+  if not ok then
+    return nil, tostring(result)
+  end
+  return result
+end
+
+function M.update(id, name, description)
+  if not name or vim.trim(name) == "" then
+    return false, "name is required"
+  end
+  local db = open_writable()
+  if not db then
+    return false, "state store unavailable"
+  end
+  local ok, err = pcall(function()
+    local updated = db:eval(
+      "UPDATE work_items SET name = ?, description = ?, updated_ts = ? WHERE id = ?",
+      { vim.trim(name), description or "", timestamp(), tonumber(id) }
+    )
+    if updated == false then
+      error("update failed")
+    end
+    if not record_event(db, id, "edited", vim.trim(name)) then
+      error("event insert failed")
+    end
+  end)
+  close(db)
+  if not ok then
+    return false, tostring(err)
+  end
+  return true
+end
+
+function M.set_status(id, status, reason)
+  if not valid_status(status) then
+    return false, "invalid status"
+  end
+  local db = open_writable()
+  if not db then
+    return false, "state store unavailable"
+  end
+  local ok, err = pcall(function()
+    local completed = status == "completed" and timestamp() or nil
+    local updated = db:eval(
+      "UPDATE work_items SET status = ?, hold_reason = ?, completed_ts = ?, updated_ts = ? WHERE id = ?",
+      { status, reason or "", completed, timestamp(), tonumber(id) }
+    )
+    if updated == false then
+      error("status update failed")
+    end
+    if not record_event(db, id, "status", status .. (reason and reason ~= "" and ": " .. reason or "")) then
+      error("event insert failed")
+    end
+  end)
+  close(db)
+  if not ok then
+    return false, tostring(err)
+  end
+  return true
+end
+
+function M.set_importance(id, importance)
+  importance = math.max(1, math.min(5, tonumber(importance) or 3))
+  local db = open_writable()
+  if not db then
+    return false, "state store unavailable"
+  end
+  local ok, err = pcall(function()
+    local updated = db:eval(
+      "UPDATE work_items SET importance = ?, updated_ts = ? WHERE id = ?",
+      { importance, timestamp(), tonumber(id) }
+    )
+    if updated == false then
+      error("importance update failed")
+    end
+    if not record_event(db, id, "importance", tostring(importance)) then
+      error("event insert failed")
+    end
+  end)
+  close(db)
+  if not ok then
+    return false, tostring(err)
+  end
+  return true
+end
+
+function M.set_active(id)
+  local db = open_writable()
+  if not db then
+    return false, "state store unavailable"
+  end
+  local ok, err = pcall(function()
+    if not get_one(db, id) then
+      error("work item not found")
+    end
+    local updated = db:eval(
+      "INSERT INTO active_work_item (id, item_id, updated_ts) VALUES (1, ?, ?) "
+        .. "ON CONFLICT(id) DO UPDATE SET item_id = excluded.item_id, updated_ts = excluded.updated_ts",
+      { tonumber(id), timestamp() }
+    )
+    if updated == false then
+      error("active item update failed")
+    end
+    if not record_event(db, id, "activated", "") then
+      error("event insert failed")
+    end
+  end)
+  close(db)
+  if not ok then
+    return false, tostring(err)
+  end
+  return true
+end
+
+function M.clear_active()
+  local db = open_writable()
+  if not db then
+    return false, "state store unavailable"
+  end
+  local ok, err = pcall(function()
+    local active = db:eval("SELECT item_id FROM active_work_item WHERE id = 1")
+    local item_id = type(active) == "table" and active[1] and active[1].item_id
+    if db:eval("DELETE FROM active_work_item WHERE id = 1") == false then
+      error("active item clear failed")
+    end
+    if item_id then
+      record_event(db, item_id, "deactivated", "")
+    end
+  end)
+  close(db)
+  if not ok then
+    return false, tostring(err)
+  end
+  return true
+end
+
+local function reorder(db, rows)
+  for index, row in ipairs(rows) do
+    if db:eval("UPDATE work_items SET sibling_order = ?, updated_ts = ? WHERE id = ?", {
+      index - 1,
+      timestamp(),
+      row.id,
+    }) == false then
+      error("reorder failed")
+    end
+  end
+end
+
+function M.move(id, delta)
+  delta = delta < 0 and -1 or 1
+  local db = open_writable()
+  if not db then
+    return false, "state store unavailable"
+  end
+  local ok, err = pcall(function()
+    local item = get_one(db, id)
+    if not item then
+      error("work item not found")
+    end
+    local rows = sibling_rows(db, item.parent_id)
+    local index
+    for i, row in ipairs(rows) do
+      if tonumber(row.id) == tonumber(id) then
+        index = i
+        break
+      end
+    end
+    if not index then
+      error("work item is not ordered")
+    end
+    local target = index + delta
+    if target < 1 or target > #rows then
+      return
+    end
+    rows[index], rows[target] = rows[target], rows[index]
+    reorder(db, rows)
+    record_event(db, id, "reordered", tostring(delta))
+  end)
+  close(db)
+  if not ok then
+    return false, tostring(err)
+  end
+  return true
+end
+
+function M.indent(id)
+  local db = open_writable()
+  if not db then
+    return false, "state store unavailable"
+  end
+  local ok, err = pcall(function()
+    local item = get_one(db, id)
+    if not item then
+      error("work item not found")
+    end
+    local rows = sibling_rows(db, item.parent_id)
+    local index
+    for i, row in ipairs(rows) do
+      if tonumber(row.id) == tonumber(id) then
+        index = i
+        break
+      end
+    end
+    local previous = index and rows[index - 1]
+    if not previous then
+      return
+    end
+    local child_rows = sibling_rows(db, previous.id)
+    if db:eval("UPDATE work_items SET parent_id = ?, sibling_order = ?, updated_ts = ? WHERE id = ?", {
+      previous.id,
+      #child_rows,
+      timestamp(),
+      id,
+    }) == false then
+      error("indent failed")
+    end
+    record_event(db, id, "indented", tostring(previous.id))
+  end)
+  close(db)
+  if not ok then
+    return false, tostring(err)
+  end
+  return true
+end
+
+function M.outdent(id)
+  local db = open_writable()
+  if not db then
+    return false, "state store unavailable"
+  end
+  local ok, err = pcall(function()
+    local item = get_one(db, id)
+    if not item or not item.parent_id then
+      return
+    end
+    local parent = get_one(db, item.parent_id)
+    if not parent then
+      error("parent work item not found")
+    end
+    local new_parent = parent.parent_id
+    local new_order = tonumber(parent.sibling_order) + 1
+    if db:eval(
+      "UPDATE work_items SET sibling_order = sibling_order + 1, updated_ts = ? "
+        .. "WHERE (parent_id = ? OR (parent_id IS NULL AND ? IS NULL)) AND sibling_order >= ?",
+      { timestamp(), new_parent, new_parent, new_order }
+    ) == false then
+      error("outdent sibling shift failed")
+    end
+    if db:eval("UPDATE work_items SET parent_id = ?, sibling_order = ?, updated_ts = ? WHERE id = ?", {
+      new_parent,
+      new_order,
+      timestamp(),
+      id,
+    }) == false then
+      error("outdent failed")
+    end
+    record_event(db, id, "outdented", new_parent and tostring(new_parent) or "root")
+  end)
+  close(db)
+  if not ok then
+    return false, tostring(err)
+  end
+  return true
+end
+
+function M.summary()
+  local rows = M.list()
+  print(string.format("work items: %d", #rows))
+  for _, row in ipairs(rows) do
+    print(string.format("  #%s %-10s %-12s %s", row.id, row.kind, row.status, row.name))
+  end
+  if #rows == 0 then
+    print("  none yet - use :ManageGoals to create one")
+  end
+  return rows
+end
+
+return M

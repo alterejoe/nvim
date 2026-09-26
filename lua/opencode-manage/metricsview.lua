@@ -1,5 +1,5 @@
 -- /home/altjoe/.config/nvim/lua/opencode-manage/metricsview.lua FINAL
--- opencode-manage.metricsview — the metrics interface (doc 19, C1/C2/O1).
+-- opencode-manage.metricsview — metrics panel (console adapter, doc 19 C1/C2/O1).
 -- Persistent two-pane viewer, same shape as the other manage viewers:
 --   j/k move · t mode (turns <-> objects) · r refresh · Q kill
 -- TURNS mode: one row per assistant turn — time · in · out · cache · delta ·
@@ -8,27 +8,19 @@
 -- groups) with touch counts and last-seen; detail = verdict outcomes for
 -- file objects plus the recent events under that tag.
 -- Data comes from opencode-manage.metrics — reads only, never writes.
+-- The engine (opencode-manage.console) owns windows/keymaps/state; this
+-- file owns the metrics-specific rendering and the mode toggle.
 
 local metrics = require("opencode-manage.metrics")
+local console = require("opencode-manage.console")
 
 local M = {}
 
-local state = {
-	mode = "turns", -- "turns" | "objects"
-	turns = {},
-	events = {},
-	objects = {},
-	idx = 1,
-	obj_idx = 1,
-	prune_pending = false,
-	list_buf = nil,
-	detail_buf = nil,
-	list_win = nil,
-	detail_win = nil,
-	outer_win = nil,
-	origin_win = nil,
-	autocmd = nil,
-}
+local adapter = { mode = "turns" } -- "turns" | "objects"
+
+-- One cache per refresh: turns + events + objects + prune flag. The detail
+-- panes read from here — never re-query the store per keystroke.
+local cache = { turns = {}, events = {}, objects = {}, prune_pending = false }
 
 local function fmt_ts(ts)
 	if not ts or ts == 0 then
@@ -55,31 +47,34 @@ local function num(v)
 	return tonumber(v) or 0
 end
 
-local function load_items()
-	state.turns = metrics.turns(300)
-	state.events = metrics.events(1000)
-	if state.mode == "objects" then
-		state.objects = metrics.objects(300)
-		state.obj_idx = math.max(1, math.min(state.obj_idx, #state.objects))
-	else
-		local s = metrics.stats()
-		state.prune_pending = s.prune_pending == true
-		state.idx = math.max(1, math.min(state.idx, #state.turns))
+--- Refresh source: loads the shared cache, returns the mode's list.
+--- @return table[]
+local function list()
+	cache.events = metrics.events(1000)
+	local s = metrics.stats()
+	cache.prune_pending = s.prune_pending == true
+	if adapter.mode == "objects" then
+		cache.objects = metrics.objects(300)
+		return cache.objects
 	end
+	cache.turns = metrics.turns(300)
+	return cache.turns
 end
 
---- Events inside the selected turn's window: (previous turn ts, this ts].
+--- Context events whose ts falls inside turn i's window (exclusive of the
+--- older turn's ts, inclusive of this turn's).
+--- @param items table[]
 --- @param i number
 --- @return table[]
-local function window_events(i)
-	local turn = state.turns[i]
+local function window_events(items, i)
+	local turn = items[i]
 	if not turn then
 		return {}
 	end
 	local hi = num(turn.ts)
-	local lo = state.turns[i + 1] and num(state.turns[i + 1].ts) or 0
+	local lo = items[i + 1] and num(items[i + 1].ts) or 0
 	local out = {}
-	for _, e in ipairs(state.events) do
+	for _, e in ipairs(cache.events) do
 		local ts = num(e.ts)
 		if ts > lo and ts <= hi then
 			out[#out + 1] = e
@@ -88,43 +83,44 @@ local function window_events(i)
 	return out
 end
 
---- How much context moved versus the previous (older) turn.
+--- Cache delta vs the previous (older) turn.
+--- @param items table[]
 --- @param i number
 --- @return number|nil
-local function cache_delta(i)
-	local cur = state.turns[i]
-	local older = state.turns[i + 1]
+local function cache_delta(items, i)
+	local cur = items[i]
+	local older = items[i + 1]
 	if not cur or not older then
 		return nil
 	end
 	return num(cur.cache_read) - num(older.cache_read)
 end
 
---- @param d number|nil
---- @return string
 local function fmt_delta(d)
-	if d == nil or d == 0 then
+	if d == nil then
 		return ""
 	end
-	if d < 0 then
-		return "▼" .. tostring(-d)
+	if d >= 0 then
+		return string.format("+%d", d)
 	end
-	return "▲" .. tostring(d)
+	return tostring(d)
 end
 
---- Name the turn from its own numbers + window events.
+--- Badge for a turn: compaction (big input or big negative delta), proposal
+--- (any proposal event in the window), tool burst (>= 5 tool calls).
+--- @param items table[]
 --- @param i number
 --- @param d number|nil
 --- @return string
-local function turn_badge(i, d)
-	local t = state.turns[i]
+local function turn_badge(items, i, d)
+	local t = items[i]
 	if not t then
 		return ""
 	end
 	if num(t.tokens_input) >= 20000 or (d ~= nil and d <= -50000) then
 		return "⚙ compaction"
 	end
-	local evs = window_events(i)
+	local evs = window_events(items, i)
 	local tools, proposals = 0, 0
 	for _, e in ipairs(evs) do
 		if e.kind == "tool_call" then
@@ -142,313 +138,158 @@ local function turn_badge(i, d)
 	return ""
 end
 
-local function render_turns_list()
-	local lines = {}
-	local cursor_line = 1
-	for i, t in ipairs(state.turns) do
-		local marker = (i == state.idx) and ">" or " "
-		local d = cache_delta(i)
-		table.insert(
-			lines,
-			string.format(
-				"%s %s  in %-7s out %-6s cache %-8s %-9s %s",
-				marker,
-				fmt_clock(t.ts),
-				tostring(num(t.tokens_input)),
-				tostring(num(t.tokens_output)),
-				tostring(num(t.cache_read)),
-				fmt_delta(d),
-				turn_badge(i, d)
-			)
-		)
-		if i == state.idx then
-			cursor_line = #lines
-		end
-	end
-	if #lines == 0 then
-		table.insert(lines, "— no turns yet — they record on every assistant message")
-	end
-	return lines, cursor_line
-end
-
-local function render_objects_list()
-	local lines = {}
-	local cursor_line = 1
-	for i, o in ipairs(state.objects) do
-		local marker = (i == state.obj_idx) and ">" or " "
-		local tag = tostring(o.tag or "?")
-		table.insert(
-			lines,
-			string.format(
-				"%s %-8s %5d  %-12s %s",
-				marker,
-				tostring(o.kind or "?"),
-				num(o.n),
-				fmt_short(o.last),
-				tag
-			)
-		)
-		if i == state.obj_idx then
-			cursor_line = #lines
-		end
-	end
-	if #lines == 0 then
-		table.insert(lines, "— no objects yet — tags record from tool calls (files, dirs, patterns, symbols)")
-	end
-	return lines, cursor_line
-end
-
-local function render_list()
-	if not state.list_buf or not vim.api.nvim_buf_is_valid(state.list_buf) then
-		return
-	end
-	local lines, cursor_line
-	if state.mode == "objects" then
-		lines, cursor_line = render_objects_list()
-	else
-		lines, cursor_line = render_turns_list()
-	end
-	if vim.bo[state.list_buf].modifiable == false then
-		vim.bo[state.list_buf].modifiable = true
-	end
-	vim.api.nvim_buf_set_lines(state.list_buf, 0, -1, false, lines)
-	vim.bo[state.list_buf].modifiable = false
-
-	if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
-		local total = vim.api.nvim_buf_line_count(state.list_buf)
-		local target = math.max(1, math.min(cursor_line, total))
-		pcall(vim.api.nvim_win_set_cursor, state.list_win, { target, 0 })
-	end
-end
-
-local function render_turns_detail()
-	local t = state.turns[state.idx]
-	local lines = {}
-	if not t then
-		return { "— nothing selected —" }
-	end
-	local d = cache_delta(state.idx)
-	local evs = window_events(state.idx)
-	local badge = turn_badge(state.idx, d)
-	lines[#lines + 1] = "turn:     " .. fmt_ts(t.ts)
-	lines[#lines + 1] = "message:  " .. (t.message_id or "?")
-	lines[#lines + 1] = "kind:     " .. (badge ~= "" and badge or "chat")
-	lines[#lines + 1] = string.format(
-		"tokens:   in %s · out %s · reasoning %s · cache r/w %s/%s",
-		tostring(num(t.tokens_input)),
-		tostring(num(t.tokens_output)),
-		tostring(num(t.tokens_reasoning)),
-		tostring(num(t.cache_read)),
-		tostring(num(t.cache_write))
-	)
-	lines[#lines + 1] = "context:  " .. (fmt_delta(d) ~= "" and (fmt_delta(d) .. " vs previous turn") or "no previous turn")
-	lines[#lines + 1] = "model:    " .. (t.model or "?") .. "  ·  agent: " .. (t.agent or "?")
-	lines[#lines + 1] = string.rep("─", 40)
-	if #evs == 0 then
-		lines[#lines + 1] = "— no context events in this window —"
-	else
-		lines[#lines + 1] = string.format("events in this turn's window (%d):", #evs)
-		for _, e in ipairs(evs) do
-			lines[#lines + 1] = string.format("  %s  %-16s %s", fmt_clock(e.ts), e.kind or "?", e.detail or "")
-		end
-	end
-	return lines
-end
-
-local function render_objects_detail()
-	local o = state.objects[state.obj_idx]
-	if not o then
-		return { "— nothing selected —" }
-	end
-	local lines = {}
-	lines[#lines + 1] = "object:   " .. tostring(o.tag or "?")
-	lines[#lines + 1] = "kind:     " .. tostring(o.kind or "?")
-	lines[#lines + 1] = string.format("touches:  %d", num(o.n))
-	lines[#lines + 1] = "last:     " .. fmt_ts(o.last)
-	if o.kind == "file" then
-		local vs = metrics.object_verdicts(o.tag)
-		if #vs > 0 then
-			local parts = {}
-			for _, v in ipairs(vs) do
-				parts[#parts + 1] = string.format("%s=%d", v.verdict or "?", num(v.n))
-			end
-			lines[#lines + 1] = "verdicts: " .. table.concat(parts, " · ")
+--- Rows per mode.
+--- @param items table[]
+--- @return table[]
+local function rows(items)
+	local out = {}
+	for i, it in ipairs(items) do
+		if adapter.mode == "objects" then
+			out[i] = {
+				item = it,
+				text = string.format(
+					"%-8s %5d  %-12s %s",
+					tostring(it.kind or "?"),
+					num(it.n),
+					fmt_short(it.last),
+					tostring(it.tag or "?")
+				),
+			}
 		else
-			lines[#lines + 1] = "verdicts: — none yet"
+			local d = cache_delta(items, i)
+			out[i] = {
+				item = it,
+				text = string.format(
+					"%s  in %-7s out %-6s cache %-8s %-9s %s",
+					fmt_clock(it.ts),
+					tostring(num(it.tokens_input)),
+					tostring(num(it.tokens_output)),
+					tostring(num(it.cache_read)),
+					fmt_delta(d),
+					turn_badge(items, i, d)
+				),
+			}
 		end
 	end
-	lines[#lines + 1] = string.rep("─", 40)
-	local evs = metrics.object_events(o.tag, o.kind, 80)
-	if #evs == 0 then
-		lines[#lines + 1] = "— no events under this object —"
-	else
-		lines[#lines + 1] = string.format("recent events (%d):", #evs)
-		for _, e in ipairs(evs) do
-			lines[#lines + 1] = string.format("  %s  %-16s %s", fmt_clock(e.ts), e.kind or "?", e.detail or "")
-		end
-	end
-	return lines
+	return out
 end
 
-local function render_detail()
-	if not state.detail_buf or not vim.api.nvim_buf_is_valid(state.detail_buf) then
-		return
-	end
+--- Detail per mode.
+--- @param it table
+--- @param h table  console handle
+--- @return table
+local function preview(it, h)
 	local lines
-	if state.mode == "objects" then
-		lines = render_objects_detail()
-	else
-		lines = render_turns_detail()
-	end
-	if vim.bo[state.detail_buf].modifiable == false then
-		vim.bo[state.detail_buf].modifiable = true
-	end
-	vim.api.nvim_buf_set_lines(state.detail_buf, 0, -1, false, lines)
-	vim.bo[state.detail_buf].modifiable = false
-	vim.api.nvim_buf_set_name(state.detail_buf, "METRICS DETAIL")
-end
-
-local function set_legend()
-	if not state.list_win or not vim.api.nvim_win_is_valid(state.list_win) then
-		return
-	end
-	vim.wo[state.list_win].winbar = string.format(
-		"METRICS · %s · %d turns · %d events · %d objects · prune: %s · t mode · j/k r Q",
-		state.mode,
-		#state.turns,
-		#state.events,
-		#state.objects,
-		state.prune_pending and "requested" or "—"
-	)
-end
-
-local function move(delta)
-	if state.mode == "objects" then
-		if #state.objects == 0 then
-			return
+	if adapter.mode == "objects" then
+		lines = {}
+		lines[#lines + 1] = "object:   " .. tostring(it.tag or "?")
+		lines[#lines + 1] = "kind:     " .. tostring(it.kind or "?")
+		lines[#lines + 1] = string.format("touches:  %d", num(it.n))
+		lines[#lines + 1] = "last:     " .. fmt_ts(it.last)
+		if it.kind == "file" then
+			local vs = metrics.object_verdicts(it.tag)
+			if #vs > 0 then
+				local parts = {}
+				for _, v in ipairs(vs) do
+					parts[#parts + 1] = string.format("%s=%d", v.verdict or "?", num(v.n))
+				end
+				lines[#lines + 1] = "verdicts: " .. table.concat(parts, " · ")
+			else
+				lines[#lines + 1] = "verdicts: — none yet"
+			end
 		end
-		state.obj_idx = math.max(1, math.min(#state.objects, state.obj_idx + delta))
-	else
-		if #state.turns == 0 then
-			return
+		lines[#lines + 1] = string.rep("─", 40)
+		local evs = metrics.object_events(it.tag, it.kind, 80)
+		if #evs == 0 then
+			lines[#lines + 1] = "— no events under this object —"
+		else
+			lines[#lines + 1] = string.format("recent events (%d):", #evs)
+			for _, e in ipairs(evs) do
+				lines[#lines + 1] = string.format("  %s  %-16s %s", fmt_clock(e.ts), e.kind or "?", e.detail or "")
+			end
 		end
-		state.idx = math.max(1, math.min(#state.turns, state.idx + delta))
-	end
-	render_list()
-	render_detail()
-end
-
-local function toggle_mode()
-	if state.mode == "turns" then
-		state.mode = "objects"
 	else
-		state.mode = "turns"
-	end
-	load_items()
-	render_list()
-	render_detail()
-	set_legend()
-	vim.notify("metrics mode: " .. state.mode, vim.log.levels.INFO)
-end
-
-local function refresh()
-	load_items()
-	render_list()
-	render_detail()
-	set_legend()
-end
-
-local function kill_viewer()
-	for _, b in ipairs({ state.list_buf, state.detail_buf }) do
-		if b and vim.api.nvim_buf_is_valid(b) then
-			pcall(vim.keymap.del, "n", "Q", { buffer = b })
-		end
-	end
-	if state.autocmd then
-		pcall(vim.api.nvim_del_autocmd, state.autocmd)
-		state.autocmd = nil
-	end
-	local seen = {}
-	for _, w in ipairs({ state.list_win, state.detail_win, state.outer_win }) do
-		if w and not seen[w] then
-			seen[w] = true
-			if vim.api.nvim_win_is_valid(w) then
-				vim.api.nvim_win_close(w, true)
+		local i = h.state.idx
+		local d = cache_delta(h.state.items, i)
+		local evs = window_events(h.state.items, i)
+		local badge = turn_badge(h.state.items, i, d)
+		lines = {}
+		lines[#lines + 1] = "turn:     " .. fmt_ts(it.ts)
+		lines[#lines + 1] = "message:  " .. (it.message_id or "?")
+		lines[#lines + 1] = "kind:     " .. (badge ~= "" and badge or "chat")
+		lines[#lines + 1] = string.format(
+			"tokens:   in %s · out %s · reasoning %s · cache r/w %s/%s",
+			tostring(num(it.tokens_input)),
+			tostring(num(it.tokens_output)),
+			tostring(num(it.tokens_reasoning)),
+			tostring(num(it.cache_read)),
+			tostring(num(it.cache_write))
+		)
+		lines[#lines + 1] = "context:  " .. (fmt_delta(d) ~= "" and (fmt_delta(d) .. " vs previous turn") or "no previous turn")
+		lines[#lines + 1] = "model:    " .. (it.model or "?") .. "  ·  agent: " .. (it.agent or "?")
+		lines[#lines + 1] = string.rep("─", 40)
+		if #evs == 0 then
+			lines[#lines + 1] = "— no context events in this window —"
+		else
+			lines[#lines + 1] = string.format("events in this turn's window (%d):", #evs)
+			for _, e in ipairs(evs) do
+				lines[#lines + 1] = string.format("  %s  %-16s %s", fmt_clock(e.ts), e.kind or "?", e.detail or "")
 			end
 		end
 	end
-	state.turns = {}
-	state.events = {}
-	state.objects = {}
-	state.list_buf = nil
-	state.detail_buf = nil
-	state.list_win = nil
-	state.detail_win = nil
-	state.outer_win = nil
-	state.origin_win = nil
-	vim.notify("🗑️ Metrics viewer closed", vim.log.levels.INFO)
+	return {
+		left = {
+			lines = lines,
+			name = "METRICS DETAIL",
+			ft = "",
+			modifiable = false,
+			winbar = "METRICS DETAIL",
+		},
+	}
 end
 
-local function make_window(buf, split, ref_win)
-	local opts = { relative = "", split = split }
-	if ref_win then
-		opts.win = ref_win
+--- t: toggle turns <-> objects mode.
+--- @param h table  console handle
+local function toggle_mode(h)
+	if adapter.mode == "turns" then
+		adapter.mode = "objects"
+	else
+		adapter.mode = "turns"
 	end
-	return vim.api.nvim_open_win(buf, false, opts)
-end
-
-local function map_keys(buf)
-	local opts = { buffer = buf, nowait = true, noremap = true, silent = true }
-	vim.keymap.set("n", "j", function()
-		move(1)
-	end, opts)
-	vim.keymap.set("n", "k", function()
-		move(-1)
-	end, opts)
-	vim.keymap.set("n", "t", toggle_mode, opts)
-	vim.keymap.set("n", "r", refresh, opts)
-	vim.keymap.set("n", "Q", kill_viewer, opts)
+	h.state.idx = 1
+	h.refresh()
+	vim.notify("metrics mode: " .. adapter.mode, vim.log.levels.INFO)
 end
 
 function M.open()
-	load_items()
-
-	state.origin_win = vim.api.nvim_get_current_win()
-
-	state.list_buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[state.list_buf].bufhidden = "wipe"
-	state.outer_win = make_window(state.list_buf, "right")
-	state.list_win = state.outer_win
-	set_legend()
-
-	state.detail_buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[state.detail_buf].bufhidden = "wipe"
-	vim.bo[state.detail_buf].modifiable = false
-	state.detail_win = make_window(state.detail_buf, "below", state.list_win)
-
-	vim.api.nvim_set_current_win(state.list_win)
-	map_keys(state.list_buf)
-	map_keys(state.detail_buf)
-
-	state.autocmd = vim.api.nvim_create_autocmd("WinEnter", {
-		callback = function()
-			local cur = vim.api.nvim_get_current_win()
-			if
-				state.list_win
-				and vim.api.nvim_win_is_valid(state.list_win)
-				and (cur == state.detail_win or cur == state.list_win)
-			then
-				vim.schedule(function()
-					if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
-						vim.api.nvim_set_current_win(state.list_win)
-					end
-				end)
-			end
+	console.open({
+		name = "Metrics",
+		layout = "detail",
+		list = list,
+		rows = rows,
+		preview = preview,
+		keys = {
+			{ key = "t", desc = "mode", fn = toggle_mode },
+		},
+		legend = function(h)
+			return string.format(
+				"METRICS · %s · %d turns · %d events · %d objects · prune: %s · t mode · j/k r Q",
+				adapter.mode,
+				#cache.turns,
+				#cache.events,
+				#cache.objects,
+				cache.prune_pending and "requested" or "—"
+			)
 		end,
+		empty_lines = function()
+			if adapter.mode == "objects" then
+				return { "— no objects yet — tags record from tool calls (files, dirs, patterns, symbols)" }
+			end
+			return { "— no turns yet — they record on every assistant message" }
+		end,
+		open_empty = true,
+		keep_empty = true,
 	})
-
-	render_list()
-	render_detail()
 end
 
 return M

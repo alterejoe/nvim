@@ -1,0 +1,75 @@
+// /home/altjoe/.config/opencode/plugins/lib/tools/work-item-list.ts FINAL-2
+import { tool } from "@opencode-ai/plugin";
+import { listWorkItems, type WorkItem } from "../work-items";
+
+export function workItemListTool(directory: string) {
+  return tool({
+    description:
+      "Read-only goal and milestone tree lookup. Returns project work items " +
+      "with hierarchy, status, importance, descriptions, and ordering. It " +
+      "never creates, updates, reorders, or completes work items.",
+    args: {
+      status: tool.schema
+        .string()
+        .optional()
+        .describe("Optional status filter, such as in_progress or on_hold."),
+      include_completed: tool.schema
+        .boolean()
+        .optional()
+        .describe("Include completed, cancelled, and merged items. Default false."),
+    },
+    async execute(args: any, context: any) {
+      let items = listWorkItems(directory);
+      if (args.status) items = items.filter((item) => item.status === args.status);
+      if (!args.include_completed) {
+        items = items.filter(
+          (item) => !["completed", "cancelled", "merged"].includes(item.status),
+        );
+      }
+      await recordEventSafe(directory, context?.sessionID, items.length);
+      return JSON.stringify(
+        {
+          ok: true,
+          count: items.length,
+          items: items.map(publicItem),
+          note:
+            "Read-only state. Do not infer completion from absence; inspect status, children, and events.",
+        },
+        null,
+        2,
+      );
+    },
+  });
+}
+
+function publicItem(item: WorkItem): Record<string, unknown> {
+  return {
+    id: item.id,
+    parent_id: item.parent_id,
+    kind: item.kind,
+    name: item.name,
+    description: item.description,
+    status: item.status,
+    importance: item.importance,
+    sibling_order: item.sibling_order,
+    hold_reason: item.hold_reason,
+    deferred_reason: item.deferred_reason,
+    merged_into_id: item.merged_into_id,
+    created_at: item.created_at,
+    updated_at: item.updated_at,
+    completed_at: item.completed_at,
+  };
+}
+
+async function recordEventSafe(
+  directory: string,
+  sessionID: string | undefined,
+  count: number,
+): Promise<void> {
+  try {
+    const { recordEvent } = await import("../metrics");
+    await recordEvent(directory, sessionID, "work_item_list", `${count} item(s)`, null);
+  } catch {
+    // Metrics are diagnostics, never a gate.
+  }
+}

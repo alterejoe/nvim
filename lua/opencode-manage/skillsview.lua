@@ -1,5 +1,5 @@
 -- /home/altjoe/.config/nvim/lua/opencode-manage/skillsview.lua FINAL
--- opencode-manage.skillsview — the skills lifecycle viewer (doc 22, SL2).
+-- opencode-manage.skillsview — skills lifecycle panel (console adapter, doc 22 SL2).
 -- Persistent two-pane viewer over the merged routing manifests (global +
 -- nearest project, project wins by name):
 --   j/k move · t re-tier · n note · s subjects · D drop entry ·
@@ -12,23 +12,14 @@
 -- Detail: entry metadata + note, usage from THIS project's metrics store
 -- (skill-tag touches + recent loads), and a preview of the SKILL.md body.
 -- Writes route through opencode-manage.skills — snapshot + journal each time.
+-- The engine (opencode-manage.console) owns windows/keymaps/state; this
+-- file owns the skills-specific rendering and actions.
 
 local skills = require("opencode-manage.skills")
 local metrics = require("opencode-manage.metrics")
+local console = require("opencode-manage.console")
 
 local M = {}
-
-local state = {
-	items = {},
-	idx = 1,
-	list_buf = nil,
-	detail_buf = nil,
-	list_win = nil,
-	detail_win = nil,
-	outer_win = nil,
-	origin_win = nil,
-	autocmd = nil,
-}
 
 local TIER_HL = {
 	default = "ManageSkillDefault",
@@ -38,15 +29,6 @@ local TIER_HL = {
 	legacy = "ManageSkillLegacy",
 }
 
-local function define_hls()
-	local hl = vim.api.nvim_set_hl
-	hl(0, "ManageSkillDefault", { fg = "#4ec9b0" }) -- green: routed by subject
-	hl(0, "ManageSkillConditional", { fg = "#569cd6" }) -- blue: exact subject only
-	hl(0, "ManageSkillEmergency", { fg = "#c586c0", bold = true }) -- magenta: always hinted
-	hl(0, "ManageSkillExplicit", { fg = "#808080" }) -- dim: never hinted
-	hl(0, "ManageSkillLegacy", { fg = "#808080", italic = true, strikethrough = true }) -- retired
-end
-
 local function short(path)
 	if not path or path == "" then
 		return ""
@@ -55,6 +37,8 @@ local function short(path)
 end
 
 --- Epoch millis (or seconds) -> seconds.
+--- @param v any
+--- @return number
 local function secs(v)
 	local n = tonumber(v) or 0
 	if n > 100000000000 then
@@ -71,9 +55,10 @@ local function fmt_when(ts)
 	return os.date("%m-%d %H:%M", math.floor(secs(n)))
 end
 
-local function load_items()
+--- Skills + usage enrichment from THIS project's metrics store (fail-open).
+--- @return table[]
+local function list()
 	local all = skills.list()
-	-- Usage: one scan of this project's object aggregates (fail-open).
 	local ok, objects = pcall(metrics.objects, 500)
 	if not ok or type(objects) ~= "table" then
 		objects = {}
@@ -89,147 +74,89 @@ local function load_items()
 		e.touches = tonumber(u and u.n) or 0
 		e.last_used = u and u.last or nil
 	end
-	state.items = all
-	state.idx = math.max(1, math.min(state.idx, #all))
+	return all
 end
 
-local function render_list()
-	if not state.list_buf or not vim.api.nvim_buf_is_valid(state.list_buf) then
-		return
-	end
-	local lines = {}
-	local row_tier = {}
-	local cursor_line = 1
-	for i, e in ipairs(state.items) do
-		local marker = (i == state.idx) and ">" or " "
+--- Rows: name · scope · tier · touches · last used · subjects.
+--- @param items table[]
+--- @return table[]
+local function rows(items)
+	local out = {}
+	for i, e in ipairs(items) do
 		local subs = #e.subject > 0 and table.concat(e.subject, ", ") or "—"
-		table.insert(
-			lines,
-			string.format(
-				"%s %-24s %-7s %-11s t=%-4s %-12s %s",
-				marker,
+		out[i] = {
+			item = e,
+			text = string.format(
+				"%-24s %-7s %-11s t=%-4s %-12s %s",
 				e.name,
 				e.scope,
 				e.tier,
 				tostring(e.touches or 0),
 				fmt_when(e.last_used),
 				subs
-			)
-		)
-		row_tier[#lines] = e.tier
-		if i == state.idx then
-			cursor_line = #lines
-		end
+			),
+			hl = TIER_HL[e.tier] or "ManageSkillDefault",
+			col = 0,
+		}
 	end
-	if #lines == 0 then
-		table.insert(lines, "— no skills in the manifests —")
-		table.insert(lines, "  (emit_skill in a session, or check ~/.config/opencode/skills.policy.json)")
-	end
-	if vim.bo[state.list_buf].modifiable == false then
-		vim.bo[state.list_buf].modifiable = true
-	end
-	vim.api.nvim_buf_set_lines(state.list_buf, 0, -1, false, lines)
-	vim.bo[state.list_buf].modifiable = false
-
-	-- Tier colors: green routed · blue exact-only · magenta always ·
-	-- dim never · dim-struck retired.
-	local ns = vim.api.nvim_create_namespace("manage-skills")
-	vim.api.nvim_buf_clear_namespace(state.list_buf, ns, 0, -1)
-	for ln, tier in pairs(row_tier) do
-		local hl = TIER_HL[tier] or "ManageSkillDefault"
-		vim.api.nvim_buf_add_highlight(state.list_buf, ns, hl, ln - 1, 0, -1)
-	end
-
-	if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
-		local total = vim.api.nvim_buf_line_count(state.list_buf)
-		local target = math.max(1, math.min(cursor_line, total))
-		pcall(vim.api.nvim_win_set_cursor, state.list_win, { target, 0 })
-	end
+	return out
 end
 
-local function render_detail()
-	if not state.detail_buf or not vim.api.nvim_buf_is_valid(state.detail_buf) then
-		return
-	end
-	local e = state.items[state.idx]
+--- Detail: metadata + note + usage + SKILL.md body preview.
+--- @param e table
+--- @return table
+local function preview(e)
 	local lines = {}
-	if not e then
-		lines = { "— nothing selected —" }
-	else
-		lines[#lines + 1] = "name:      " .. e.name
-		lines[#lines + 1] = "scope:     " .. e.scope
-		lines[#lines + 1] = "tier:      " .. e.tier
-		lines[#lines + 1] = "subjects:  " .. (#e.subject > 0 and table.concat(e.subject, ", ") or "—")
-		lines[#lines + 1] = "note:      " .. (e.note or "—")
-		lines[#lines + 1] = "manifest:  " .. short(e.file)
-		lines[#lines + 1] = "path:      "
-			.. short(e.path)
-			.. (e.exists and "" or "   (missing on disk!)")
-		lines[#lines + 1] = string.format(
-			"touches:   %d  ·  last: %s   (this project's store)",
-			tonumber(e.touches) or 0,
-			fmt_when(e.last_used)
-		)
-		local ok, events = pcall(metrics.object_events, e.name, "skill", 8)
-		if ok and type(events) == "table" and #events > 0 then
-			lines[#lines + 1] = "recent:"
-			for _, ev in ipairs(events) do
-				lines[#lines + 1] = string.format(
-					"  %s · %s · %s",
-					fmt_when(ev.ts),
-					tostring(ev.kind or "?"),
-					tostring(ev.detail or "")
-				)
-			end
-		end
-		lines[#lines + 1] = string.rep("─", 48)
-		lines[#lines + 1] = "lifecycle: t re-tier · n note · s subjects · D drop entry (file kept)"
-		lines[#lines + 1] = "legacy retires without deletion · explicit never hints · emergency always"
-		if e.exists then
-			lines[#lines + 1] = string.rep("─", 48)
-			lines[#lines + 1] = "SKILL.md (first 40 lines):"
-			local body = vim.fn.readfile(e.path, "", 40)
-			for _, l in ipairs(body) do
-				lines[#lines + 1] = l
-			end
-		end
-	end
-	if vim.bo[state.detail_buf].modifiable == false then
-		vim.bo[state.detail_buf].modifiable = true
-	end
-	vim.api.nvim_buf_set_lines(state.detail_buf, 0, -1, false, lines)
-	vim.bo[state.detail_buf].modifiable = false
-	vim.api.nvim_buf_set_name(state.detail_buf, "SKILLS DETAIL")
-end
-
-local function set_legend()
-	if not state.list_win or not vim.api.nvim_win_is_valid(state.list_win) then
-		return
-	end
-	vim.wo[state.list_win].winbar = string.format(
-		"SKILLS · %d · merged global+project · j/k t tier n note s subjects D drop o open r Q",
-		#state.items
+	lines[#lines + 1] = "name:      " .. e.name
+	lines[#lines + 1] = "scope:     " .. e.scope
+	lines[#lines + 1] = "tier:      " .. e.tier
+	lines[#lines + 1] = "subjects:  " .. (#e.subject > 0 and table.concat(e.subject, ", ") or "—")
+	lines[#lines + 1] = "note:      " .. (e.note or "—")
+	lines[#lines + 1] = "manifest:  " .. short(e.file)
+	lines[#lines + 1] = "path:      " .. short(e.path) .. (e.exists and "" or "   (missing on disk!)")
+	lines[#lines + 1] = string.format(
+		"touches:   %d  ·  last: %s   (this project's store)",
+		tonumber(e.touches) or 0,
+		fmt_when(e.last_used)
 	)
-end
-
-local function refresh()
-	load_items()
-	render_list()
-	render_detail()
-	set_legend()
-end
-
-local function move(delta)
-	if #state.items == 0 then
-		return
+	local ok, events = pcall(metrics.object_events, e.name, "skill", 8)
+	if ok and type(events) == "table" and #events > 0 then
+		lines[#lines + 1] = "recent:"
+		for _, ev in ipairs(events) do
+			lines[#lines + 1] = string.format(
+				"  %s · %s · %s",
+				fmt_when(ev.ts),
+				tostring(ev.kind or "?"),
+				tostring(ev.detail or "")
+			)
+		end
 	end
-	state.idx = math.max(1, math.min(#state.items, state.idx + delta))
-	render_list()
-	render_detail()
+	lines[#lines + 1] = string.rep("─", 48)
+	lines[#lines + 1] = "lifecycle: t re-tier · n note · s subjects · D drop entry (file kept)"
+	lines[#lines + 1] = "legacy retires without deletion · explicit never hints · emergency always"
+	if e.exists then
+		lines[#lines + 1] = string.rep("─", 48)
+		lines[#lines + 1] = "SKILL.md (first 40 lines):"
+		local body = vim.fn.readfile(e.path, "", 40)
+		for _, l in ipairs(body) do
+			lines[#lines + 1] = l
+		end
+	end
+	return {
+		left = {
+			lines = lines,
+			name = "SKILLS DETAIL",
+			ft = "",
+			modifiable = false,
+			winbar = "SKILLS DETAIL",
+		},
+	}
 end
 
-local function select_tier()
-	local e = state.items[state.idx]
+--- t: re-tier via vim.ui.select.
+--- @param e table
+--- @param h table  console handle
+local function select_tier(e, h)
 	if not e then
 		return
 	end
@@ -238,14 +165,16 @@ local function select_tier()
 			return
 		end
 		if skills.set_tier(e.name, choice) then
-			refresh()
+			h.refresh()
 			vim.notify("skills: " .. e.name .. " → " .. choice, vim.log.levels.INFO)
 		end
 	end)
 end
 
-local function edit_note()
-	local e = state.items[state.idx]
+--- n: edit the note (empty clears).
+--- @param e table
+--- @param h table  console handle
+local function edit_note(e, h)
 	if not e then
 		return
 	end
@@ -256,15 +185,17 @@ local function edit_note()
 				return
 			end
 			if skills.set_note(e.name, input) then
-				refresh()
+				h.refresh()
 				vim.notify("skills: note updated for " .. e.name, vim.log.levels.INFO)
 			end
 		end
 	)
 end
 
-local function edit_subjects()
-	local e = state.items[state.idx]
+--- s: edit subjects (comma-separated; at least one required).
+--- @param e table
+--- @param h table  console handle
+local function edit_subjects(e, h)
 	if not e then
 		return
 	end
@@ -286,15 +217,17 @@ local function edit_subjects()
 				return
 			end
 			if skills.set_subjects(e.name, subs) then
-				refresh()
+				h.refresh()
 				vim.notify("skills: subjects updated for " .. e.name, vim.log.levels.INFO)
 			end
 		end
 	)
 end
 
-local function drop_entry()
-	local e = state.items[state.idx]
+--- D: drop the manifest entry (confirmed; the SKILL.md file stays on disk).
+--- @param e table
+--- @param h table  console handle
+local function drop_entry(e, h)
 	if not e then
 		return
 	end
@@ -310,13 +243,15 @@ local function drop_entry()
 		return
 	end
 	if skills.drop(e.name) then
-		refresh()
+		h.refresh()
 		vim.notify("skills: dropped " .. e.name .. " (file kept)", vim.log.levels.INFO)
 	end
 end
 
-local function open_in_origin()
-	local e = state.items[state.idx]
+--- o: open the SKILL.md in the origin window.
+--- @param e table
+--- @param h table  console handle
+local function open_in_origin(e, h)
 	if not e then
 		return
 	end
@@ -324,7 +259,7 @@ local function open_in_origin()
 		vim.notify("❌ skills: no SKILL.md on disk at " .. e.path, vim.log.levels.WARN)
 		return
 	end
-	local origin = state.origin_win
+	local origin = h.state.origin_win
 	if origin and vim.api.nvim_win_is_valid(origin) then
 		local cur = vim.api.nvim_get_current_win()
 		vim.api.nvim_set_current_win(origin)
@@ -334,100 +269,56 @@ local function open_in_origin()
 	end
 end
 
-local function kill_viewer()
-	for _, b in ipairs({ state.list_buf, state.detail_buf }) do
-		if b and vim.api.nvim_buf_is_valid(b) then
-			pcall(vim.keymap.del, "n", "Q", { buffer = b })
-		end
-	end
-	if state.autocmd then
-		pcall(vim.api.nvim_del_autocmd, state.autocmd)
-		state.autocmd = nil
-	end
-	local seen = {}
-	for _, w in ipairs({ state.list_win, state.detail_win, state.outer_win }) do
-		if w and not seen[w] then
-			seen[w] = true
-			if vim.api.nvim_win_is_valid(w) then
-				vim.api.nvim_win_close(w, true)
-			end
-		end
-	end
-	state.items = {}
-	state.list_buf = nil
-	state.detail_buf = nil
-	state.list_win = nil
-	state.detail_win = nil
-	state.outer_win = nil
-	state.origin_win = nil
-	vim.notify("🗑️ Skills viewer closed", vim.log.levels.INFO)
-end
-
-local function make_window(buf, split, ref_win)
-	local opts = { relative = "", split = split }
-	if ref_win then
-		opts.win = ref_win
-	end
-	return vim.api.nvim_open_win(buf, false, opts)
-end
-
-local function map_keys(buf)
-	local opts = { buffer = buf, nowait = true, noremap = true, silent = true }
-	vim.keymap.set("n", "j", function()
-		move(1)
-	end, opts)
-	vim.keymap.set("n", "k", function()
-		move(-1)
-	end, opts)
-	vim.keymap.set("n", "t", select_tier, opts)
-	vim.keymap.set("n", "n", edit_note, opts)
-	vim.keymap.set("n", "s", edit_subjects, opts)
-	vim.keymap.set("n", "D", drop_entry, opts)
-	vim.keymap.set("n", "o", open_in_origin, opts)
-	vim.keymap.set("n", "r", refresh, opts)
-	vim.keymap.set("n", "Q", kill_viewer, opts)
-end
-
 function M.open()
-	load_items()
-	define_hls()
-
-	state.origin_win = vim.api.nvim_get_current_win()
-
-	state.list_buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[state.list_buf].bufhidden = "wipe"
-	state.outer_win = make_window(state.list_buf, "right")
-	state.list_win = state.outer_win
-	set_legend()
-
-	state.detail_buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[state.detail_buf].bufhidden = "wipe"
-	vim.bo[state.detail_buf].modifiable = false
-	state.detail_win = make_window(state.detail_buf, "below", state.list_win)
-
-	vim.api.nvim_set_current_win(state.list_win)
-	map_keys(state.list_buf)
-	map_keys(state.detail_buf)
-
-	state.autocmd = vim.api.nvim_create_autocmd("WinEnter", {
-		callback = function()
-			local cur = vim.api.nvim_get_current_win()
-			if
-				state.list_win
-				and vim.api.nvim_win_is_valid(state.list_win)
-				and (cur == state.detail_win or cur == state.list_win)
-			then
-				vim.schedule(function()
-					if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
-						vim.api.nvim_set_current_win(state.list_win)
-					end
-				end)
-			end
+	console.open({
+		name = "Skills",
+		layout = "detail",
+		list = list,
+		rows = rows,
+		preview = preview,
+		actions = {
+			open = open_in_origin,
+		},
+		keys = {
+			{
+				key = "t",
+				desc = "tier",
+				fn = function(h)
+					select_tier(h.state.items[h.state.idx], h)
+				end,
+			},
+			{
+				key = "n",
+				desc = "note",
+				fn = function(h)
+					edit_note(h.state.items[h.state.idx], h)
+				end,
+			},
+			{
+				key = "s",
+				desc = "subjects",
+				fn = function(h)
+					edit_subjects(h.state.items[h.state.idx], h)
+				end,
+			},
+			{
+				key = "D",
+				desc = "drop entry",
+				fn = function(h)
+					drop_entry(h.state.items[h.state.idx], h)
+				end,
+			},
+		},
+		legend = function(h)
+			return string.format("SKILLS · %d · merged global+project · j/k t tier n note s subjects D drop o open r Q", #h.state.items)
 		end,
+		empty_lines = {
+			"— no skills in the manifests —",
+			"  (emit_skill in a session, or check ~/.config/opencode/skills.policy.json)",
+		},
+		open_empty = true,
+		keep_empty = true,
 	})
-
-	render_list()
-	render_detail()
 end
 
 return M

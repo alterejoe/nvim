@@ -1,0 +1,22 @@
+{
+  "skills": {
+    "manage-bootstrap": {
+      "tier": "default",
+      "subject": [
+        "html templ",
+        "templ",
+        "opencode-manage lua",
+        "plugins ts",
+        "manage-plugin md"
+      ]
+    },
+    "manage-proposals": {
+      "tier": "default",
+      "subject": [
+        "opencode-manage lua",
+        "plugins ts",
+        "manage-plugin md"
+      ]
+    }
+  }
+}

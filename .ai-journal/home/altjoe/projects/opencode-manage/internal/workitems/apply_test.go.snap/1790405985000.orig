@@ -1,0 +1,311 @@
+// /home/altjoe/projects/opencode-manage/internal/workitems/apply_test.go FINAL
+package workitems
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	_ "modernc.org/sqlite"
+
+	"github.com/alterejoe/opencode-manage/db/migrations"
+	"github.com/alterejoe/opencode-manage/internal/store"
+)
+
+const testDir = "/tmp/manage-test-project"
+
+func newTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1) // :memory: is per-connection
+	t.Cleanup(func() { _ = db.Close() })
+	for _, name := range []string{"0001_init.up.sql", "0002_work_items.up.sql"} {
+		data, err := migrations.FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(string(data)); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	return db
+}
+
+func mustJSON(v any) json.RawMessage {
+	raw, _ := json.Marshal(v)
+	return raw
+}
+
+func mustParse(t *testing.T, action string, itemID *int64, payload map[string]any) Mutation {
+	t.Helper()
+	m, err := ParseMutation(Suggestion{
+		Directory: testDir,
+		ItemID:    itemID,
+		Action:    action,
+		Payload:   mustJSON(payload),
+	})
+	if err != nil {
+		t.Fatalf("parse %s: %v", action, err)
+	}
+	return m
+}
+
+func mustApply(t *testing.T, q *store.Queries, m Mutation) int64 {
+	t.Helper()
+	id, err := Apply(context.Background(), q, m, "user", "test-session")
+	if err != nil {
+		t.Fatalf("apply %s: %v", m.Action, err)
+	}
+	return id
+}
+
+func TestCreateAppendsAtEnd(t *testing.T) {
+	db := newTestDB(t)
+	q := store.New(db)
+	a := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "A"}))
+	b := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "B"}))
+	c := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "milestone", "name": "C", "parent_id": float64(a)}))
+
+	rows, err := q.ListWorkItems(context.Background(), testDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("want 3 items, got %d", len(rows))
+	}
+	if rows[0].ID != a || rows[0].SiblingOrder != 0 {
+		t.Fatalf("first item = %+v", rows[0])
+	}
+	if rows[1].ID != b || rows[1].SiblingOrder != 1 {
+		t.Fatalf("second item = %+v", rows[1])
+	}
+	if rows[2].ID != c || rows[2].SiblingOrder != 0 || rows[2].ParentID == nil || *rows[2].ParentID != a {
+		t.Fatalf("child item = %+v", rows[2])
+	}
+}
+
+func TestMoveSwapsSiblingOrder(t *testing.T) {
+	db := newTestDB(t)
+	q := store.New(db)
+	a := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "A"}))
+	b := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "B"}))
+	c := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "C"}))
+
+	mustApply(t, q, mustParse(t, ActionMove, &a, map[string]any{"delta": float64(1)}))
+
+	rows, err := q.ListSiblings(context.Background(), store.ListSiblingsParams{Directory: testDir, ParentID: nil})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].ID != b || rows[1].ID != a || rows[2].ID != c {
+		t.Fatalf("order after move = %d,%d,%d", rows[0].ID, rows[1].ID, rows[2].ID)
+	}
+}
+
+func TestMoveBoundaryIsNoop(t *testing.T) {
+	db := newTestDB(t)
+	q := store.New(db)
+	a := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "A"}))
+	b := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "B"}))
+
+	mustApply(t, q, mustParse(t, ActionMove, &a, map[string]any{"delta": float64(-1)})) // already first
+
+	rows, _ := q.ListSiblings(context.Background(), store.ListSiblingsParams{Directory: testDir, ParentID: nil})
+	if rows[0].ID != a || rows[1].ID != b {
+		t.Fatalf("boundary move changed order: %d,%d", rows[0].ID, rows[1].ID)
+	}
+}
+
+func TestIndentMakesChildOfPreviousSibling(t *testing.T) {
+	db := newTestDB(t)
+	q := store.New(db)
+	a := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "A"}))
+	b := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "B"}))
+
+	mustApply(t, q, mustParse(t, ActionIndent, &b, nil))
+
+	item, err := q.GetWorkItem(context.Background(), store.GetWorkItemParams{ID: b, Directory: testDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.ParentID == nil || *item.ParentID != a || item.SiblingOrder != 0 {
+		t.Fatalf("indented item = %+v", item)
+	}
+}
+
+func TestOutdentPlacesAfterParent(t *testing.T) {
+	db := newTestDB(t)
+	q := store.New(db)
+	a := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "A"}))
+	b := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "B"}))
+	c := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "milestone", "name": "C", "parent_id": float64(a)}))
+
+	mustApply(t, q, mustParse(t, ActionOutdent, &c, nil))
+
+	rows, _ := q.ListSiblings(context.Background(), store.ListSiblingsParams{Directory: testDir, ParentID: nil})
+	if len(rows) != 3 {
+		t.Fatalf("want 3 root items, got %d", len(rows))
+	}
+	if rows[0].ID != a || rows[1].ID != c || rows[2].ID != b {
+		t.Fatalf("root order = %d,%d,%d", rows[0].ID, rows[1].ID, rows[2].ID)
+	}
+	item, _ := q.GetWorkItem(context.Background(), store.GetWorkItemParams{ID: c, Directory: testDir})
+	if item.ParentID != nil || item.SiblingOrder != 1 {
+		t.Fatalf("outdented item = %+v", item)
+	}
+}
+
+func TestSetStatusSetsAndClearsCompletedAt(t *testing.T) {
+	db := newTestDB(t)
+	q := store.New(db)
+	a := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "A"}))
+
+	mustApply(t, q, mustParse(t, ActionSetStatus, &a, map[string]any{"status": "completed", "reason": "done"}))
+	item, _ := q.GetWorkItem(context.Background(), store.GetWorkItemParams{ID: a, Directory: testDir})
+	if item.Status != "completed" || item.CompletedAt == nil {
+		t.Fatalf("completed item = %+v", item)
+	}
+
+	mustApply(t, q, mustParse(t, ActionSetStatus, &a, map[string]any{"status": "planned"}))
+	item, _ = q.GetWorkItem(context.Background(), store.GetWorkItemParams{ID: a, Directory: testDir})
+	if item.CompletedAt != nil {
+		t.Fatalf("completed_at should clear on non-completed status: %+v", item)
+	}
+}
+
+func TestSetActiveAndClear(t *testing.T) {
+	db := newTestDB(t)
+	q := store.New(db)
+	a := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "A"}))
+
+	mustApply(t, q, mustParse(t, ActionSetActive, &a, nil))
+	active, err := q.GetActiveWorkItem(context.Background(), testDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.ItemID != a {
+		t.Fatalf("active = %+v", active)
+	}
+
+	mustApply(t, q, mustParse(t, ActionClearActive, nil, nil))
+	if _, err := q.GetActiveWorkItem(context.Background(), testDir); err != sql.ErrNoRows {
+		t.Fatalf("want ErrNoRows after clear, got %v", err)
+	}
+}
+
+func TestImportanceClamp(t *testing.T) {
+	db := newTestDB(t)
+	q := store.New(db)
+	a := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "A"}))
+
+	mustApply(t, q, mustParse(t, ActionSetImportance, &a, map[string]any{"importance": float64(9)}))
+	item, _ := q.GetWorkItem(context.Background(), store.GetWorkItemParams{ID: a, Directory: testDir})
+	if item.Importance != 5 {
+		t.Fatalf("importance = %d, want 5", item.Importance)
+	}
+}
+
+func TestSuggestionQueueFlow(t *testing.T) {
+	db := newTestDB(t)
+	q := store.New(db)
+	a := mustApply(t, q, mustParse(t, ActionCreate, nil, map[string]any{"kind": "goal", "name": "A"}))
+
+	m := mustParse(t, ActionSetStatus, &a, map[string]any{"status": "in_progress", "reason": "started"})
+	payload, _ := json.Marshal(m)
+	s, err := q.AppendSuggestion(context.Background(), store.AppendSuggestionParams{
+		SessionID: "s1",
+		Directory: testDir,
+		ItemID:    &a,
+		Action:    ActionSetStatus,
+		Payload:   string(payload),
+		Rationale: "AI thinks so",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Status != "pending" {
+		t.Fatalf("suggestion status = %s", s.Status)
+	}
+
+	// Apply in a transaction, exactly like the handler does.
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qtx := q.WithTx(tx)
+	var m2 Mutation
+	if err := json.Unmarshal([]byte(s.Payload), &m2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(context.Background(), qtx, m2, "user", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := qtx.SetSuggestionStatus(context.Background(), store.SetSuggestionStatusParams{
+		Status:    "applied",
+		AppliedBy: "user",
+		ID:        s.ID,
+		Directory: testDir,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	item, _ := q.GetWorkItem(context.Background(), store.GetWorkItemParams{ID: a, Directory: testDir})
+	if item.Status != "in_progress" {
+		t.Fatalf("status after apply = %s", item.Status)
+	}
+	events, _ := q.ListWorkItemEvents(context.Background(), store.ListWorkItemEventsParams{Directory: testDir, ItemID: a})
+	if len(events) != 2 { // created + status
+		t.Fatalf("events = %d, want 2", len(events))
+	}
+	if events[0].EventType != "status" || events[0].SessionID != "s1" {
+		t.Fatalf("latest event = %+v", events[0])
+	}
+}
+
+func TestParseMutationValidation(t *testing.T) {
+	ptr := func(v int64) *int64 { return &v }
+	tests := []struct {
+		name      string
+		action    string
+		itemID    *int64
+		payload   map[string]any
+		wantError string
+	}{
+		{"missing directory", "", nil, nil, "needs a directory"},
+		{"unknown action", "explode", ptr(1), nil, "unknown work-item action"},
+		{"create missing kind", ActionCreate, nil, map[string]any{"name": "X"}, "kind goal or milestone"},
+		{"create empty name", ActionCreate, nil, map[string]any{"kind": "goal", "name": "  "}, "non-empty name"},
+		{"update missing item", ActionUpdate, nil, map[string]any{"name": "X"}, "needs an item_id"},
+		{"set_status invalid", ActionSetStatus, ptr(1), map[string]any{"status": "banana"}, "invalid work-item status"},
+		{"importance clamps high", ActionSetImportance, ptr(1), map[string]any{"importance": float64(9)}, ""},
+		{"importance clamps low", ActionSetImportance, ptr(1), map[string]any{"importance": float64(-3)}, ""},
+		{"move normalizes", ActionMove, ptr(1), map[string]any{"delta": float64(5)}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseMutation(Suggestion{
+				Directory: testDir,
+				ItemID:    tt.itemID,
+				Action:    tt.action,
+				Payload:   mustJSON(tt.payload),
+			})
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("want error containing %q, got %v", tt.wantError, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("want pass, got %v", err)
+			}
+		})
+	}
+}

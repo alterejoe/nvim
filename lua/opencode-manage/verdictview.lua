@@ -1,5 +1,5 @@
 -- /home/altjoe/.config/nvim/lua/opencode-manage/verdictview.lua FINAL
--- opencode-manage.verdictview — the verdict store viewer (T2 + T2.5).
+-- opencode-manage.verdictview — verdict store panel (console adapter, T2 + T2.5).
 -- Persistent two-pane viewer: verdict list (top) + detail preview (below).
 --   j/k move · f verdict filter (all/accepted/corrected/rejected/moved_old/
 --   aborted) · s scope filter (all/project/global) · r refresh · Q kill
@@ -8,10 +8,11 @@
 -- Preview: corrected/aborted verdicts show the diff (proposed vs applied —
 -- for aborted: the killed text vs your correction); others show metadata.
 -- S0: opens even when the store is empty — the empty state renders in-pane.
--- The old notify-and-return made the viewer look dead before any verdict
--- existed (and hid the store bug behind a single flash notification).
+-- The engine (opencode-manage.console) owns windows/keymaps/state; this
+-- file owns the verdict-specific rendering and filters.
 
 local verdicts = require("opencode-manage.verdicts")
+local console = require("opencode-manage.console")
 
 local M = {}
 
@@ -26,30 +27,7 @@ local VERDICT_HL = {
 	aborted = "ManageRerun",
 }
 
-local state = {
-	items = {},
-	idx = 1,
-	vfilter = "all",
-	sfilter = "all",
-	list_buf = nil,
-	detail_buf = nil,
-	list_win = nil,
-	detail_win = nil,
-	outer_win = nil,
-	origin_win = nil,
-	autocmd = nil,
-}
-
-local function define_hls()
-	local hl = vim.api.nvim_set_hl
-	hl(0, "ManageNew", { fg = "#4ec9b0", bold = true })
-	hl(0, "ManageEdit", { fg = "#569cd6" })
-	hl(0, "ManageRejected", { fg = "#808080", strikethrough = true })
-	hl(0, "ManageDelete", { fg = "#f44747" })
-	hl(0, "ManageRerun", { fg = "#c586c0" })
-	hl(0, "ManageAdd", { bg = "#1e3b2a" })
-	hl(0, "ManageRemove", { bg = "#3b1f1f" })
-end
+local adapter = { vfilter = "all", sfilter = "all" }
 
 local function fmt_when(ts)
 	if not ts or ts == 0 then
@@ -58,19 +36,44 @@ local function fmt_when(ts)
 	return os.date("%m-%d %H:%M", math.floor(ts / 1000))
 end
 
---- Load verdicts from the store, applying the current filters.
-local function load_items()
+--- Verdicts from the store, filtered by the current f/s filters.
+--- @return table[]
+local function list()
 	local all = verdicts.recent(200)
 	local out = {}
 	for _, v in ipairs(all) do
-		if state.vfilter == "all" or v.verdict == state.vfilter then
-			if state.sfilter == "all" or v.scope == state.sfilter then
+		if adapter.vfilter == "all" or v.verdict == adapter.vfilter then
+			if adapter.sfilter == "all" or v.scope == adapter.sfilter then
 				out[#out + 1] = v
 			end
 		end
 	end
-	state.items = out
-	state.idx = math.max(1, math.min(state.idx, #out))
+	return out
+end
+
+--- Rows: verdict · scope · target · reason · source · project · when.
+--- @param items table[]
+--- @return table[]
+local function rows(items)
+	local out = {}
+	for i, v in ipairs(items) do
+		local target = v.path or (v.reason or "conversation")
+		out[i] = {
+			item = v,
+			text = string.format(
+				"%-9s [%-8s] %-28s %s  (%s · %s · %s)",
+				v.verdict or "?",
+				v.scope or "?",
+				target,
+				(v.reason or ""):sub(1, 30),
+				v.source or "?",
+				v.project or "?",
+				fmt_when(v.ts)
+			),
+			hl = VERDICT_HL[v.verdict],
+		}
+	end
+	return out
 end
 
 --- Simple line diff: proposed vs applied, -/+ prefixed. Good enough for
@@ -123,88 +126,25 @@ local function simple_diff(a, b)
 	return out
 end
 
-local function render_list()
-	if not state.list_buf or not vim.api.nvim_buf_is_valid(state.list_buf) then
-		return
-	end
+--- Detail: corrected/aborted verdicts show the proposed-vs-applied diff
+--- (red/green); everything else shows metadata.
+--- @param v table
+--- @return table
+local function preview(v)
 	local lines = {}
-	local row_of = {}
-	local cursor_line = 1
-	for i, v in ipairs(state.items) do
-		local marker = (i == state.idx) and ">" or " "
-		local target = v.path or (v.reason or "conversation")
-		table.insert(
-			lines,
-			string.format(
-				"%s %-9s [%-8s] %-28s %s  (%s · %s · %s)",
-				marker,
-				v.verdict or "?",
-				v.scope or "?",
-				target,
-				(v.reason or ""):sub(1, 30),
-				v.source or "?",
-				v.project or "?",
-				fmt_when(v.ts)
-			)
-		)
-		row_of[#lines] = v.verdict
-		if i == state.idx then
-			cursor_line = #lines
-		end
-	end
-	if #lines == 0 then
-		if state.vfilter == "all" and state.sfilter == "all" then
-			table.insert(lines, "— no verdicts yet — accept/reject a proposal or kill a generation to record one —")
-			table.insert(lines, "  (if this stays empty after an accept, the store failed — check :messages for a verdicts ERROR)")
-		else
-			table.insert(lines, "— no verdicts match the current filters — f: verdict · s: scope")
-		end
-	end
-	if vim.bo[state.list_buf].modifiable == false then
-		vim.bo[state.list_buf].modifiable = true
-	end
-	vim.api.nvim_buf_set_lines(state.list_buf, 0, -1, false, lines)
-	vim.bo[state.list_buf].modifiable = false
-
-	local ns = vim.api.nvim_create_namespace("manage-verdicts")
-	vim.api.nvim_buf_clear_namespace(state.list_buf, ns, 0, -1)
-	for ln, v in pairs(row_of) do
-		local hl = VERDICT_HL[v]
-		if hl then
-			vim.api.nvim_buf_add_highlight(state.list_buf, ns, hl, ln - 1, 0, -1)
-		end
-	end
-
-	if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
-		local total = vim.api.nvim_buf_line_count(state.list_buf)
-		local target = math.max(1, math.min(cursor_line, total))
-		pcall(vim.api.nvim_win_set_cursor, state.list_win, { target, 0 })
-	end
-end
-
-local function render_detail()
-	if not state.detail_buf or not vim.api.nvim_buf_is_valid(state.detail_buf) then
-		return
-	end
-	local v = state.items[state.idx]
-	local lines = {}
-	local ns = vim.api.nvim_create_namespace("manage-verdict-detail")
-	vim.api.nvim_buf_clear_namespace(state.detail_buf, ns, 0, -1)
-
+	local hl = {}
 	if not v then
 		lines = { "— nothing selected —" }
 	elseif (v.verdict == "corrected" or v.verdict == "aborted") and v.proposed_content and v.applied_content then
-		-- The structural fact: what the AI produced vs what the user
-		-- applied / said instead. For aborted: killed text vs correction.
 		local proposed = vim.split(v.proposed_content, "\n", { plain = true })
 		local applied = vim.split(v.applied_content, "\n", { plain = true })
 		lines = simple_diff(proposed, applied)
 		for ln, l in ipairs(lines) do
 			local prefix = l:sub(1, 1)
 			if prefix == "-" then
-				vim.api.nvim_buf_add_highlight(state.detail_buf, ns, "ManageRemove", ln - 1, 0, -1)
+				hl[ln] = "ManageRemove"
 			elseif prefix == "+" then
-				vim.api.nvim_buf_add_highlight(state.detail_buf, ns, "ManageAdd", ln - 1, 0, -1)
+				hl[ln] = "ManageAdd"
 			end
 		end
 	else
@@ -217,175 +157,81 @@ local function render_detail()
 			"group:    " .. (v.group_name or "—") .. "  ·  op: " .. (v.operation or "—"),
 		}
 	end
-
-	if vim.bo[state.detail_buf].modifiable == false then
-		vim.bo[state.detail_buf].modifiable = true
-	end
-	vim.api.nvim_buf_set_lines(state.detail_buf, 0, -1, false, lines)
-	vim.bo[state.detail_buf].modifiable = false
-	vim.api.nvim_buf_set_name(state.detail_buf, "VERDICT DETAIL")
+	return {
+		left = {
+			lines = lines,
+			name = "VERDICT DETAIL",
+			ft = "",
+			modifiable = false,
+			winbar = "VERDICT DETAIL",
+			hl = hl,
+		},
+	}
 end
 
-local function set_legend()
-	if not state.list_win or not vim.api.nvim_win_is_valid(state.list_win) then
-		return
-	end
-	vim.wo[state.list_win].winbar = string.format(
-		"VERDICTS · %d rows · f: %s · s: %s · j/k f s r Q",
-		#state.items,
-		state.vfilter,
-		state.sfilter
-	)
-end
-
-local function move(delta)
-	if #state.items == 0 then
-		return
-	end
-	state.idx = math.max(1, math.min(#state.items, state.idx + delta))
-	render_list()
-	render_detail()
-end
-
-local function toggle_filter()
+--- f: cycle the verdict filter.
+--- @param h table  console handle
+local function toggle_filter(h)
 	local cur = 1
 	for i, f in ipairs(VERDICT_CYCLE) do
-		if f == state.vfilter then
+		if f == adapter.vfilter then
 			cur = i
 			break
 		end
 	end
-	state.vfilter = VERDICT_CYCLE[(cur % #VERDICT_CYCLE) + 1]
-	state.idx = 1
-	load_items()
-	render_list()
-	render_detail()
-	set_legend()
-	vim.notify("verdict filter: " .. state.vfilter, vim.log.levels.INFO)
+	adapter.vfilter = VERDICT_CYCLE[(cur % #VERDICT_CYCLE) + 1]
+	h.state.idx = 1
+	h.refresh()
+	vim.notify("verdict filter: " .. adapter.vfilter, vim.log.levels.INFO)
 end
 
-local function toggle_scope()
+--- s: cycle the scope filter.
+--- @param h table  console handle
+local function toggle_scope(h)
 	local cur = 1
 	for i, f in ipairs(SCOPE_CYCLE) do
-		if f == state.sfilter then
+		if f == adapter.sfilter then
 			cur = i
 			break
 		end
 	end
-	state.sfilter = SCOPE_CYCLE[(cur % #SCOPE_CYCLE) + 1]
-	state.idx = 1
-	load_items()
-	render_list()
-	render_detail()
-	set_legend()
-	vim.notify("scope filter: " .. state.sfilter, vim.log.levels.INFO)
-end
-
-local function refresh()
-	load_items()
-	render_list()
-	render_detail()
-	set_legend()
-end
-
-local function kill_viewer()
-	for _, b in ipairs({ state.list_buf, state.detail_buf }) do
-		if b and vim.api.nvim_buf_is_valid(b) then
-			pcall(vim.keymap.del, "n", "Q", { buffer = b })
-		end
-	end
-	if state.autocmd then
-		pcall(vim.api.nvim_del_autocmd, state.autocmd)
-		state.autocmd = nil
-	end
-	local seen = {}
-	for _, w in ipairs({ state.list_win, state.detail_win, state.outer_win }) do
-		if w and not seen[w] then
-			seen[w] = true
-			if vim.api.nvim_win_is_valid(w) then
-				vim.api.nvim_win_close(w, true)
-			end
-		end
-	end
-	state.items = {}
-	state.list_buf = nil
-	state.detail_buf = nil
-	state.list_win = nil
-	state.detail_win = nil
-	state.outer_win = nil
-	state.origin_win = nil
-	vim.notify("🗑️ Verdict viewer closed", vim.log.levels.INFO)
-end
-
-local function set_q_kill(buf)
-	vim.keymap.set("n", "Q", kill_viewer, { buffer = buf, nowait = true, noremap = true, silent = true })
-end
-
-local function make_window(buf, split, ref_win)
-	local opts = { relative = "", split = split }
-	if ref_win then
-		opts.win = ref_win
-	end
-	return vim.api.nvim_open_win(buf, false, opts)
-end
-
-local function map_keys(buf)
-	local opts = { buffer = buf, nowait = true, noremap = true, silent = true }
-	vim.keymap.set("n", "j", function()
-		move(1)
-	end, opts)
-	vim.keymap.set("n", "k", function()
-		move(-1)
-	end, opts)
-	vim.keymap.set("n", "f", toggle_filter, opts)
-	vim.keymap.set("n", "s", toggle_scope, opts)
-	vim.keymap.set("n", "r", refresh, opts)
-	set_q_kill(buf)
+	adapter.sfilter = SCOPE_CYCLE[(cur % #SCOPE_CYCLE) + 1]
+	h.state.idx = 1
+	h.refresh()
+	vim.notify("scope filter: " .. adapter.sfilter, vim.log.levels.INFO)
 end
 
 function M.open()
-	define_hls()
-	load_items()
-	if state.outer_win and vim.api.nvim_win_is_valid(state.outer_win) then
-		kill_viewer()
-	end
-
-	state.origin_win = vim.api.nvim_get_current_win()
-
-	state.list_buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[state.list_buf].bufhidden = "wipe"
-	state.outer_win = make_window(state.list_buf, "right")
-	state.list_win = state.outer_win
-	set_legend()
-
-	state.detail_buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[state.detail_buf].bufhidden = "wipe"
-	vim.bo[state.detail_buf].modifiable = false
-	state.detail_win = make_window(state.detail_buf, "below", state.list_win)
-
-	vim.api.nvim_set_current_win(state.list_win)
-	map_keys(state.list_buf)
-	map_keys(state.detail_buf)
-
-	state.autocmd = vim.api.nvim_create_autocmd("WinEnter", {
-		callback = function()
-			local cur = vim.api.nvim_get_current_win()
-			if
-				state.list_win
-				and vim.api.nvim_win_is_valid(state.list_win)
-				and (cur == state.detail_win or cur == state.list_win)
-			then
-				vim.schedule(function()
-					if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
-						vim.api.nvim_set_current_win(state.list_win)
-					end
-				end)
-			end
+	console.open({
+		name = "Verdicts",
+		layout = "detail",
+		list = list,
+		rows = rows,
+		preview = preview,
+		keys = {
+			{ key = "f", desc = "verdict filter", fn = toggle_filter },
+			{ key = "s", desc = "scope filter", fn = toggle_scope },
+		},
+		legend = function(h)
+			return string.format(
+				"VERDICTS · %d · f: %s · s: %s · j/k f s r Q",
+				#h.state.items,
+				adapter.vfilter,
+				adapter.sfilter
+			)
 		end,
+		empty_lines = function()
+			if adapter.vfilter == "all" and adapter.sfilter == "all" then
+				return {
+					"— no verdicts yet — accept/reject a proposal or kill a generation to record one —",
+					"  (if this stays empty after an accept, the store failed — check :messages for a verdicts ERROR)",
+				}
+			end
+			return { "— no verdicts match the current filters — f: verdict · s: scope" }
+		end,
+		open_empty = true,
+		keep_empty = true,
 	})
-
-	render_list()
-	render_detail()
 end
 
 return M

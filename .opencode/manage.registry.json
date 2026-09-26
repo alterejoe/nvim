@@ -86,6 +86,62 @@
         "list",
         "list_global"
       ]
+    },
+    {
+      "constraints": "Keep the spec contract stable (name/layout/list/rows/preview/actions/keys/legend/identity/scroll). Additive changes only. Adapters must stay thin — panel-specific logic lives in the adapter, never in the engine. The full key set stays mapped on every buffer; Q kills, r refreshes; which-key registration stays pcall-guarded.",
+      "path": "lua/opencode-manage/console.lua",
+      "rationale": "The shared review console engine: every reviewable Nvim panel (proposals, registry, journal, skills, verdicts, metrics, refs, vault, goals) is a thin adapter over console.open(). It owns windows, keymaps, state, kill/refresh, legend, focus-return, and which-key registration — the ~2000 lines of duplicated viewer scaffolding collapsed into one module. Future reviewable panels (e.g. work-item suggestions) should be adapters, not new viewers.",
+      "refs": [
+        {
+          "path": "lua/opencode-manage/reviewview.lua",
+          "relation": "calls",
+          "symbol": "open"
+        },
+        {
+          "path": "lua/opencode-manage/registryview.lua",
+          "relation": "calls",
+          "symbol": "open"
+        },
+        {
+          "path": "lua/opencode-manage/journalview.lua",
+          "relation": "calls",
+          "symbol": "open"
+        },
+        {
+          "path": "lua/opencode-manage/skillsview.lua",
+          "relation": "calls",
+          "symbol": "open"
+        },
+        {
+          "path": "lua/opencode-manage/verdictview.lua",
+          "relation": "calls",
+          "symbol": "open"
+        },
+        {
+          "path": "lua/opencode-manage/metricsview.lua",
+          "relation": "calls",
+          "symbol": "open"
+        },
+        {
+          "path": "lua/opencode-manage/refsview.lua",
+          "relation": "calls",
+          "symbol": "open"
+        },
+        {
+          "path": "lua/opencode-manage/vaultview.lua",
+          "relation": "calls",
+          "symbol": "open"
+        },
+        {
+          "path": "lua/opencode-manage/goalsview.lua",
+          "relation": "calls",
+          "symbol": "open"
+        }
+      ],
+      "symbols": [
+        "open",
+        "define_hls"
+      ]
     }
   ]
 }

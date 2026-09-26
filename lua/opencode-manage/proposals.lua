@@ -34,6 +34,8 @@
 --   NEITHER  = not _cwd and not _cwd_file (foreign session AND foreign file)
 -- VISIBLE = pending + accepted (accepted rows stay in the viewer marked
 -- [applied], so the review history is never a mystery).
+-- Resolved rows are purged ONLY by explicit user action (M.purge_resolved,
+-- `c` in the review console) — never automatically.
 -- All iteration is DETERMINISTIC (sorted dirs) — the item order never
 -- reshuffles between refreshes.
 -- Each proposal also carries _file/_line (in-place status updates) and
@@ -94,6 +96,11 @@ local function all_dirs()
 	end
 	return dirs
 end
+
+--- Exported for consumers that need the same discovery (e.g. the review
+--- console's current_session): every .ai-proposals dir, cwd-reachable or
+--- under SCAN_ROOTS.
+M.all_dirs = all_dirs
 
 --- Read every proposal from every jsonl in every .ai-proposals dir.
 --- Each proposal carries _file and _line so accept/reject can update in
@@ -194,6 +201,36 @@ function M.list_visible(mode)
 		end
 	end
 	return out
+end
+
+--- Purge resolved rows (accepted/rejected) from the journal files, in
+--- place. Verdicts already live in state.db (T2 capture), so the audit
+--- trail survives even though the journal rows are removed. Pending rows
+--- are never touched. Line numbers are collected per file and removed
+--- descending so earlier removals never shift later ones.
+--- @return number  rows removed
+function M.purge_resolved()
+	local by_file = {}
+	for _, p in ipairs(M.list_all()) do
+		local st = p.status or "pending"
+		if (st == "accepted" or st == "rejected") and p._file and p._line then
+			by_file[p._file] = by_file[p._file] or {}
+			table.insert(by_file[p._file], p._line)
+		end
+	end
+	local removed = 0
+	for f, lines in pairs(by_file) do
+		table.sort(lines, function(a, b)
+			return a > b
+		end)
+		local content = vim.fn.readfile(f)
+		for _, ln in ipairs(lines) do
+			table.remove(content, ln)
+		end
+		vim.fn.writefile(content, f)
+		removed = removed + #lines
+	end
+	return removed
 end
 
 --- Resolve a proposal path to absolute, FAIL CLOSED (doc 21): only absolute

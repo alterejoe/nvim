@@ -1,0 +1,691 @@
+-- /home/altjoe/.config/nvim/lua/opencode-manage/console.lua FINAL-2
+-- opencode-manage.console — the shared review console engine.
+-- ONE recognizable review/application interface for every reviewable panel:
+-- proposals, registry, journal, skills, verdicts, metrics, refs, vault.
+-- A panel is a thin ADAPTER (spec) implementing a small contract; the engine
+-- owns the windows, keymaps, state, kill/refresh, legend, and focus-return.
+--
+-- SPEC CONTRACT:
+--   name          string          panel name (winbar / notify / re-entry key)
+--   layout        "pair"|"detail" "pair" = list + CURRENT/AFTER side-by-side
+--                                  (default); "detail" = list + one pane below
+--   list()        -> items        full refresh source (reads adapter state)
+--   rows(items)   -> entries[]    DISPLAY-ORDERED row rendering, one entry per
+--                                  row: { item = <the item>, text = string,
+--                                  hl = string|nil, col = number|nil (0 or 2),
+--                                  state = any|nil } — or { sep = "group" }
+--                                  for separator lines. The ONLY place
+--                                  per-row disk checks run (cached per refresh).
+--   preview(item, h) -> { left = { lines, name, ft, modifiable, winbar, hl },
+--                         right = {...},            -- pair layout only
+--                         focus = { left = n, right = n } }
+--                      hl = { [line] = "ManageAdd" } etc — applied after write.
+--   actions       table           optional: primary (<CR>, primary_desc),
+--                                  accept (da), reject (dr), group_apply (ga),
+--                                  open (o), yank (y), rerun (rr) — fn(item, h)
+--   yank(item, h) optional override for the universal y (row-state yank);
+--                                  default: row text + known item fields
+--   keys          {key,desc,fn(h)}[]  extra keymaps (mapped on EVERY buffer)
+--   legend        string|fn(h)    optional; default built from actions+keys
+--   swatches      string          optional winbar line 1 (color legend)
+--   empty_msg     string          notify text when list() is empty
+--   empty_lines   string[]|fn(h)  in-pane empty state (keep_empty viewers)
+--   open_empty    bool            open the viewer even with zero items
+--   keep_empty    bool            keep the viewer when a refresh empties it
+--   preview_empty bool            render the detail pane with no selected item
+--   identity(item)-> string|nil   cursor restore key across refresh
+--   scroll        "previews"|"hunks"  [/] behavior (default "previews")
+--   hunk_jump     fn(delta, h)    required when scroll == "hunks"
+--   right_editable bool           right pane editable (da writes it)
+--
+-- The engine maps the FULL key set on EVERY buffer — nothing is dead by
+-- focus. Q kills; r refreshes; y yanks the row's state (paste into a
+-- session to ask about it); the WinEnter autocmd returns focus to the
+-- list (deferred via vim.schedule — never switch windows synchronously
+-- inside nvim_win_call). Re-opening a panel replaces its own viewer
+-- instead of stacking; different panels coexist.
+
+local M = {}
+
+local actives = {} -- panel name -> handle
+
+--- Create a deterministic split window.
+--- @param buf number
+--- @param split string
+--- @param ref_win number|nil
+--- @return number
+local function make_window(buf, split, ref_win)
+	local opts = { relative = "", split = split }
+	if ref_win then
+		opts.win = ref_win
+	end
+	return vim.api.nvim_open_win(buf, false, opts)
+end
+
+--- Define the shared row highlight groups once (all panels agree visually).
+function M.define_hls()
+	local hl = vim.api.nvim_set_hl
+	-- proposals / journal / verdicts
+	hl(0, "ManageNew", { fg = "#4ec9b0", bold = true }) -- green: new file
+	hl(0, "ManageEdit", { fg = "#569cd6" }) -- blue: edit needed
+	hl(0, "ManageRerun", { fg = "#c586c0" }) -- magenta: context stale
+	hl(0, "ManageDelete", { fg = "#f44747" }) -- red: delete/move
+	hl(0, "ManageApplied", { fg = "#6a9955" }) -- dim green: already applied
+	hl(0, "ManageRejected", { fg = "#808080", strikethrough = true }) -- dim: rejected
+	hl(0, "ManageSuperseded", { fg = "#6e6e6e", italic = true, strikethrough = true }) -- dim: older revision
+	hl(0, "ManageMismatch", { fg = "#dcdcaa", bold = true }) -- yellow: mismatch
+	hl(0, "ManageManual", { fg = "#dcdcaa" }) -- yellow: manual-y
+	hl(0, "ManageRestore", { fg = "#c586c0" }) -- magenta: restore (revert)
+	hl(0, "ManageDead", { fg = "#808080", strikethrough = true }) -- dim: not restorable
+	hl(0, "ManageGroup", { fg = "#808080", italic = true }) -- group headers
+	-- registry
+	hl(0, "ManageRegShared", { fg = "#f44747" }) -- red: shared (central)
+	hl(0, "ManageRegCanonical", { fg = "#569cd6" }) -- blue: canonical
+	hl(0, "ManageRegModularize", { fg = "#dcdcaa" }) -- yellow: modularize
+	hl(0, "ManageRegConsolidate", { fg = "#c586c0" }) -- magenta: consolidations
+	hl(0, "ManageRegMerged", { fg = "#6a9955" }) -- dim green: merged
+	hl(0, "ManageRegRejected", { fg = "#808080", strikethrough = true }) -- dim: rejected
+	-- skills
+	hl(0, "ManageSkillDefault", { fg = "#4ec9b0" }) -- green: routed by subject
+	hl(0, "ManageSkillConditional", { fg = "#569cd6" }) -- blue: exact subject only
+	hl(0, "ManageSkillEmergency", { fg = "#c586c0", bold = true }) -- magenta: always hinted
+	hl(0, "ManageSkillExplicit", { fg = "#808080" }) -- dim: never hinted
+	hl(0, "ManageSkillLegacy", { fg = "#808080", italic = true, strikethrough = true }) -- retired
+	-- diff panes: what a partial deletes (left) / adds (right)
+	hl(0, "ManageAdd", { bg = "#1e3b2a" })
+	hl(0, "ManageRemove", { bg = "#3b1f1f" })
+end
+
+--- Build the default legend from the spec's actions + extra keys.
+--- @param spec table
+--- @return string
+local function build_legend(spec)
+	local parts = { "j/k move", "gg/G jump" }
+	table.insert(parts, spec.scroll == "hunks" and "[/] hunks" or "[/] scroll")
+	local a = spec.actions or {}
+	if a.primary then
+		table.insert(parts, "<CR> " .. (a.primary_desc or "apply"))
+	end
+	if a.accept then
+		table.insert(parts, "da accept")
+	end
+	if a.reject then
+		table.insert(parts, "dr reject")
+	end
+	if a.group_apply then
+		table.insert(parts, "ga group")
+	end
+	if a.open then
+		table.insert(parts, "o open")
+	end
+	table.insert(parts, "y yank")
+	if a.rerun then
+		table.insert(parts, "rr rerun")
+	end
+	for _, k in ipairs(spec.keys or {}) do
+		table.insert(parts, k.key .. " " .. k.desc)
+	end
+	table.insert(parts, "r refresh")
+	table.insert(parts, "Q kill")
+	return table.concat(parts, " · ")
+end
+
+--- Open a review console for `spec`. Returns the handle (refresh/kill/state).
+--- @param spec table  see the contract in the module header
+--- @return table handle
+function M.open(spec)
+	local raw = spec.list()
+	if #raw == 0 and not spec.open_empty then
+		vim.notify(spec.empty_msg or ("No " .. spec.name .. " items"), vim.log.levels.INFO)
+		return
+	end
+	-- Re-entry guard: replace this panel's own viewer instead of stacking
+	local prev = actives[spec.name]
+	if prev and prev.state.outer_win and vim.api.nvim_win_is_valid(prev.state.outer_win) then
+		prev.kill()
+	end
+	M.define_hls()
+
+	local state = {
+		items = {},
+		idx = 1,
+		row_info = {},
+		list_buf = nil,
+		cur_buf = nil,
+		after_buf = nil,
+		list_win = nil,
+		cur_win = nil,
+		after_win = nil,
+		outer_win = nil,
+		origin_win = nil,
+		origin_buf = nil,
+		autocmd = nil,
+	}
+	local handle = { state = state, name = spec.name }
+	actives[spec.name] = handle
+
+	local function kill_viewer()
+		for _, b in ipairs({ state.list_buf, state.cur_buf, state.after_buf }) do
+			if b and vim.api.nvim_buf_is_valid(b) then
+				pcall(vim.keymap.del, "n", "Q", { buffer = b })
+			end
+		end
+		if state.autocmd then
+			pcall(vim.api.nvim_del_autocmd, state.autocmd)
+			state.autocmd = nil
+		end
+		local seen = {}
+		for _, w in ipairs({ state.list_win, state.cur_win, state.after_win, state.outer_win }) do
+			if w and not seen[w] then
+				seen[w] = true
+				if vim.api.nvim_win_is_valid(w) then
+					vim.api.nvim_win_close(w, true)
+				end
+			end
+		end
+		state.items = {}
+		state.row_info = {}
+		state.list_buf = nil
+		state.cur_buf = nil
+		state.after_buf = nil
+		state.list_win = nil
+		state.cur_win = nil
+		state.after_win = nil
+		state.outer_win = nil
+		state.origin_win = nil
+		state.origin_buf = nil
+		if actives[spec.name] == handle then
+			actives[spec.name] = nil
+		end
+		vim.notify("🗑️ " .. spec.name .. " viewer closed", vim.log.levels.INFO)
+	end
+	handle.kill = kill_viewer
+
+	local function render_list()
+		if not state.list_buf or not vim.api.nvim_buf_is_valid(state.list_buf) then
+			return
+		end
+		local lines = {}
+		local row_of = {} -- display line -> { hl = string, col = number }
+		local cursor_line = 1
+		local cur = state.items[state.idx]
+		for _, info in ipairs(state.row_info) do
+			if info.sep then
+				table.insert(
+					lines,
+					"── " .. info.sep .. " ─────────────────────"
+				)
+				row_of[#lines] = { hl = "ManageGroup", col = 0 }
+			else
+				local marker = (info.item == cur) and ">" or " "
+				table.insert(lines, marker .. " " .. (info.text or ""))
+				row_of[#lines] = { hl = info.hl, col = info.col or 2 }
+				if info.item == cur then
+					cursor_line = #lines
+				end
+			end
+		end
+		if #lines == 0 then
+			local el = spec.empty_lines
+			if type(el) == "function" then
+				el = el(handle)
+			end
+			if el then
+				for _, l in ipairs(el) do
+					table.insert(lines, l)
+				end
+			else
+				table.insert(lines, "— nothing here —")
+			end
+		end
+		if vim.bo[state.list_buf].modifiable == false then
+			vim.bo[state.list_buf].modifiable = true
+		end
+		vim.api.nvim_buf_set_lines(state.list_buf, 0, -1, false, lines)
+		vim.bo[state.list_buf].modifiable = false
+
+		local ns = vim.api.nvim_create_namespace("manage-rows")
+		vim.api.nvim_buf_clear_namespace(state.list_buf, ns, 0, -1)
+		for ln, r in pairs(row_of) do
+			if r.hl then
+				vim.api.nvim_buf_add_highlight(state.list_buf, ns, r.hl, ln - 1, r.col, -1)
+			end
+		end
+
+		if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
+			local total = vim.api.nvim_buf_line_count(state.list_buf)
+			local target = math.max(1, math.min(cursor_line, total))
+			pcall(vim.api.nvim_win_set_cursor, state.list_win, { target, 0 })
+		end
+	end
+
+	local function render_previews()
+		local item = state.items[state.idx]
+		if not item and not spec.preview_empty then
+			return
+		end
+		local pv = spec.preview(item, handle)
+		if not pv then
+			return
+		end
+		local panes = {
+			{ buf = state.cur_buf, win = state.cur_win, p = pv.left },
+		}
+		if state.after_buf then
+			panes[#panes + 1] = { buf = state.after_buf, win = state.after_win, p = pv.right }
+		end
+		local ns = vim.api.nvim_create_namespace("manage-panes")
+		for _, pane in ipairs(panes) do
+			local p = pane.p
+			if p and pane.buf and vim.api.nvim_buf_is_valid(pane.buf) then
+				if vim.bo[pane.buf].modifiable == false then
+					vim.bo[pane.buf].modifiable = true
+				end
+				vim.api.nvim_buf_set_lines(pane.buf, 0, -1, false, p.lines or { "" })
+				vim.bo[pane.buf].bufhidden = "wipe"
+				vim.bo[pane.buf].filetype = p.ft or ""
+				vim.api.nvim_buf_set_name(pane.buf, p.name or spec.name)
+				vim.bo[pane.buf].modifiable = p.modifiable ~= nil and p.modifiable or false
+				vim.api.nvim_buf_clear_namespace(pane.buf, ns, 0, -1)
+				for ln, hl in pairs(p.hl or {}) do
+					vim.api.nvim_buf_add_highlight(pane.buf, ns, hl, ln - 1, 0, -1)
+				end
+				if pane.win and vim.api.nvim_win_is_valid(pane.win) then
+					vim.wo[pane.win].winbar = p.winbar or (p.name or spec.name)
+				end
+			end
+		end
+		local focus = pv.focus or {}
+		local focus_specs = {
+			{ state.cur_win, focus.left or 1 },
+			{ state.after_win, focus.right or 1 },
+		}
+		for _, fs in ipairs(focus_specs) do
+			local w, ln = fs[1], fs[2]
+			if w and vim.api.nvim_win_is_valid(w) then
+				local maxln = math.max(1, vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(w)))
+				ln = math.max(1, math.min(ln, maxln))
+				vim.api.nvim_win_call(w, function()
+					vim.api.nvim_win_set_cursor(w, { ln, 0 })
+					vim.cmd("normal! zt") -- change line lands at the top of the pane
+				end)
+			end
+		end
+	end
+
+	local function set_legend()
+		if not state.list_win or not vim.api.nvim_win_is_valid(state.list_win) then
+			return
+		end
+		local line2 = spec.legend
+		if type(line2) == "function" then
+			line2 = line2(handle)
+		end
+		line2 = line2 or build_legend(spec)
+		if spec.swatches then
+			vim.wo[state.list_win].winbar = table.concat({ spec.swatches, line2 }, "\n")
+		else
+			vim.wo[state.list_win].winbar = line2
+		end
+	end
+
+	local function refresh()
+		local infos = spec.rows(spec.list()) or {}
+		local items = {}
+		for _, info in ipairs(infos) do
+			if info.item then
+				items[#items + 1] = info.item
+			end
+		end
+		local prev = state.items[state.idx]
+		state.items = items
+		state.row_info = infos
+		if #items == 0 then
+			if spec.keep_empty then
+				render_list()
+				if spec.preview_empty then
+					render_previews()
+				end
+				set_legend()
+				return
+			end
+			vim.notify(spec.empty_msg or ("No " .. spec.name .. " items"), vim.log.levels.INFO)
+			kill_viewer()
+			return
+		end
+		-- Cursor restore: by identity when the adapter provides it, else clamp
+		if prev and spec.identity then
+			local key = spec.identity(prev)
+			local found = false
+			for i, it in ipairs(items) do
+				if spec.identity(it) == key then
+					state.idx = i
+					found = true
+					break
+				end
+			end
+			if not found then
+				state.idx = math.max(1, math.min(state.idx, #items))
+			end
+		else
+			state.idx = math.max(1, math.min(state.idx, #items))
+		end
+		render_list()
+		render_previews()
+		set_legend()
+	end
+	handle.refresh = refresh
+
+	local function move(delta)
+		local n = #state.items
+		if n == 0 then
+			return
+		end
+		state.idx = math.max(1, math.min(n, state.idx + delta))
+		render_list()
+		render_previews()
+	end
+
+	local function jump(to_last)
+		local n = #state.items
+		if n == 0 then
+			return
+		end
+		state.idx = to_last and n or 1
+		render_list()
+		render_previews()
+	end
+
+local function scroll_previews(delta)
+		local amount = delta * 8
+		for _, w in ipairs({ state.cur_win, state.after_win }) do
+			if w and vim.api.nvim_win_is_valid(w) then
+				local topline = vim.api.nvim_win_call(w, function()
+					return vim.fn.line("w0")
+				end)
+				local maxln = math.max(1, vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(w)))
+				local target = math.max(1, math.min(topline + amount, maxln))
+				vim.api.nvim_win_set_cursor(w, { target, 0 })
+			end
+		end
+	end
+
+	--- Generic row-state yank: the row text plus the item's known fields.
+	--- Defined BEFORE yank_current — Lua resolves names at compile time, and
+	--- a later-declared local would compile as a global lookup (E5108).
+	local function default_yank(item)
+		local info = state.row_info[state.idx] or {}
+		local lines = { info.text or "" }
+		for _, k in ipairs({
+			"path",
+			"operation",
+			"status",
+			"group",
+			"sessionID",
+			"ts",
+			"reason",
+			"kind",
+			"source",
+			"title",
+			"category",
+			"why",
+			"summary",
+			"name",
+			"tier",
+			"verdict",
+			"scope",
+		}) do
+			local v = item[k]
+			if v ~= nil then
+				lines[#lines + 1] = string.format("%s: %s", k, tostring(v))
+			end
+		end
+		return table.concat(lines, "\n")
+	end
+
+	--- y: yank this row's state — identity, status, and metadata — so it can
+	--- be pasted into a session for follow-up. Panels may override via
+	--- spec.yank(item, handle) for a richer payload.
+	local function yank_current()
+		local item = state.items[state.idx]
+		if not item then
+			return
+		end
+		local text = spec.yank and spec.yank(item, handle) or default_yank(item)
+		vim.fn.setreg("+", text)
+		vim.fn.setreg('"', text)
+		vim.notify(
+			string.format("📋 Yanked row state (%d chars) — paste into a session to ask about it", #text),
+			vim.log.levels.INFO
+		)
+	end
+
+	--- Register the panel's keybinds with which-key (v3) explicitly — the
+	--- popup then shows "what comes next" on prefix keys (d, g, r, [, ]).
+	--- Guarded: which-key is optional; without it the winbar legend still
+	--- documents every key. Buffer-scoped, so registrations die with the
+	--- panel buffers.
+	local function register_whichkey(buf)
+		local ok, wk = pcall(require, "which-key")
+		if not ok then
+			return
+		end
+		local overrides = {}
+		for _, k in ipairs(spec.keys or {}) do
+			overrides[k.key] = true
+		end
+		local specs = {
+			{ "j", desc = "next row", buffer = buf },
+			{ "k", desc = "prev row", buffer = buf },
+			{ "<C-n>", desc = "next row", buffer = buf },
+			{ "<C-p>", desc = "prev row", buffer = buf },
+			{ "gg", desc = "jump to top", buffer = buf },
+			{ "G", desc = "jump to bottom", buffer = buf },
+		}
+		if not overrides["["] and not overrides["]"] then
+			if spec.scroll == "hunks" then
+				specs[#specs + 1] = { "[", desc = "prev hunk", buffer = buf }
+				specs[#specs + 1] = { "]", desc = "next hunk", buffer = buf }
+			else
+				specs[#specs + 1] = { "[", desc = "scroll previews up", buffer = buf }
+				specs[#specs + 1] = { "]", desc = "scroll previews down", buffer = buf }
+			end
+		end
+		local a = spec.actions or {}
+		if a.primary then
+			specs[#specs + 1] = { "<CR>", desc = a.primary_desc or "apply", buffer = buf }
+		elseif a.open then
+			specs[#specs + 1] = { "<CR>", desc = "open", buffer = buf }
+		end
+		if a.accept then
+			specs[#specs + 1] = { "da", desc = "accept", buffer = buf }
+		end
+		if a.reject then
+			specs[#specs + 1] = { "dr", desc = "reject", buffer = buf }
+		end
+		if a.group_apply then
+			specs[#specs + 1] = { "ga", desc = "group apply", buffer = buf }
+		end
+		if a.open then
+			specs[#specs + 1] = { "o", desc = "open", buffer = buf }
+		end
+		specs[#specs + 1] = { "y", desc = "yank row", buffer = buf }
+		if a.rerun then
+			specs[#specs + 1] = { "rr", desc = "rerun", buffer = buf }
+		end
+		specs[#specs + 1] = { "r", desc = "refresh", buffer = buf }
+		for _, k in ipairs(spec.keys or {}) do
+			specs[#specs + 1] = { k.key, desc = k.desc, buffer = buf }
+		end
+		specs[#specs + 1] = { "Q", desc = "kill viewer", buffer = buf }
+		wk.add(specs)
+	end
+
+	local function map_keys(buf)
+		local opts = { buffer = buf, nowait = true, noremap = true, silent = true }
+		vim.keymap.set("n", "j", function()
+			move(1)
+		end, vim.tbl_extend("force", opts, { desc = "next row" }))
+		vim.keymap.set("n", "k", function()
+			move(-1)
+		end, vim.tbl_extend("force", opts, { desc = "prev row" }))
+		vim.keymap.set("n", "<C-n>", function()
+			move(1)
+		end, vim.tbl_extend("force", opts, { desc = "next row" }))
+		vim.keymap.set("n", "<C-p>", function()
+			move(-1)
+		end, vim.tbl_extend("force", opts, { desc = "prev row" }))
+		vim.keymap.set("n", "gg", function()
+			jump(false)
+		end, vim.tbl_extend("force", opts, { desc = "jump to top" }))
+		vim.keymap.set("n", "G", function()
+			jump(true)
+		end, vim.tbl_extend("force", opts, { desc = "jump to bottom" }))
+		-- Adapter keys may override the default [/] behavior (e.g. goals
+		-- uses them for suggestion selection).
+		local overrides = {}
+		for _, k in ipairs(spec.keys or {}) do
+			overrides[k.key] = true
+		end
+		if not overrides["["] and not overrides["]"] then
+			if spec.scroll == "hunks" then
+				vim.keymap.set("n", "[", function()
+					spec.hunk_jump(-1, handle)
+				end, vim.tbl_extend("force", opts, { desc = "prev hunk" }))
+				vim.keymap.set("n", "]", function()
+					spec.hunk_jump(1, handle)
+				end, vim.tbl_extend("force", opts, { desc = "next hunk" }))
+			else
+				vim.keymap.set("n", "[", function()
+					scroll_previews(-1)
+				end, vim.tbl_extend("force", opts, { desc = "scroll previews up" }))
+				vim.keymap.set("n", "]", function()
+					scroll_previews(1)
+				end, vim.tbl_extend("force", opts, { desc = "scroll previews down" }))
+			end
+		end
+		local a = spec.actions or {}
+		if a.primary then
+			vim.keymap.set("n", "<CR>", function()
+				a.primary(state.items[state.idx], handle)
+			end, vim.tbl_extend("force", opts, { desc = a.primary_desc or "apply" }))
+		elseif a.open then
+			vim.keymap.set("n", "<CR>", function()
+				a.open(state.items[state.idx], handle)
+			end, vim.tbl_extend("force", opts, { desc = "open" }))
+		end
+		if a.accept then
+			vim.keymap.set("n", "da", function()
+				a.accept(state.items[state.idx], handle)
+			end, vim.tbl_extend("force", opts, { desc = "accept" }))
+		end
+		if a.reject then
+			vim.keymap.set("n", "dr", function()
+				a.reject(state.items[state.idx], handle)
+			end, vim.tbl_extend("force", opts, { desc = "reject" }))
+		end
+		if a.group_apply then
+			vim.keymap.set("n", "ga", function()
+				a.group_apply(state.items[state.idx], handle)
+			end, vim.tbl_extend("force", opts, { desc = "group apply" }))
+		end
+		if a.open then
+			vim.keymap.set("n", "o", function()
+				a.open(state.items[state.idx], handle)
+			end, vim.tbl_extend("force", opts, { desc = "open" }))
+		end
+		vim.keymap.set("n", "y", yank_current, vim.tbl_extend("force", opts, { desc = "yank row" }))
+		if a.rerun then
+			vim.keymap.set("n", "rr", function()
+				a.rerun(state.items[state.idx], handle)
+			end, vim.tbl_extend("force", opts, { desc = "rerun" }))
+		end
+		vim.keymap.set("n", "r", refresh, vim.tbl_extend("force", opts, { desc = "refresh" }))
+		for _, k in ipairs(spec.keys or {}) do
+			vim.keymap.set("n", k.key, function()
+				k.fn(handle)
+			end, vim.tbl_extend("force", opts, { desc = k.desc }))
+		end
+		vim.keymap.set("n", "Q", kill_viewer, vim.tbl_extend("force", opts, { desc = "kill viewer" }))
+		register_whichkey(buf)
+	end
+
+	-- Layout: list column right of origin; preview below; pair adds a right sibling
+	state.origin_win = vim.api.nvim_get_current_win()
+	state.origin_buf = vim.api.nvim_get_current_buf()
+
+	state.list_buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[state.list_buf].bufhidden = "wipe"
+	vim.bo[state.list_buf].filetype = "managelist"
+	state.outer_win = make_window(state.list_buf, "right")
+	state.list_win = state.outer_win
+
+	state.cur_buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[state.cur_buf].bufhidden = "wipe"
+	vim.bo[state.cur_buf].modifiable = false
+	state.cur_win = make_window(state.cur_buf, "below", state.list_win)
+
+	if spec.layout ~= "detail" then
+		state.after_buf = vim.api.nvim_create_buf(false, true)
+		vim.bo[state.after_buf].bufhidden = "wipe"
+		vim.bo[state.after_buf].modifiable = spec.right_editable or false
+		state.after_win = make_window(state.after_buf, "right", state.cur_win)
+	end
+
+	-- Word-wrap every pane: long rows and previews read as paragraphs.
+	for _, w in ipairs({ state.list_win, state.cur_win, state.after_win }) do
+		if w and vim.api.nvim_win_is_valid(w) then
+			vim.wo[w].wrap = true
+			vim.wo[w].linebreak = true
+		end
+	end
+
+	vim.api.nvim_set_current_win(state.list_win)
+
+	-- Full key set on ALL buffers so nothing is a dead key by focus.
+	local bufs = { state.list_buf, state.cur_buf }
+	if state.after_buf then
+		bufs[#bufs + 1] = state.after_buf
+	end
+	for _, b in ipairs(bufs) do
+		map_keys(b)
+	end
+
+	state.autocmd = vim.api.nvim_create_autocmd("WinEnter", {
+		callback = function()
+			local cur = vim.api.nvim_get_current_win()
+			if
+				state.list_win
+				and vim.api.nvim_win_is_valid(state.list_win)
+				and (cur == state.cur_win or cur == state.after_win or cur == state.list_win)
+			then
+				-- Deferred: never switch windows synchronously inside a
+				-- nvim_win_call (disallowed) or mid-render — the focus
+				-- return lands on the next tick.
+				vim.schedule(function()
+					if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
+						vim.api.nvim_set_current_win(state.list_win)
+					end
+				end)
+			end
+		end,
+	})
+
+	local infos = spec.rows(raw) or {}
+	local items = {}
+	for _, info in ipairs(infos) do
+		if info.item then
+			items[#items + 1] = info.item
+		end
+	end
+	state.items = items
+	state.row_info = infos
+	state.idx = 1
+
+	render_list()
+	render_previews()
+	set_legend()
+	return handle
+end
+
+return M

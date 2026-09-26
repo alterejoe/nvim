@@ -1,0 +1,61 @@
+// /home/altjoe/.config/opencode/plugins/lib/tools/work-item-context.ts FINAL-2
+import { tool } from "@opencode-ai/plugin";
+import { workItemContext } from "../work-items";
+
+export function workItemContextTool(directory: string) {
+  return tool({
+    description:
+      "Read-only active goal and milestone context. Returns the active item, " +
+      "ancestors, children, and audit events so the assistant can assess " +
+      "progress without changing status or scope.",
+    args: {
+      item_id: tool.schema
+        .number()
+        .optional()
+        .describe("Optional work-item ID; defaults to the active item."),
+    },
+    async execute(args: any, context: any) {
+      const data = workItemContext(directory, args.item_id);
+      await recordEventSafe(
+        directory,
+        context?.sessionID,
+        data.active?.id ?? null,
+        data.events.length,
+      );
+      return JSON.stringify(
+        {
+          ok: true,
+          active_id: data.active_id,
+          active: data.active,
+          ancestors: data.ancestors,
+          children: data.children,
+          events: data.events,
+          note:
+            "This is evidence, not an accomplishment verdict. Use a reviewable suggestion for status, scope, priority, merge, or split changes.",
+        },
+        null,
+        2,
+      );
+    },
+  });
+}
+
+async function recordEventSafe(
+  directory: string,
+  sessionID: string | undefined,
+  itemID: number | null,
+  eventCount: number,
+): Promise<void> {
+  try {
+    const { recordEvent } = await import("../metrics");
+    await recordEvent(
+      directory,
+      sessionID,
+      "work_item_context",
+      itemID == null ? "no active item" : `item ${itemID}, ${eventCount} event(s)`,
+      null,
+    );
+  } catch {
+    // Metrics are diagnostics, never a gate.
+  }
+}

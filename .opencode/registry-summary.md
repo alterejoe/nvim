@@ -1,4 +1,4 @@
-# /home/jmeyer/.config/nvim/.opencode/registry-summary.md FINAL
+# /home/altjoe/.config/nvim/.opencode/registry-summary.md FINAL
 # Registry Summary — nvim
 
 Generated from `.opencode/manage.registry.json`. LSP-verified refs
@@ -16,6 +16,11 @@ are archived by the snapshot system — treat as dead consumers.
 - Symbols: index, pin, request_focus, list, list_global
 - Why: The reference store is shared by commands, focus updates and both viewers. Home-relative storage must resolve at this boundary so callers still receive absolute paths; proposal/verdict history is outside its scope.
 - Used by: lua/opencode-manage/init.lua, lua/opencode-manage/foldersview.lua, lua/opencode-manage/refsview.lua, lua/opencode-manage/vaultview.lua
+
+### lua/opencode-manage/console.lua
+- Symbols: open, define_hls
+- Why: The shared review console engine: every reviewable Nvim panel (proposals, registry, journal, skills, verdicts, metrics, refs, vault, goals) is a thin adapter over console.open(). It owns windows, keymaps, state, kill/refresh, legend, focus-return, and which-key registration — the ~2000 lines of duplicated viewer scaffolding collapsed into one module. Future reviewable panels (e.g. work-item suggestions) should be adapters, not new viewers.
+- Used by: lua/opencode-manage/reviewview.lua, lua/opencode-manage/registryview.lua, lua/opencode-manage/journalview.lua, lua/opencode-manage/skillsview.lua, lua/opencode-manage/verdictview.lua, lua/opencode-manage/metricsview.lua, lua/opencode-manage/refsview.lua, lua/opencode-manage/vaultview.lua, lua/opencode-manage/goalsview.lua
 
 ## consolidations
 

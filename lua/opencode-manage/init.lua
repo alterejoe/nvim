@@ -1,20 +1,18 @@
--- /home/altjoe/.config/nvim/lua/opencode-manage/init.lua FINAL-2
--- opencode-manage — the review console for the opencode manage plugin.
+-- /home/altjoe/.config/nvim/lua/opencode-manage/init.lua FINAL-4
+-- opencode-manage: the review console for the opencode manage plugin.
 -- Proposal review + change journal + registry review + verdict store/viewer
 -- + metrics interface + references + skills lifecycle + permissions folders
--- + handoff catalogue viewer.
--- Completely separate from opencode-ext (the chat viewer) — no overlap.
+-- + handoff catalogue + user-owned goals and milestones.
+-- Completely separate from opencode-ext (the chat viewer) - no overlap.
 --
 -- VIEWERS: proposals (<leader>ap / <leader>ac), journal (<leader>aj),
 -- registry (<leader>ar), verdicts (<leader>av), metrics (<leader>at),
--- references (<leader>af), vault (<leader>ag), skills (<leader>ak), folders (<leader>aa),
--- handoff (<leader>ah) —
--- all persistent two-pane viewers with live previews, no bland pickers.
--- COMMANDS: :ManageMetrics (summary), :ManagePrune [note] (shaped prune),
--- :ManageFolders (permissions memory + sync + verify),
--- :ManageIndex [root] / :ManageVault [root] / :ManageRef [path] /
--- :ManageRefs / :ManageRefPrune <id> <why> (references, doc 20),
--- :ManageHandoff (handoff catalogue + pending proposals).
+-- references (<leader>af), vault (<leader>ag), skills (<leader>ak),
+-- folders (<leader>aa), handoff (<leader>ah), goals (<leader>am).
+-- All persistent viewers have live previews and explicit user actions.
+-- COMMANDS: :ManageMetrics, :ManagePrune, :ManageFolders, :ManageGoals,
+-- :ManageIndex, :ManageVault, :ManageRef, :ManageRefs, :ManageRefPrune,
+-- and :ManageHandoff.
 -- Focus: BufEnter writes the active file so refs can route by what you work on.
 
 local review = require("opencode-manage.review")
@@ -32,6 +30,10 @@ local skillsview = require("opencode-manage.skillsview")
 local folders = require("opencode-manage.folders")
 local foldersview = require("opencode-manage.foldersview")
 local handoffview = require("opencode-manage.handoffview")
+local goals = require("opencode-manage.goals")
+local goalsview = require("opencode-manage.goalsview")
+local bookmarks = require("opencode-manage.bookmarks")
+local bookmarksview = require("opencode-manage.bookmarksview")
 
 -- Keymaps
 vim.keymap.set("n", "<leader>ap", reviewview.open, { desc = "Manage: review proposals" })
@@ -45,88 +47,118 @@ vim.keymap.set("n", "<leader>ak", skillsview.open, { desc = "Manage: skills life
 vim.keymap.set("n", "<leader>aa", foldersview.open, { desc = "Manage: folder permissions" })
 vim.keymap.set("n", "<leader>ag", vaultview.open, { desc = "Manage: vault (global references)" })
 vim.keymap.set("n", "<leader>ah", handoffview.open, { desc = "Manage: handoff catalogue" })
+vim.keymap.set("n", "<leader>am", goalsview.open, { desc = "Manage: goals and milestones" })
+vim.keymap.set("n", "<leader>ab", bookmarksview.open, { desc = "Manage: review session bookmarks" })
 
--- Stable commands (path resolution lives in code, not in pasted one-liners)
+-- Stable commands
 vim.api.nvim_create_user_command("ManageMetrics", function()
-	metrics.summary()
+  metrics.summary()
 end, { desc = "Manage: metrics store summary" })
 
 vim.api.nvim_create_user_command("ManagePrune", function(opts)
-	metrics.request_prune(opts.args ~= "" and opts.args or nil)
+  metrics.request_prune(opts.args ~= "" and opts.args or nil)
 end, { nargs = "*", desc = "Manage: request a shaped context prune (next opencode message)" })
 
 vim.api.nvim_create_user_command("ManageFolders", function()
-	folders.summary()
+  folders.summary()
 end, { desc = "Manage: folder permissions memory (approve/avoid/sync/verify)" })
 
+vim.api.nvim_create_user_command("ManageGoals", function()
+  goalsview.open()
+end, { desc = "Manage: goals and milestones viewer" })
+
+vim.api.nvim_create_user_command("ManageGoalsSummary", function()
+	goals.summary()
+end, { desc = "Manage: print project goals and milestones" })
+
+vim.api.nvim_create_user_command("ManageBookmarks", function(opts)
+	local results = bookmarks.search(opts.args)
+	if #results == 0 then
+		vim.notify("bookmarks: no matches for '" .. opts.args .. "'", vim.log.levels.INFO)
+		return
+	end
+	local qf = {}
+	for _, e in ipairs(results) do
+		qf[#qf + 1] = {
+			filename = bookmarks.session_file(e.session_id) or "",
+			text = string.format("[%s] %s — %s", e.category, e.title, e.why),
+		}
+	end
+	vim.fn.setqflist({}, " ", { title = "bookmarks: " .. opts.args, items = qf })
+	vim.cmd("copen")
+	vim.notify(string.format("🔖 %d bookmark(s) for '%s'", #results, opts.args), vim.log.levels.INFO)
+end, { nargs = "*", desc = "Manage: search accepted session bookmarks" })
+
 vim.api.nvim_create_user_command("ManageIndex", function(opts)
-	refs.index(opts.args ~= "" and opts.args or vim.fn.getcwd())
+  refs.index(opts.args ~= "" and opts.args or vim.fn.getcwd())
 end, { nargs = "?", complete = "dir", desc = "Manage: index references under a root" })
 
 vim.api.nvim_create_user_command("ManageVault", function(opts)
-	local root = opts.args ~= "" and opts.args or ((vim.env.HOME or "") .. "/projects/shared")
-	refs.index(root, { global = true })
+  local root = opts.args ~= "" and opts.args or ((vim.env.HOME or "") .. "/projects/shared")
+  refs.index(root, { global = true })
 end, { nargs = "?", complete = "dir", desc = "Manage: index the shared vault into the GLOBAL ref store" })
 
 vim.api.nvim_create_user_command("ManageRef", function(opts)
-	local path = opts.args ~= "" and opts.args or vim.api.nvim_buf_get_name(0)
-	if path == "" then
-		vim.notify("❌ refs: no path given and the buffer has no file", vim.log.levels.WARN)
-		return
-	end
-	refs.pin(path)
+  local path = opts.args ~= "" and opts.args or vim.api.nvim_buf_get_name(0)
+  if path == "" then
+    vim.notify("refs: no path given and the buffer has no file", vim.log.levels.WARN)
+    return
+  end
+  refs.pin(path)
 end, { nargs = "?", complete = "file", desc = "Manage: pin a reference" })
 
 vim.api.nvim_create_user_command("ManageRefs", function()
-	refs.summary()
+  refs.summary()
 end, { desc = "Manage: list references" })
 
 vim.api.nvim_create_user_command("ManageRefPrune", function(opts)
-	local id, reason = opts.args:match("^(%d+)%s+(.+)$")
-	if not id then
-		vim.notify("❌ usage: :ManageRefPrune <id> <reason>", vim.log.levels.WARN)
-		return
-	end
-	refs.prune(tonumber(id), reason)
+  local id, reason = opts.args:match("^(%d+)%s+(.+)$")
+  if not id then
+    vim.notify("usage: :ManageRefPrune <id> <reason>", vim.log.levels.WARN)
+    return
+  end
+  refs.prune(tonumber(id), reason)
 end, { nargs = "+", desc = "Manage: prune a reference, keeping the reason" })
 
 vim.api.nvim_create_user_command("ManageHandoff", function()
-	handoffview.open()
+  handoffview.open()
 end, { desc = "Manage: show the handoff catalogue + pending proposals" })
 
--- R1: focus routing — write the active file so refs match what you work on.
+-- R1: focus routing - write the active file so refs match what you work on.
 vim.api.nvim_create_autocmd("BufEnter", {
-	callback = function()
-		local buf = vim.api.nvim_get_current_buf()
-		if vim.bo[buf].buftype ~= "" then
-			return
-		end
-		local name = vim.api.nvim_buf_get_name(buf)
-		if name ~= "" then
-			refs.request_focus(name)
-		end
-	end,
+  callback = function()
+    local buf = vim.api.nvim_get_current_buf()
+    if vim.bo[buf].buftype ~= "" then
+      return
+    end
+    local name = vim.api.nvim_buf_get_name(buf)
+    if name ~= "" then
+      refs.request_focus(name)
+    end
+  end,
 })
 
 -- API surface for scripting / later integration
 return {
-	review = review,
-	reviewview = reviewview,
-	journalview = journalview,
-	registryview = registryview,
-	verdictview = verdictview,
-	metrics = metrics,
-	metricsview = metricsview,
-	refs = refs,
-	refsview = refsview,
-	vaultview = vaultview,
-	skills = skills,
-	skillsview = skillsview,
-	folders = folders,
-	foldersview = foldersview,
-	handoffview = handoffview,
-	proposals = require("opencode-manage.proposals"),
-	journal = require("opencode-manage.journal"),
-	registry = require("opencode-manage.registry"),
-	verdicts = require("opencode-manage.verdicts"),
+  review = review,
+  reviewview = reviewview,
+  journalview = journalview,
+  registryview = registryview,
+  verdictview = verdictview,
+  metrics = metrics,
+  metricsview = metricsview,
+  refs = refs,
+  refsview = refsview,
+  vaultview = vaultview,
+  skills = skills,
+  skillsview = skillsview,
+  folders = folders,
+  foldersview = foldersview,
+  handoffview = handoffview,
+  goals = goals,
+  goalsview = goalsview,
+  proposals = require("opencode-manage.proposals"),
+  journal = require("opencode-manage.journal"),
+  registry = require("opencode-manage.registry"),
+  verdicts = require("opencode-manage.verdicts"),
 }

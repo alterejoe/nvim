@@ -1,0 +1,160 @@
+// /home/altjoe/.config/opencode/plugins/lib/work-items.ts FINAL-3
+/**
+ * Read-only project work-item access for OpenCode tools.
+ *
+ * Nvim owns mutations to .opencode/state.db in this phase. The plugin only
+ * reads existing work-item tables and never creates the database or schema.
+ */
+import { existsSync } from "fs";
+import { join } from "path";
+import { openDatabase } from "./sqlite";
+
+export type WorkItem = {
+  id: number;
+  parent_id: number | null;
+  kind: string;
+  name: string;
+  description: string;
+  status: string;
+  importance: number;
+  sibling_order: number;
+  hold_reason: string;
+  deferred_reason: string;
+  merged_into_id: number | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+};
+
+export type WorkItemEvent = {
+  id: number;
+  item_id: number;
+  actor: string;
+  event_type: string;
+  reason: string;
+  created_at: string;
+  session_id: string;
+};
+
+function statePath(directory: string): string {
+  return join(directory, ".opencode", "state.db");
+}
+
+function readRows<T>(db: any, sql: string, args: unknown[] = []): T[] {
+  try {
+    const rows = db.prepare(sql).all(...args);
+    return Array.isArray(rows) ? (rows as T[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function readOne<T>(db: any, sql: string, args: unknown[] = []): T | null {
+  try {
+    const row = db.prepare(sql).get(...args);
+    return row ? (row as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function listWorkItems(directory: string): WorkItem[] {
+  if (!existsSync(statePath(directory))) return [];
+  const db = openDatabase(statePath(directory));
+  if (!db) return [];
+  try {
+    return readRows<WorkItem>(
+      db,
+      `SELECT id, parent_id, kind, name, description, status,
+              importance, sibling_order, hold_reason, deferred_reason,
+              merged_into_id, created_at, updated_at, completed_at
+         FROM work_items
+        ORDER BY COALESCE(parent_id, 0), sibling_order, id`,
+    );
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // Read-only diagnostics must not fail on close.
+    }
+  }
+}
+
+export function workItemContext(
+  directory: string,
+  requestedID?: number,
+): {
+  active_id: number | null;
+  active: WorkItem | null;
+  ancestors: WorkItem[];
+  children: WorkItem[];
+  events: WorkItemEvent[];
+} {
+  const items = listWorkItems(directory);
+  const byID = new Map(items.map((item) => [item.id, item]));
+  let activeID: number | null = requestedID ?? null;
+
+  if (activeID == null && existsSync(statePath(directory))) {
+    const db = openDatabase(statePath(directory));
+    if (db) {
+      const row = readOne<{ item_id: number }>(
+        db,
+        "SELECT item_id FROM active_work_item WHERE id = 1",
+      );
+      activeID = row?.item_id ?? null;
+      try {
+        db.close();
+      } catch {
+        // Read-only diagnostics must not fail on close.
+      }
+    }
+  }
+
+  const active = activeID == null ? null : byID.get(activeID) ?? null;
+  const ancestors: WorkItem[] = [];
+  const seen = new Set<number>();
+  let parentID = active?.parent_id ?? null;
+  while (parentID != null && !seen.has(parentID)) {
+    seen.add(parentID);
+    const parent = byID.get(parentID);
+    if (!parent) break;
+    ancestors.unshift(parent);
+    parentID = parent.parent_id;
+  }
+
+  const children = active
+    ? items.filter((item) => item.parent_id === active.id)
+    : [];
+  const events = active ? readEvents(directory, active.id) : [];
+
+  return {
+    active_id: activeID,
+    active,
+    ancestors,
+    children,
+    events,
+  };
+}
+
+function readEvents(directory: string, itemID: number): WorkItemEvent[] {
+  if (!existsSync(statePath(directory))) return [];
+  const db = openDatabase(statePath(directory));
+  if (!db) return [];
+  try {
+    return readRows<WorkItemEvent>(
+      db,
+      `SELECT id, item_id, actor, event_type, reason, created_at, session_id
+         FROM work_item_events
+        WHERE item_id = ?
+        ORDER BY id DESC
+        LIMIT 50`,
+      [itemID],
+    );
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // Read-only diagnostics must not fail on close.
+    }
+  }
+}
