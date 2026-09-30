@@ -281,17 +281,7 @@ function M.open(spec)
 				if vim.bo[pane.buf].modifiable == false then
 					vim.bo[pane.buf].modifiable = true
 				end
-local pl = {}
-				for _, l in ipairs(p.lines or { "" }) do
-					if type(l) == "string" and l:find("\n") then
-						for _, s in ipairs(vim.split(l, "\n", { plain = true })) do
-							table.insert(pl, s)
-						end
-					else
-						table.insert(pl, l or "")
-					end
-				end
-				vim.api.nvim_buf_set_lines(pane.buf, 0, -1, false, pl)
+				vim.api.nvim_buf_set_lines(pane.buf, 0, -1, false, p.lines or { "" })
 				vim.bo[pane.buf].bufhidden = "wipe"
 				vim.bo[pane.buf].filetype = p.ft or ""
 				vim.api.nvim_buf_set_name(pane.buf, p.name or spec.name)

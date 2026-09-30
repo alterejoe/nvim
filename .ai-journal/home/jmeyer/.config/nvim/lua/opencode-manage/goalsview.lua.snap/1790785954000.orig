@@ -1,0 +1,549 @@
+-- /home/altjoe/.config/nvim/lua/opencode-manage/goalsview.lua FINAL-5
+-- opencode-manage.goalsview — goals/milestones panel (console adapter).
+-- Same recognizable interface as every other manage panel: list + detail.
+-- The tree renders as an indented list; the detail shows the selected
+-- item plus the pending suggestions section.
+--   j/k move · a add · e edit · space activate · s status · J/K move ·
+--   >/< indent/outdent · [/] filter · A accept suggestion ·
+--   R reject suggestion · x reject stale · r refresh · Q kill
+-- The panel is intentionally local: it changes planning state only
+-- through explicit user actions (goals.* writes).
+-- The engine (opencode-manage.console) owns windows/keymaps/state; this
+-- file owns the goals-specific rendering and actions.
+
+local goals = require("opencode-manage.goals")
+local console = require("opencode-manage.console")
+
+local M = {}
+
+local STATUS_ORDER = {
+	"planned",
+	"in_progress",
+	"on_hold",
+	"completed",
+	"deferred",
+	"cancelled",
+}
+
+local FILTER_ORDER = {
+	"all",
+	"planned",
+	"in_progress",
+	"on_hold",
+	"completed",
+	"deferred",
+	"cancelled",
+}
+
+local adapter = {
+	suggestions = {},
+	suggestion_idx = 1,
+	stale_ids = {},
+	status_filter = "all",
+}
+
+local function status_label(status)
+	return tostring(status or "planned"):gsub("_", " ")
+end
+
+local function kind_label(kind)
+	return kind == "goal" and "G" or "M"
+end
+
+local function children_by_parent(items)
+	local children = {}
+	for _, item in ipairs(items or {}) do
+		local key = "root"
+		if item.parent_id ~= nil and item.parent_id ~= vim.NIL then
+			key = tostring(item.parent_id)
+		end
+		children[key] = children[key] or {}
+		children[key][#children[key] + 1] = item
+	end
+	return children
+end
+
+--- Flatten the tree into display order (depth-first, root first).
+local function flatten(items)
+	local children = children_by_parent(items)
+	local out = {}
+	local visiting = {}
+
+	local function append(parent_id, depth)
+		local key = parent_id and tostring(parent_id) or "root"
+		if visiting[key] then
+			return
+		end
+		visiting[key] = true
+		for _, item in ipairs(children[key] or {}) do
+			out[#out + 1] = { item = item, depth = depth }
+			append(item.id, depth + 1)
+		end
+		visiting[key] = nil
+	end
+
+	append(nil, 0)
+	return out
+end
+
+local function normalize_name(name)
+	return (tostring(name or ""):lower():gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function suggestion_payload(suggestion)
+	local ok, payload = pcall(vim.json.decode, tostring(suggestion.payload or "{}"))
+	if ok and type(payload) == "table" then
+		return payload
+	end
+	return {}
+end
+
+--- Mark older duplicates as stale: group by action+kind+normalized name,
+--- the newest id in each group wins, all others are stale.
+local function mark_stale(suggestions)
+	local newest = {}
+	for _, suggestion in ipairs(suggestions or {}) do
+		local payload = suggestion_payload(suggestion)
+		local key = string.format(
+			"%s|%s|%s",
+			tostring(suggestion.action or ""),
+			tostring(payload.Kind or payload.kind or ""),
+			normalize_name(payload.Name or payload.name or "")
+		)
+		local current = newest[key]
+		if not current or tonumber(suggestion.id) > tonumber(current.id) then
+			newest[key] = suggestion
+		end
+	end
+	local stale = {}
+	for _, suggestion in ipairs(suggestions or {}) do
+		local payload = suggestion_payload(suggestion)
+		local key = string.format(
+			"%s|%s|%s",
+			tostring(suggestion.action or ""),
+			tostring(payload.Kind or payload.kind or ""),
+			normalize_name(payload.Name or payload.name or "")
+		)
+		if newest[key] and tonumber(newest[key].id) ~= tonumber(suggestion.id) then
+			stale[tostring(suggestion.id)] = true
+		end
+	end
+	return stale
+end
+
+local function list()
+	adapter.suggestions = goals.suggestions() or {}
+	adapter.stale_ids = mark_stale(adapter.suggestions)
+	local items = goals.list() or {}
+	if adapter.status_filter ~= "all" then
+		local filtered = {}
+		for _, item in ipairs(items) do
+			if tostring(item.status or "planned") == adapter.status_filter then
+				filtered[#filtered + 1] = item
+			end
+		end
+		items = filtered
+	end
+	return items
+end
+
+local function cycle_filter(h, delta)
+	local idx = 1
+	for i, f in ipairs(FILTER_ORDER) do
+		if f == adapter.status_filter then
+			idx = i
+			break
+		end
+	end
+	idx = ((idx - 1 + delta) % #FILTER_ORDER) + 1
+	adapter.status_filter = FILTER_ORDER[idx]
+	vim.notify("goals: filter: " .. adapter.status_filter, vim.log.levels.INFO)
+	h.refresh()
+end
+
+--- Rows: the goal tree, then a separator, then suggestion rows.
+--- Suggestions are first-class rows: A/R act on the selected row.
+local function rows(items)
+	local flat = flatten(items)
+	local active_id = goals.active_id()
+	local out = {}
+	for i, entry in ipairs(flat) do
+		local item = entry.item
+		local active = tonumber(item.id) == tonumber(active_id) and "*" or " "
+		local indent = string.rep("  ", entry.depth)
+		out[#out + 1] = {
+			item = item,
+			text = string.format(
+				"%s [%s] %-12s %s%s",
+				active,
+				kind_label(item.kind),
+				status_label(item.status),
+				indent,
+				item.name
+			),
+			col = 0,
+		}
+	end
+	if #adapter.suggestions > 0 then
+		out[#out + 1] = { sep = "PENDING SUGGESTIONS" }
+		for _, suggestion in ipairs(adapter.suggestions) do
+			local payload = suggestion_payload(suggestion)
+			local name = payload.Name or payload.name or "(unnamed)"
+			local stale = adapter.stale_ids[tostring(suggestion.id)]
+			out[#out + 1] = {
+				item = suggestion,
+				text = string.format("  [S] %-12s %s", stale and "stale" or "pending", name),
+				hl = stale and "ManageSuperseded" or "ManageNew",
+				col = 0,
+			}
+		end
+	end
+	return out
+end
+
+--- Detail: the selected item plus the pending suggestions section.
+local function preview(item, h)
+	local lines = {}
+	if item then
+		if item.action then
+			local payload = suggestion_payload(item)
+			local stale = adapter.stale_ids[tostring(item.id)] and " [stale]" or ""
+			lines[#lines + 1] = string.format("#%s suggestion%s / %s", item.id, stale, tostring(item.action))
+			lines[#lines + 1] = "status: " .. tostring(item.status)
+			lines[#lines + 1] = "name: " .. tostring(payload.Name or payload.name or "")
+			lines[#lines + 1] = ""
+			lines[#lines + 1] = tostring(payload.Description or payload.description or "(no description)")
+			lines[#lines + 1] = ""
+			lines[#lines + 1] = "rationale: " .. tostring(item.rationale or "")
+		else
+			lines[#lines + 1] = string.format("#%s %s / importance %s", item.id, item.kind, item.importance)
+			lines[#lines + 1] = "status: " .. status_label(item.status)
+lines[#lines + 1] = "parent: " .. (item.parent_id ~= nil and item.parent_id ~= vim.NIL and ("#" .. item.parent_id) or "root")
+			if item.hold_reason and item.hold_reason ~= "" then
+				lines[#lines + 1] = "reason: " .. item.hold_reason
+			end
+			lines[#lines + 1] = ""
+			lines[#lines + 1] = item.description ~= "" and item.description or "(no description)"
+		end
+	else
+		lines[#lines + 1] = "Select a goal, milestone, or suggestion."
+	end
+	return {
+		left = {
+			lines = lines,
+			name = "GOALS DETAIL",
+			ft = "",
+			modifiable = false,
+			winbar = "GOALS DETAIL",
+		},
+	}
+end
+
+local function selected(h)
+	return h.state.items[h.state.idx]
+end
+
+local function selected_suggestion()
+	return adapter.suggestions[adapter.suggestion_idx]
+end
+
+local function move_suggestion(h, delta)
+	if #adapter.suggestions == 0 then
+		return
+	end
+	adapter.suggestion_idx = math.max(1, math.min(#adapter.suggestions, adapter.suggestion_idx + delta))
+	h.refresh()
+end
+
+local function accept_suggestion(h)
+	local item = selected(h)
+	if not item then
+		return
+	end
+	if not item.action then
+		vim.notify("goals: select a suggestion row to accept", vim.log.levels.INFO)
+		return
+	end
+	local ok, err = goals.accept_suggestion(item.id)
+	if not ok then
+		vim.notify("goals: " .. tostring(err), vim.log.levels.ERROR)
+		return
+	end
+	vim.notify("suggestion accepted: #" .. tostring(item.id), vim.log.levels.INFO)
+	h.refresh()
+end
+
+local function reject_suggestion(h)
+	local item = selected(h)
+	if not item then
+		return
+	end
+	if not item.action then
+		vim.notify("goals: select a suggestion row to reject", vim.log.levels.INFO)
+		return
+	end
+	vim.ui.input({ prompt = "rejection reason: " }, function(reason)
+		local ok, err = goals.reject_suggestion(item.id, reason or "")
+		if not ok then
+			vim.notify("goals: " .. tostring(err), vim.log.levels.ERROR)
+			return
+		end
+		vim.notify("suggestion rejected: #" .. tostring(item.id), vim.log.levels.INFO)
+		h.refresh()
+	end)
+end
+
+local function reject_stale(h)
+	local stale = {}
+	for _, suggestion in ipairs(adapter.suggestions) do
+		if adapter.stale_ids[tostring(suggestion.id)] then
+			stale[#stale + 1] = suggestion
+		end
+	end
+	if #stale == 0 then
+		vim.notify("goals: no stale suggestions", vim.log.levels.INFO)
+		return
+	end
+	vim.ui.input({ prompt = "reject " .. #stale .. " stale suggestion(s)? reason: " }, function(reason)
+		if reason == nil then
+			return
+		end
+		local rejected = 0
+		for _, suggestion in ipairs(stale) do
+			local ok, err =
+				goals.reject_suggestion(suggestion.id, reason ~= "" and reason or "superseded by newer suggestion")
+			if ok then
+				rejected = rejected + 1
+			else
+				vim.notify("goals: reject #" .. tostring(suggestion.id) .. ": " .. tostring(err), vim.log.levels.ERROR)
+			end
+		end
+		vim.notify("goals: rejected " .. rejected .. " stale suggestion(s)", vim.log.levels.INFO)
+		h.refresh()
+	end)
+end
+
+local function find_item_by_name(name)
+	local items = goals.list() or {}
+	local normalized = (name or ""):lower():gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+	for _, item in ipairs(items) do
+		local item_name = (item.name or ""):lower():gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+		if item_name == normalized then
+			return item
+		end
+	end
+	return nil
+end
+
+local function choose_status(h)
+	local item = selected(h)
+	if not item then
+		return
+	end
+	local target = item
+	if item.action then
+		-- suggestion row: accept it first, then set status on the applied item
+		local ok, err = goals.accept_suggestion(item.id)
+		if not ok then
+			vim.notify("goals: " .. tostring(err), vim.log.levels.ERROR)
+			return
+		end
+		vim.notify("suggestion accepted: #" .. tostring(item.id), vim.log.levels.INFO)
+		local payload = suggestion_payload(item)
+		target = find_item_by_name(payload.Name or payload.name or "")
+		if not target then
+			vim.notify("goals: accepted but could not find the new item to set status", vim.log.levels.WARN)
+			h.refresh()
+			return
+		end
+	end
+	vim.ui.select(STATUS_ORDER, { prompt = "status", default = target.status }, function(status)
+		if not status then
+			return
+		end
+		local reason = ""
+		if status == "on_hold" or status == "deferred" then
+			vim.ui.input({ prompt = "reason: ", default = target.hold_reason or "" }, function(value)
+				local ok, err = goals.set_status(target.id, status, value or "")
+				if not ok then
+					vim.notify("goals: " .. tostring(err), vim.log.levels.ERROR)
+					return
+				end
+				h.refresh()
+			end)
+			return
+		end
+		local ok, err = goals.set_status(target.id, status, reason)
+		if not ok then
+			vim.notify("goals: " .. tostring(err), vim.log.levels.ERROR)
+			return
+		end
+		h.refresh()
+	end)
+end
+
+local function add_item(h)
+	local selected_item = selected(h)
+	local default_kind = selected_item and selected_item.kind == "goal" and "milestone" or "goal"
+	vim.ui.select({ "goal", "milestone" }, { prompt = "kind", default = default_kind }, function(kind)
+		if not kind then
+			return
+		end
+		vim.ui.input({ prompt = "name: " }, function(name)
+			if not name or vim.trim(name) == "" then
+				return
+			end
+			vim.ui.input({ prompt = "description: " }, function(description)
+				local parent_id = nil
+				if kind == "milestone" and selected_item and selected_item.kind == "goal" then
+					parent_id = selected_item.id
+				end
+				local id, err = goals.create(kind, name, description or "", parent_id)
+				if not id then
+					vim.notify("goals: " .. tostring(err), vim.log.levels.ERROR)
+					return
+				end
+				vim.notify("goal item created: #" .. tostring(id), vim.log.levels.INFO)
+				h.refresh()
+			end)
+		end)
+	end)
+end
+
+local function edit_item(h)
+	local item = selected(h)
+	if not item then
+		return
+	end
+	vim.ui.input({ prompt = "name: ", default = item.name }, function(name)
+		if not name or vim.trim(name) == "" then
+			return
+		end
+		vim.ui.input({ prompt = "description: ", default = item.description or "" }, function(description)
+			local ok, err = goals.update(item.id, name, description or "")
+			if not ok then
+				vim.notify("goals: " .. tostring(err), vim.log.levels.ERROR)
+				return
+			end
+			h.refresh()
+		end)
+	end)
+end
+
+local function set_active(h)
+	local item = selected(h)
+	if not item then
+		return
+	end
+	local ok, err = goals.set_active(item.id)
+	if not ok then
+		vim.notify("goals: " .. tostring(err), vim.log.levels.ERROR)
+		return
+	end
+	h.refresh()
+end
+
+local function move_item(h, delta)
+	local item = selected(h)
+	if not item then
+		return
+	end
+	local ok, err = goals.move(item.id, delta)
+	if not ok then
+		vim.notify("goals: " .. tostring(err), vim.log.levels.ERROR)
+		return
+	end
+	h.refresh()
+end
+
+local function indent_item(h)
+	local item = selected(h)
+	if not item then
+		return
+	end
+	local ok, err = goals.indent(item.id)
+	if not ok then
+		vim.notify("goals: " .. tostring(err), vim.log.levels.ERROR)
+		return
+	end
+	h.refresh()
+end
+
+local function outdent_item(h)
+	local item = selected(h)
+	if not item then
+		return
+	end
+	local ok, err = goals.outdent(item.id)
+	if not ok then
+		vim.notify("goals: " .. tostring(err), vim.log.levels.ERROR)
+		return
+	end
+	h.refresh()
+end
+
+function M.open()
+	adapter.status_filter = "all"
+	console.open({
+		name = "Goals",
+		layout = "detail",
+		list = list,
+		rows = rows,
+		preview = preview,
+		keys = {
+			{ key = "a", desc = "add item", fn = add_item },
+			{ key = "e", desc = "edit item", fn = edit_item },
+			{ key = "s", desc = "status", fn = choose_status },
+			{
+				key = "J",
+				desc = "move down",
+				fn = function(h)
+					move_item(h, 1)
+				end,
+			},
+			{
+				key = "K",
+				desc = "move up",
+				fn = function(h)
+					move_item(h, -1)
+				end,
+			},
+			{ key = ">", desc = "indent", fn = indent_item },
+			{ key = "<", desc = "outdent", fn = outdent_item },
+			{ key = "<Space>", desc = "set active", fn = set_active },
+			{ key = "A", desc = "accept suggestion", fn = accept_suggestion },
+			{ key = "R", desc = "reject suggestion", fn = reject_suggestion },
+			{ key = "x", desc = "reject stale", fn = reject_stale },
+			{
+				key = "[",
+				desc = "filter prev",
+				fn = function(h)
+					cycle_filter(h, -1)
+				end,
+			},
+			{
+				key = "]",
+				desc = "filter next",
+				fn = function(h)
+					cycle_filter(h, 1)
+				end,
+			},
+		},
+		legend = function(h)
+			return string.format(
+				"GOALS / MILESTONES · %d items · filter:%s · j/k a add e edit space activate s status J/K move >/< indent A/R accept/reject suggestion x reject-stale [/] filter r refresh Q kill",
+				#h.state.items,
+				adapter.status_filter
+			)
+		end,
+		empty_lines = { "(none yet - press a to create a goal)" },
+		open_empty = true,
+		keep_empty = true,
+		preview_empty = true,
+		identity = function(item)
+			return (item.action and "s" or "g") .. tostring(item.id)
+		end,
+	})
+end
+
+return M

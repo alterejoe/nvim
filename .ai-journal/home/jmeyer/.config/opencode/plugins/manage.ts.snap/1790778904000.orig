@@ -1,0 +1,70 @@
+// /home/altjoe/.config/opencode/plugins/manage.ts FINAL-10
+/**
+ * Manage - OpenCode Management Plugin
+ * Composition root only: hooks + tools, wired from lib/ modules.
+ *
+ * Core principle: STRUCTURAL, not heuristic. There is no path from the AI
+ * to the filesystem. The gate denies mutation tools outright; the AI's only
+ * write channels append review queues the user applies.
+ *
+ * Goals are project-local planning state. Work-item reads and suggestions are
+ * delegated to the Go manage daemon; this file contains only thin adapters.
+ */
+import { type Plugin } from "@opencode-ai/plugin";
+import { buildHooks } from "./lib/hooks";
+import { buildWorkItemHooks } from "./lib/work-item-hooks";
+import { ensureDaemon } from "./lib/daemon";
+import { emitProposalTool } from "./lib/tools/emit-proposal";
+import { registryProposeTool } from "./lib/tools/registry-propose";
+import { emitSkillTool } from "./lib/tools/emit-skill";
+import { skillLoadTool } from "./lib/tools/skill-load";
+import { refLookupTool } from "./lib/tools/ref-lookup";
+import { proposalStatusTool } from "./lib/tools/proposal-status";
+import { workItemListTool } from "./lib/tools/work-item-list";
+import { workItemContextTool } from "./lib/tools/work-item-context";
+import { workItemSuggestTool } from "./lib/tools/work-item-suggest";
+import { workItemHandoffTool } from "./lib/tools/work-item-handoff";
+import { workItemSuggestionsTool } from "./lib/tools/work-item-suggestions";
+
+const ManagePlugin: Plugin = async ({ directory, client }) => {
+  void ensureDaemon().catch((err) => {
+    console.error("[manage] daemon autostart failed: " + String(err));
+  });
+
+  const baseHooks: any = buildHooks(directory, client);
+  const workItemHooks: any = buildWorkItemHooks(directory);
+
+  return {
+    ...baseHooks,
+    "tool.execute.after": async (input: any, output: any) => {
+      await baseHooks["tool.execute.after"]?.(input, output);
+      await workItemHooks["tool.execute.after"]?.(input, output);
+    },
+    "experimental.chat.system.transform": async (input: any, output: any) => {
+      await baseHooks["experimental.chat.system.transform"]?.(input, output);
+      await workItemHooks["experimental.chat.system.transform"]?.(
+        input,
+        output,
+      );
+    },
+
+    tool: {
+      emit_proposal: emitProposalTool(directory),
+      registry_propose: registryProposeTool(directory),
+      emit_skill: emitSkillTool(directory),
+      skill_load: skillLoadTool(directory),
+      ref_lookup: refLookupTool(directory),
+      proposal_status: proposalStatusTool(directory),
+      work_item_list: workItemListTool(directory),
+      work_item_context: workItemContextTool(directory),
+      work_item_suggest: workItemSuggestTool(directory),
+      work_item_handoff: workItemHandoffTool(directory),
+      work_item_suggestions: workItemSuggestionsTool(directory),
+    },
+  };
+};
+
+export default {
+  id: "manage",
+  server: ManagePlugin,
+};

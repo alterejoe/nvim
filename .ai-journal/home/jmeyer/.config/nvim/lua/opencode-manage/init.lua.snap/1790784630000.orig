@@ -128,16 +128,6 @@ vim.api.nvim_create_user_command("ManageDaemonRestart", function()
   require("opencode-manage.daemon").restart()
 end, { desc = "Manage: rebuild + restart the manage daemon (make restart)" })
 
--- Seed the daemon's folders gate from opencode.json external_directory once
--- per nvim start (config -> memory). Additive-only; existing rows win.
-vim.api.nvim_create_autocmd("VimEnter", {
-  callback = function()
-    pcall(function()
-      folders.import()
-    end)
-  end,
-})
-
 -- R1: focus routing - write the active file so refs match what you work on.
 vim.api.nvim_create_autocmd("BufEnter", {
   callback = function()

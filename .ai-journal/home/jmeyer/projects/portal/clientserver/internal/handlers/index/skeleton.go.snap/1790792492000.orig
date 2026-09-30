@@ -1,0 +1,47 @@
+// /home/jmeyer/projects/portal/clientserver/internal/handlers/index/skeleton.go FINAL
+package index
+
+import (
+	"net/http"
+	"os"
+
+	"github.com/Glass6444/portal-clientserver/internal/app"
+	"github.com/Glass6444/portal-clientserver/ui/html/index"
+	"github.com/google/uuid"
+)
+
+func Skeleton(app *app.App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+
+		flashType, flashMsg := app.Session.GetFlashMessage(r.Context())
+		groupName := app.Session.GetGroupName(r.Context())
+		groupID := app.Session.GetClientGroupID(r.Context())
+		userID := app.Session.GetAuthenticatedUserID(r.Context())
+		electionID := app.Session.GetElectionID(r.Context())
+		_, electionName := app.Session.GetCurrentElection(r.Context())
+
+		isEmployee := false
+		if v := app.Session.Get(r.Context(), "is_employee"); v != nil {
+			isEmployee = v.(bool)
+		}
+
+		props := &index.SkeletonProps{
+			FlashMsg: index.FlashMsgProps{
+				Type:    flashType,
+				Message: flashMsg,
+			},
+			GroupName:    groupName,
+			GroupID:      groupID.String(),
+			UserID:       userID.String(),
+			ElectionID:   electionID.String(),
+			ElectionName: electionName,
+			InElection:   electionID != uuid.Nil,
+			URL:          r.URL.Path,
+			IsEmployee:   isEmployee,
+			Environment:  os.Getenv("ENVIRONMENT"),
+		}
+
+		index.Skeleton(props).Render(r.Context(), w)
+	}
+}

@@ -1,0 +1,73 @@
+# /home/jmeyer/projects/portal/migrations/Makefile FINAL
+TAG := $(shell git rev-parse --short HEAD)
+REGISTRY := registry.digitalocean.com/harp-repository
+
+MIGRATION_IMAGE := $(REGISTRY)/portalmigration
+
+.PHONY: run build push login deploy up down clean lint new
+
+.DEFAULT_GOAL := run
+
+run: build
+
+build:
+	@echo "Building $(MIGRATION_IMAGE):$(TAG)"
+	docker build \
+		-f Dockerfile \
+		-t $(MIGRATION_IMAGE):$(TAG) \
+		-t $(MIGRATION_IMAGE):latest \
+		.
+build-no-cache:
+	@echo "Building $(MIGRATION_IMAGE):$(TAG)"
+	docker build \
+		--no-cache \
+		-f Dockerfile \
+		-t $(MIGRATION_IMAGE):$(TAG) \
+		-t $(MIGRATION_IMAGE):latest \
+		.
+push:
+	docker push $(MIGRATION_IMAGE):$(TAG)
+	docker push $(MIGRATION_IMAGE):latest
+login:
+	doctl registry login
+deploy: login build push
+DB_ENV_FILE ?= ../envs/database.env
+-include $(DB_ENV_FILE)
+export $(shell sed 's/=.*//' $(DB_ENV_FILE))
+
+GEN_ENV_FILE ?= ../envs/migrator.env
+-include $(GEN_ENV_FILE)
+export $(shell sed 's/=.*//' $(GEN_ENV_FILE))
+
+SUPER_DATABASE_URL="postgres://$(SUPER_DB_USER):$(SUPER_DB_PASS)@$(SUPER_DB_HOST):$(SUPER_DB_PORT)/$(SUPER_DB_NAME)?sslmode=disable"
+SUPER_DATABASE_URL_SEARCH="$(SUPER_DATABASE_URL)&search_path=$(SUPER_DB_SCHEMA)"
+DATABASE_URL="postgres://$(DB_USER):$(DB_PASS)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode=disable"
+DATABASE_URL_SEARCH="$(DATABASE_URL)&search_path=$(DB_SCHEMA)"
+MIGRATIONS_PATH=./migrations
+
+export CONDA_ENV=/home/altjoe/miniconda3/envs/sql/bin/python
+
+up:
+	migrate -path=$(MIGRATIONS_PATH) -database=$(DATABASE_URL_SEARCH) up
+
+down:
+	migrate -path=$(MIGRATIONS_PATH) -database=$(DATABASE_URL_SEARCH) down 1
+
+clean:
+	psql $(DATABASE_URL) -c "UPDATE "$(SUPER_DB_SCHEMA)".schema_migrations SET dirty = false;"
+
+# ── Migration authoring ────────────────────────────────────────────────────
+# Lint a single migration with squawk (Postgres DDL footgun linter).
+# Defaults to the newest .up.sql; override with MIGRATION=./migrations/0234_x.up.sql
+MIGRATION ?= $(shell ls -t $(MIGRATIONS_PATH)/*.up.sql 2>/dev/null | head -1)
+lint:
+	@test -n "$(MIGRATION)" || { echo "No *.up.sql found in $(MIGRATIONS_PATH)" >&2; exit 1; }
+	squawk lint-migration $(MIGRATION)
+
+# Create a new empty migration pair (golang-migrate sequential naming).
+# Usage: make new NAME=add_foo_table
+new:
+	@test -n "$(NAME)" || { echo "Usage: make new NAME=<description>" >&2; exit 1; }
+	migrate create -ext sql -dir $(MIGRATIONS_PATH) -seq $(NAME)
+	@echo "Created migration pair. Lint it with:"
+	@echo "  make lint MIGRATION=$$(ls -t $(MIGRATIONS_PATH)/*.up.sql | head -1)"

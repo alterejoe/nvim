@@ -1,0 +1,162 @@
+// /home/jmeyer/projects/opencode-manage/internal/handlers/fs.go FINAL
+// Phase 2 (Parity): /v1/grep and /v1/glob endpoints, gated by the same
+// readAllowed/approvedFolders logic as /v1/read. Grep is Go-native
+// (regexp + filepath.Walk — no rg dependency); glob uses filepath.Glob.
+// External paths return a needsApproval 403 so the TS tools can emit
+// folder-approve proposals.
+package handlers
+
+import (
+	"database/sql"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+// grepHandler is the /v1/grep endpoint: regex content search, gated.
+func grepHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Pattern    string `json:"pattern"`
+			Path       string `json:"path"`
+			Include    string `json:"include"`
+			OutputMode string `json:"output_mode"`
+			HeadLimit  int    `json:"head_limit"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			fail(w, http.StatusBadRequest, "[manage] bad request: "+err.Error())
+			return
+		}
+		if req.Pattern == "" {
+			fail(w, http.StatusBadRequest, "[manage] grep: pattern required")
+			return
+		}
+		directory, _ := os.Getwd()
+		approved := approvedFolders(db)
+		root := req.Path
+		if root == "" {
+			root = directory
+		}
+		ok, needsApproval, approvePath := readAllowed(directory, root, approved)
+		if !ok {
+			if needsApproval {
+				writeJSON(w, http.StatusForbidden, map[string]any{
+					"error":         "grep denied: outside project and not covered by an approved folder",
+					"needsApproval": true,
+					"path":          approvePath,
+				})
+				return
+			}
+			fail(w, http.StatusForbidden, "[manage] grep denied: sensitive path")
+			return
+		}
+		re, err := regexp.Compile(req.Pattern)
+		if err != nil {
+			fail(w, http.StatusUnprocessableEntity, "[manage] grep: invalid pattern: "+err.Error())
+			return
+		}
+		limit := req.HeadLimit
+		if limit <= 0 {
+			limit = 100
+		}
+		matches := []map[string]any{}
+		_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+			if len(matches) >= limit {
+				return filepath.SkipAll
+			}
+			if ok, _, _ := readAllowed(directory, p, approved); !ok {
+				return nil
+			}
+			if req.Include != "" {
+				if m, _ := filepath.Match(req.Include, info.Name()); !m {
+					return nil
+				}
+			}
+			data, err := os.ReadFile(p)
+			if err != nil {
+				return nil
+			}
+			lines := strings.Split(string(data), "\n")
+			for i, line := range lines {
+				if re.MatchString(line) {
+					switch req.OutputMode {
+					case "count":
+						matches = append(matches, map[string]any{"path": p, "count": 1})
+					case "files_with_matches":
+						matches = append(matches, map[string]any{"path": p})
+					default:
+						matches = append(matches, map[string]any{"path": p, "line": i + 1, "content": line})
+					}
+					if req.OutputMode == "files_with_matches" || req.OutputMode == "count" {
+						break
+					}
+					if len(matches) >= limit {
+						return filepath.SkipAll
+					}
+				}
+			}
+			return nil
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"matches": matches})
+	}
+}
+
+// globHandler is the /v1/glob endpoint: filename matching, gated.
+func globHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Pattern string `json:"pattern"`
+			Path    string `json:"path"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			fail(w, http.StatusBadRequest, "[manage] bad request: "+err.Error())
+			return
+		}
+		if req.Pattern == "" {
+			fail(w, http.StatusBadRequest, "[manage] glob: pattern required")
+			return
+		}
+		directory, _ := os.Getwd()
+		approved := approvedFolders(db)
+		root := req.Path
+		if root == "" {
+			root = directory
+		}
+		ok, needsApproval, approvePath := readAllowed(directory, root, approved)
+		if !ok {
+			if needsApproval {
+				writeJSON(w, http.StatusForbidden, map[string]any{
+					"error":         "glob denied: outside project and not covered by an approved folder",
+					"needsApproval": true,
+					"path":          approvePath,
+				})
+				return
+			}
+			fail(w, http.StatusForbidden, "[manage] glob denied: sensitive path")
+			return
+		}
+		full := req.Pattern
+		if !filepath.IsAbs(full) {
+			full = filepath.Join(root, full)
+		}
+		matches, _ := filepath.Glob(full)
+		out := []string{}
+		for _, m := range matches {
+			if ok, _, _ := readAllowed(directory, m, approved); ok {
+				out = append(out, m)
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"matches": out})
+	}
+}
+
+// mountFs wires the /v1/grep and /v1/glob endpoints into the router.
+func mountFs(r chi.Router, db *sql.DB) {
+	r.Post("/v1/grep", grepHandler(db))
+	r.Post("/v1/glob", globHandler(db))
+}

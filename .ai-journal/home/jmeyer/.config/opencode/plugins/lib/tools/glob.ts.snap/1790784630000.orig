@@ -1,0 +1,105 @@
+// /home/jmeyer/.config/opencode/plugins/lib/tools/glob.ts FINAL
+import { daemonRequest } from "../daemon"
+import { appendProposal } from "../proposals"
+
+interface GlobArgs {
+  pattern: string
+  path?: string
+}
+
+interface ToolContext {
+  sessionID?: string
+  directory?: string
+}
+
+function dirname(p: string): string {
+  const i = p.lastIndexOf("/")
+  return i > 0 ? p.slice(0, i) : "/"
+}
+
+// findPendingApproval returns true if a pending folder-approve row for this
+// path already exists in the session journal (dedup — one proposal per path).
+async function findPendingApproval(
+  directory: string,
+  sessionID: string,
+  path: string,
+): Promise<boolean> {
+  try {
+    const fs = await import("node:fs")
+    const file = `${directory}/.ai-proposals/${sessionID}.jsonl`
+    if (!fs.existsSync(file)) return false
+    const rows = fs.readFileSync(file, "utf8").split("\n")
+    for (const row of rows) {
+      if (!row.trim()) continue
+      try {
+        const p = JSON.parse(row)
+        if (
+          p.operation === "folder-approve" &&
+          p.path === path &&
+          p.status === "pending"
+        ) {
+          return true
+        }
+      } catch {
+        /* skip malformed rows */
+      }
+    }
+  } catch {
+    /* journal unreadable — allow re-emit */
+  }
+  return false
+}
+
+export const globTool = (directory: string) => ({
+  name: "glob",
+  description:
+    "Find files by glob pattern, gated by the manage daemon. Project-internal matches are allowed except sensitive files (*.env, *.env.*, *.pem, *.key, envs/**). External matches emit a folder-approval proposal for the user to accept or reject in the review console (<leader>ap), then retry.",
+  parameters: {
+    type: "object",
+    properties: {
+      pattern: {
+        type: "string",
+        description: "The glob pattern to match files against (e.g. '**/*.ts').",
+      },
+      path: {
+        type: "string",
+        description: "The directory to search in. Defaults to the current working directory.",
+      },
+    },
+    required: ["pattern"],
+  },
+  async execute(args: GlobArgs, context: ToolContext) {
+    const res = await daemonRequest("POST", "/v1/glob", JSON.stringify({
+      pattern: args.pattern,
+      path: args.path ?? directory,
+    }))
+    if (res.status === 200) {
+      const data = JSON.parse(res.body)
+      return (data.matches ?? []).join("\n")
+    }
+    let body: any = {}
+    try {
+      body = JSON.parse(res.body)
+    } catch {
+      /* non-JSON error body */
+    }
+    if (res.status === 403 && body.needsApproval) {
+      const sessionID = context?.sessionID ?? ""
+      const approvePath: string = body.path ?? dirname(args.path ?? directory)
+      const existing = await findPendingApproval(directory, sessionID, approvePath)
+      if (!existing) {
+        await appendProposal(directory, sessionID, {
+          operation: "folder-approve",
+          path: approvePath,
+          content: approvePath,
+          reason: `glob of ${args.path ?? directory} requires folder approval`,
+          group: "read-folder-approval",
+          ts: Date.now(),
+          status: "pending",
+        })
+      }
+      return `glob denied: ${args.path ?? directory} is outside the project and not covered by an approved folder. A folder-approval proposal for ${approvePath} has been emitted — accept or reject it in the review console (<leader>ap), then retry.`
+    }
+    throw new Error(body.error ?? `glob failed (${res.status})`)
+  },
+})

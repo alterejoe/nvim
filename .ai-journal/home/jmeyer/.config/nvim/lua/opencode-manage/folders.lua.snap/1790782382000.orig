@@ -1,4 +1,4 @@
--- /home/jmeyer/.config/nvim/lua/opencode-manage/folders.lua FINAL
+-- /home/altjoe/.config/nvim/lua/opencode-manage/folders.lua FINAL
 -- opencode-manage.folders — folder permission memory + sync (doc 23, PM1).
 -- MEMORY: state.db `folders` rows (this module). ENFORCEMENT:
 -- ~/.config/opencode/opencode.json `permission.external_directory`.
@@ -32,11 +32,26 @@ CREATE TABLE IF NOT EXISTS folders (
 CREATE INDEX IF NOT EXISTS idx_folders_path ON folders(path);
 ]]
 
---- Central store: the manage daemon's manage.db — one db for all sessions.
---- The daemon reads approved folders from here; the console writes here.
+--- Nearest state.db: walk up from cwd looking for .opencode; stop at the
+--- project root (first dir with .git). Never creates directories.
 --- @return string
 local function store_path()
-	return (vim.env.HOME or "") .. "/.local/share/opencode-manage/manage.db"
+	local dir = vim.fn.getcwd()
+	for _ = 1, 12 do
+		local candidate = dir .. "/.opencode"
+		if vim.fn.isdirectory(candidate) == 1 then
+			return candidate .. "/state.db"
+		end
+		if vim.fn.isdirectory(dir .. "/.git") == 1 then
+			break
+		end
+		local parent = vim.fn.fnamemodify(dir, ":h")
+		if parent == dir then
+			break
+		end
+		dir = parent
+	end
+	return vim.fn.getcwd() .. "/.opencode/state.db"
 end
 
 --- Read-only open: existing store or nil.
@@ -456,42 +471,7 @@ function M.sync()
 	vim.notify("🔐 folders: synced " .. #total .. " entr(y/ies) into external_directory", vim.log.levels.INFO)
 	return { added = total }
 end
---- Seed memory from config external_directory entries (config -> memory).
---- Reverse of sync(): makes the daemon's folders gate match opencode's own
---- permission layer. Additive-only — existing rows (any status) win; manual
---- config entries are imported as approved with source 'imported'.
---- @param scope string|nil  "common" (global config) | "project" | nil (both)
---- @return string[] added entries
-function M.import(scope)
-	local added = {}
-	local scopes = scope and { scope } or { "common", "project" }
-	for _, s in ipairs(scopes) do
-		local ext = M.config_entries(s == "project" and "project" or "global")
-		for entry, allow in pairs(ext) do
-			if allow == "allow" then
-				local p = norm(entry:gsub("/%*%*$", ""))
-				if p ~= "" then
-					local covered = false
-					for _, r in ipairs(M.list()) do
-						if norm(r.path) == p then
-							covered = true
-							break
-						end
-					end
-					if not covered then
-						if upsert(p, "approved", s, "imported from external_directory") then
-							added[#added + 1] = entry
-						end
-					end
-				end
-			end
-		end
-	end
-	if #added > 0 then
-		vim.notify("🔐 folders: imported " .. #added .. " entr(y/ies) from external_directory", vim.log.levels.INFO)
-	end
-	return added
-end
+
 --- Drift report per scope: approved-without-config (missing) and
 --- config-without-row (extra — manual entries included, informational).
 --- Labels are "<scope>:<entry>".

@@ -1,0 +1,76 @@
+// /home/altjoe/.config/opencode/plugins/lib/tools/work-item-suggest.ts FINAL-2
+import { tool } from "@opencode-ai/plugin";
+import { suggestWorkItem } from "../work-items";
+
+const ACTIONS = [
+  "create",
+  "update",
+  "set_status",
+  "set_importance",
+  "set_active",
+  "clear_active",
+  "move",
+  "indent",
+  "outdent",
+] as const;
+
+export function workItemSuggestTool(directory: string) {
+  return tool({
+    description:
+      "Append a reviewable work-item suggestion through the manage daemon. " +
+      "This never mutates project state; the user must accept it in Nvim. " +
+      "Payload schema per action: " +
+      "create: {kind: 'goal'|'milestone', name: string (required), description?: string, parent_id?: number}; " +
+      "update: {name: string (required), description?: string}; " +
+      "set_status: {status: 'planned'|'in_progress'|'on_hold'|'completed'|'deferred'|'cancelled', reason?: string}; " +
+      "set_importance: {importance: number 1-5}; " +
+      "set_active / clear_active: {} (target via item_id); " +
+      "move: {delta: number}; indent / outdent: {} (target via item_id).",
+    args: {
+      item_id: tool.schema
+        .number()
+        .optional()
+        .describe("Existing target item; omit for create."),
+      action: tool.schema
+        .string()
+        .describe("One of create, update, set_status, set_importance, set_active, clear_active, move, indent, outdent."),
+      payload: tool.schema
+        .string()
+        .describe("JSON object containing the proposed change. See the tool description for the per-action schema."),
+      rationale: tool.schema
+        .string()
+        .describe("Why the suggestion is appropriate, including evidence when available."),
+    },
+    async execute(args: any, context: any) {
+      if (!ACTIONS.includes(args.action)) {
+        throw new Error(`[manage] unsupported work-item suggestion action: ${args.action}`);
+      }
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(args.payload);
+      } catch {
+        throw new Error("[manage] work-item suggestion payload must be valid JSON");
+      }
+      if (!payload || Array.isArray(payload)) {
+        throw new Error("[manage] work-item suggestion payload must be a JSON object");
+      }
+      const suggestion = await suggestWorkItem({
+        directory,
+        session_id: context?.sessionID || "",
+        item_id: args.item_id,
+        action: args.action,
+        payload,
+        rationale: args.rationale,
+      });
+      return JSON.stringify(
+        {
+          ok: true,
+          suggestion,
+          note: "Queued for explicit user review; project state was not changed.",
+        },
+        null,
+        2,
+      );
+    },
+  });
+}

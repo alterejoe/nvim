@@ -1,0 +1,139 @@
+# /home/jmeyer/projects/portal/terraform/platform/portal/prod/Makefile.db FINAL
+# Makefile.db
+INFISICAL_ENV ?= prod
+INFISICAL_TF_PATH ?= /terraform
+DB_PATH ?= /databases
+ROLES_PATH ?= /roles
+OUT ?= query.csv
+
+.PHONY: db-sync-from-terraform db-shell db-migrate-status db-migrate-force db-migrate-up db-fix-dirty db-help db-readonly-url db-doc db-query db-query-file
+
+# Sync database credentials from Terraform to Infisical /databases path
+db-sync-from-terraform:
+	@echo "Extracting database credentials from Terraform state..."
+	@infisical run --env $(INFISICAL_ENV) --path $(INFISICAL_TF_PATH) -- bash -c ' \
+		DB_HOST=$$(terraform output -raw portal_db_host); \
+		DB_PORT=$$(terraform output -raw portal_db_port); \
+		DB_NAME=$$(terraform output -raw portal_db_name); \
+		DB_USER="migrator"; \
+		DB_SCHEMA="clerk"; \
+		echo "Setting secrets in Infisical /databases..."; \
+		echo "  DB_HOST=$$DB_HOST"; \
+		echo "  DB_PORT=$$DB_PORT"; \
+		echo "  DB_NAME=$$DB_NAME"; \
+		infisical secrets set DB_HOST="$$DB_HOST" --env $(INFISICAL_ENV) --path $(DB_PATH); \
+		infisical secrets set DB_PORT="$$DB_PORT" --env $(INFISICAL_ENV) --path $(DB_PATH); \
+		infisical secrets set DB_NAME="$$DB_NAME" --env $(INFISICAL_ENV) --path $(DB_PATH); \
+		infisical secrets set DB_USER="$$DB_USER" --env $(INFISICAL_ENV) --path $(DB_PATH); \
+		infisical secrets set DB_SCHEMA="$$DB_SCHEMA" --env $(INFISICAL_ENV) --path $(DB_PATH); \
+	'
+	@echo "✓ Database credentials synced to Infisical"
+	@echo ""
+	@echo "Note: DB_PASS must be set manually:"
+	@echo "  infisical secrets get MIGRATOR_PASSWORD --env $(INFISICAL_ENV) --path $(INFISICAL_TF_PATH) --plain | xargs -I {} infisical secrets set DB_PASS={} --env $(INFISICAL_ENV) --path $(DB_PATH)"
+
+# Interactive psql shell
+db-shell:
+	@echo "Connecting to database..."
+	@infisical run --env $(INFISICAL_ENV) --path $(DB_PATH) -- bash -c \
+		'psql "postgres://$$DB_USER:$$DB_PASS@$$DB_HOST:$$DB_PORT/$$DB_NAME?sslmode=require"'
+
+# Check migration status
+db-migrate-status:
+	@echo "Checking migration status..."
+	@infisical run --env $(INFISICAL_ENV) --path $(DB_PATH) -- bash -c \
+		'psql "postgres://$$DB_USER:$$DB_PASS@$$DB_HOST:$$DB_PORT/$$DB_NAME?sslmode=require" -c "SET search_path TO $$DB_SCHEMA; SELECT version, dirty FROM schema_migrations;"'
+
+# Fix dirty migration state
+db-fix-dirty:
+	@echo "Fixing dirty migration state..."
+	@infisical run --env $(INFISICAL_ENV) --path $(DB_PATH) -- bash -c \
+		'psql "postgres://$$DB_USER:$$DB_PASS@$$DB_HOST:$$DB_PORT/$$DB_NAME?sslmode=require" -c "SET search_path TO $$DB_SCHEMA; UPDATE schema_migrations SET dirty = false WHERE dirty = true;"'
+	@echo "✓ Dirty state cleared"
+
+VERSION ?= 209
+INFISICAL_ENV ?= prod
+
+# Force migration state to a specific version (e.g. VERSION=209)
+# Uses the same Infisical layout as the promote pipeline:
+# /databases (connection) + /roles (MIGRATOR_PASSWORD)
+db-migrate-force:
+	@echo "Forcing migration to version $(VERSION) (env: $(INFISICAL_ENV))..."
+	@infisical run --env $(INFISICAL_ENV) --path /databases -- \
+	  infisical run --env $(INFISICAL_ENV) --path /roles -- bash -c \
+	  'docker run --rm -e PGPASSWORD=$$MIGRATOR_PASSWORD registry.digitalocean.com/harp-repository/portalmigration:latest \
+	     -path /migrations \
+	     -database "postgres://migrator@$$DB_HOST:$$DB_PORT/$$DB_NAME?sslmode=$${DB_SSLMODE:-require}&search_path=$${DB_SCHEMA:-clerk}" \
+	     force $(VERSION)'
+	@echo "✓ Migration state forced to $(VERSION)"
+
+db-migrate-down:
+	@echo "Rolling back one migration..."
+	@infisical run --env $(INFISICAL_ENV) --path $(ROLES_PATH) -- \
+		infisical run --env $(INFISICAL_ENV) --path $(DB_PATH) -- bash -c \
+		'docker run --rm registry.digitalocean.com/harp-repository/portalmigration:latest -path /migrations -database "postgres://$$DB_USER:$$MIGRATOR_PASSWORD@$$DB_HOST:$$DB_PORT/$$DB_NAME?sslmode=require&search_path=$$DB_SCHEMA" down 1'
+	@echo "✓ Rolled back one migration"
+
+# Print the read-only connection string for dadbod.
+# Uses the existing `viewer` role (SELECT-only on the clerk schema, managed by
+# terraform/apps/database/user-viewer.tf). Password lives in Infisical /roles as
+# VIEWER_PASSWORD; host/port/name come from /databases.
+db-readonly-url:
+	@infisical run --env $(INFISICAL_ENV) --path $(DB_PATH) -- \
+		infisical run --env $(INFISICAL_ENV) --path $(ROLES_PATH) -- bash -c \
+		'echo "postgres://viewer:$$VIEWER_PASSWORD@$$DB_HOST:$$DB_PORT/$$DB_NAME?sslmode=require"'
+
+# Generate database documentation (schema, views, roles, grants) with tbls.
+# Read-only: uses the existing `viewer` role. Credentials are injected from
+# Infisical /databases + /roles, so no secrets sit in env files or the DSN.
+# Runs from the repo root where .tbls.yml lives (docPath: dbdoc).
+# Usage: make db-doc INFISICAL_ENV=dev
+db-doc:
+	@cd ../../../../ && \
+		infisical run --env $(INFISICAL_ENV) --path $(DB_PATH) -- \
+			infisical run --env $(INFISICAL_ENV) --path $(ROLES_PATH) -- \
+			tbls doc
+	@echo "✓ Wrote schema docs to ../../../../dbdoc"
+
+# Run a short read-only query and write results to a CSV file.
+# Connects as migrator (full access) so it works on tables the `viewer` role
+# can't yet read, but a client-side guard refuses anything that isn't
+# SELECT/WITH. Swap to the viewer role once grants are added.
+# Usage: make db-query QUERY="SELECT * FROM users" OUT=users.csv
+db-query:
+	@QUERY="$(QUERY)" infisical run --env $(INFISICAL_ENV) --path $(DB_PATH) -- bash -c \
+		'Q="$$(printf "%s" "$$QUERY" | sed -E "s/^[[:space:]]+//")"; \
+		 case "$$Q" in \
+		   SELECT*|select*|WITH*|with*) ;; \
+		   *) echo "Refusing: only SELECT/WITH allowed (read-only)" >&2; exit 1 ;; \
+		 esac; \
+		 psql "postgres://$$DB_USER:$$DB_PASS@$$DB_HOST:$$DB_PORT/$$DB_NAME?sslmode=require" --csv -v ON_ERROR_STOP=1 -c "SET search_path TO $$DB_SCHEMA; $$QUERY"' > $(OUT)
+	@echo "✓ Wrote $(OUT)"
+
+# Run a read-only query from a .sql FILE and write results to a CSV file.
+# Preferred for long/multi-line queries — avoids shell quoting entirely.
+# Connects as migrator (full access); guard refuses non-SELECT/WITH.
+# Usage: make db-query-file FILE=query.sql OUT=results.csv
+db-query-file:
+	@test -f "$(FILE)" || { echo "File not found: $(FILE)" >&2; exit 1; }
+	@infisical run --env $(INFISICAL_ENV) --path $(DB_PATH) -- bash -c \
+		'Q="$$(sed -E "s/^[[:space:]]+//" "$(FILE)" | head -1)"; \
+		 case "$$Q" in \
+		   SELECT*|select*|WITH*|with*) ;; \
+		   *) echo "Refusing: only SELECT/WITH allowed (read-only)" >&2; exit 1 ;; \
+		 esac; \
+		 psql "postgres://$$DB_USER:$$DB_PASS@$$DB_HOST:$$DB_PORT/$$DB_NAME?sslmode=require" --csv -v ON_ERROR_STOP=1 -f "$(FILE)"' > $(OUT)
+	@echo "✓ Wrote $(OUT)"
+
+db-help:
+	@echo "Database Management Commands:"
+	@echo "  make db-sync-from-terraform - Extract DB creds from Terraform and sync to Infisical"
+	@echo "  make db-shell               - Open psql shell (migrator user, write access)"
+	@echo "  make db-migrate-status      - Check migration status"
+	@echo "  make db-fix-dirty           - Clear dirty migration flags"
+	@echo "  make db-migrate-force       - Force migration version 0"
+	@echo "  make db-migrate-up          - Run migrations"
+	@echo "  make db-readonly-url        - Print read-only conn string for dadbod (viewer role)"
+	@echo "  make db-doc                 - Generate schema/grants docs with tbls (viewer role)"
+	@echo "  make db-query               - Run read-only query to CSV: QUERY=\"SELECT ...\" OUT=file.csv"
+	@echo "  make db-query-file          - Run read-only .sql file to CSV: FILE=query.sql OUT=file.csv"

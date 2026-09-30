@@ -11,11 +11,7 @@
 -- from proposed_content vs applied_content.
 -- PATH VALIDATION (doc 21): the apply side FAILS CLOSED. Only absolute
 -- proposal paths apply; update ops (replace/edit_range/delete) require a
--- readable target and are refused otherwise. Only create may create a
--- missing parent chain, and only after an explicit y/n (default No) — the
--- emit side records the chain as `mkdirs`, and the apply side recomputes it
--- when absent so legacy rows are covered too. Directories are never created
--- silently.
+-- readable target and are refused otherwise; only create may mkdir parents.
 -- A relative path is refused with a loud message — joining it to any root
 -- is how web/web copies were born. The emit side enforces the same rules
 -- (lib/proposals.ts validateProposalTarget).
@@ -34,8 +30,6 @@
 --   NEITHER  = not _cwd and not _cwd_file (foreign session AND foreign file)
 -- VISIBLE = pending + accepted (accepted rows stay in the viewer marked
 -- [applied], so the review history is never a mystery).
--- Resolved rows are purged ONLY by explicit user action (M.purge_resolved,
--- `c` in the review console) — never automatically.
 -- All iteration is DETERMINISTIC (sorted dirs) — the item order never
 -- reshuffles between refreshes.
 -- Each proposal also carries _file/_line (in-place status updates) and
@@ -96,11 +90,6 @@ local function all_dirs()
 	end
 	return dirs
 end
-
---- Exported for consumers that need the same discovery (e.g. the review
---- console's current_session): every .ai-proposals dir, cwd-reachable or
---- under SCAN_ROOTS.
-M.all_dirs = all_dirs
 
 --- Read every proposal from every jsonl in every .ai-proposals dir.
 --- Each proposal carries _file and _line so accept/reject can update in
@@ -203,36 +192,6 @@ function M.list_visible(mode)
 	return out
 end
 
---- Purge resolved rows (accepted/rejected) from the journal files, in
---- place. Verdicts already live in state.db (T2 capture), so the audit
---- trail survives even though the journal rows are removed. Pending rows
---- are never touched. Line numbers are collected per file and removed
---- descending so earlier removals never shift later ones.
---- @return number  rows removed
-function M.purge_resolved()
-	local by_file = {}
-	for _, p in ipairs(M.list_all()) do
-		local st = p.status or "pending"
-		if (st == "accepted" or st == "rejected") and p._file and p._line then
-			by_file[p._file] = by_file[p._file] or {}
-			table.insert(by_file[p._file], p._line)
-		end
-	end
-	local removed = 0
-	for f, lines in pairs(by_file) do
-		table.sort(lines, function(a, b)
-			return a > b
-		end)
-		local content = vim.fn.readfile(f)
-		for _, ln in ipairs(lines) do
-			table.remove(content, ln)
-		end
-		vim.fn.writefile(content, f)
-		removed = removed + #lines
-	end
-	return removed
-end
-
 --- Resolve a proposal path to absolute, FAIL CLOSED (doc 21): only absolute
 --- paths resolve. Relative paths return nil and every write path refuses
 --- them with a visible message — joining it to any root is how the
@@ -281,8 +240,7 @@ end
 --- Accept a proposal: snapshot → write → journal → verdict → status flip.
 --- The write is a USER-initiated action from nvim, never the AI.
 --- Fail closed (doc 21): absolute path required; update ops require a
---- readable target; create may create a missing parent chain only after the
---- y/n prompt (default No).
+--- readable target; only create may mkdir parents.
 --- T2: editing the buffer before accepting makes the verdict `corrected` —
 --- the diff between INTENDED and applied content is the structural fact.
 --- @param proposal table
@@ -293,62 +251,6 @@ end
 ---   fragment — fragment-vs-file comparisons flagged every accept as corrected.
 --- @return boolean  true when written
 function M.accept(proposal, content_override, baseline_override)
-	-- Folder-approval proposals are not file changes: accepting them
-	-- approves the folder in state.db (folders table) and flips status.
-	if proposal.operation == "folder-approve" then
-		local folders = require("opencode-manage.folders")
-		local ok = folders.approve(proposal.path, "project", proposal.reason)
-		if not ok then
-			vim.notify("folder-approve failed: " .. (proposal.path or "?"), vim.log.levels.ERROR)
-			return false
-		end
-		verdicts.record({
-			ts = os.time() * 1000,
-			session_id = proposal.sessionID,
-			proposal_id = proposal.ts,
-			group_name = proposal.group,
-			path = proposal.path,
-			operation = proposal.operation,
-			verdict = "accepted",
-			reason = proposal.reason,
-			proposed_content = proposal.content,
-			applied_content = nil,
-		})
-		M.set_status(proposal, "accepted")
-vim.notify("🔐 folder approved: " .. proposal.path, vim.log.levels.INFO)
-		return true
-	end
-
-	-- Goal suggestions are not file changes: accepting them applies the
-	-- suggestion through the goals adapter (daemon apply endpoint).
-	if proposal.operation == "goal-suggest" then
-		local goals = require("opencode-manage.goals")
-		local id = tonumber(proposal.path)
-		if not id then
-			vim.notify("goal-suggest: missing suggestion id in path", vim.log.levels.ERROR)
-			return false
-		end
-		local ok, err = goals.accept_suggestion(id)
-		if not ok then
-			vim.notify("goal-suggest apply failed: " .. tostring(err), vim.log.levels.ERROR)
-			return false
-		end
-		verdicts.record({
-			ts = os.time() * 1000,
-			session_id = proposal.sessionID,
-			proposal_id = proposal.ts,
-			group_name = proposal.group,
-			path = proposal.path,
-			operation = proposal.operation,
-			verdict = "accepted",
-			reason = proposal.reason,
-			proposed_content = proposal.content,
-			applied_content = nil,
-		})
-		M.set_status(proposal, "accepted")
-		vim.notify("🎯 goal suggestion accepted: #" .. tostring(id), vim.log.levels.INFO)
-		return true
-	end
 	local path = resolve_path(proposal)
 	if not path then
 		return refuse(proposal, "accept")
@@ -365,32 +267,6 @@ vim.notify("🔐 folder approved: " .. proposal.path, vim.log.levels.INFO)
 		end
 		local parent = vim.fn.fnamemodify(path, ":h")
 		if vim.fn.isdirectory(parent) ~= 1 then
-			-- New directories need explicit consent: list `mkdirs` (recorded
-			-- by the emit side) or recompute for legacy rows, then ask y/n.
-			-- Default No — nothing is created or written without a Yes.
-			local dirs = type(proposal.mkdirs) == "table" and proposal.mkdirs or {}
-			if #dirs == 0 then
-				local d = parent
-				while vim.fn.isdirectory(d) ~= 1 do
-					table.insert(dirs, 1, d)
-					local up = vim.fn.fnamemodify(d, ":h")
-					if up == d then
-						break
-					end
-					d = up
-				end
-			end
-			local choice = vim.fn.confirm(
-				"New directories needed by this create:\n  "
-					.. table.concat(dirs, "\n  ")
-					.. "\n\nCreate them and write the file?",
-				"&No\n&Yes",
-				1
-			)
-			if choice ~= 2 then
-				vim.notify("❌ Cancelled — no directory created, nothing written", vim.log.levels.WARN)
-				return false
-			end
 			vim.fn.mkdir(parent, "p")
 		end
 	else

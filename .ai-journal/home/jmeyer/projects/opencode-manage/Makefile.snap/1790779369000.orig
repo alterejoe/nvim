@@ -1,0 +1,26 @@
+# /home/altjoe/projects/opencode-manage/Makefile FINAL-6
+.PHONY: build sqlc migrate-down test tidy run nvim-lint
+
+NVIM_LUA_DIR ?= $(HOME)/.config/nvim/lua
+
+tidy:
+	go mod tidy
+
+sqlc:
+	sqlc generate
+
+nvim-lint:
+	@command -v nvim >/dev/null 2>&1 || { echo "nvim is required for nvim-lint"; exit 1; }
+	@find "$(NVIM_LUA_DIR)" -type f -name '*.lua' -exec nvim --headless -u NONE --clean {} -c 'lua assert(loadfile(vim.fn.argv(0)))' -c 'qa!' \;
+
+build: tidy sqlc nvim-lint
+	go build -o bin/manage ./cmd/manage
+
+run: build
+	./bin/manage
+
+test: tidy sqlc nvim-lint
+	go test -count=1 ./...
+
+migrate-down:
+	go build -o bin/manage-down ./cmd/manage-down || true

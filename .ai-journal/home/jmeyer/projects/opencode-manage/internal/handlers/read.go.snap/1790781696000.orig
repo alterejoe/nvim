@@ -1,0 +1,154 @@
+package handlers
+
+import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// sensitivePatterns mirrors the opencode.json permission.read deny list.
+// These are never readable through the managed read — no proposal is ever
+// emitted for them, inside or outside the project.
+var sensitivePatterns = []string{
+	"*.env", "*.env.*", "*.pem", "*.key",
+	"envs/**", "**/envs/**",
+}
+
+// isSensitive reports whether target matches any sensitive pattern.
+func isSensitive(target string) bool {
+	base := filepath.Base(target)
+	for _, p := range sensitivePatterns {
+		if ok, _ := filepath.Match(p, base); ok {
+			return true
+		}
+		if strings.Contains(p, "/") {
+			if ok, _ := filepath.Match(p, target); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isWithin reports whether target is inside directory (or equals it).
+func isWithin(directory, target string) bool {
+	d := filepath.Clean(directory)
+	t := filepath.Clean(target)
+	return t == d || strings.HasPrefix(t, d+string(filepath.Separator))
+}
+
+// coveredBy reports whether target is inside dir (or equals it).
+func coveredBy(target, dir string) bool {
+	d := filepath.Clean(dir)
+	t := filepath.Clean(target)
+	return t == d || strings.HasPrefix(t, d+string(filepath.Separator))
+}
+
+// readAllowed decides the gate tier for a target:
+//   - sensitive            -> denied (no proposal)
+//   - within directory     -> allowed
+//   - covered by approved  -> allowed
+//   - otherwise            -> needsApproval (proposal path = target's dir)
+func readAllowed(directory, target string, approved []string) (ok bool, needsApproval bool, approvePath string) {
+	if isSensitive(target) {
+		return false, false, ""
+	}
+	if isWithin(directory, target) {
+		return true, false, ""
+	}
+	for _, d := range approved {
+		if coveredBy(target, d) {
+			return true, false, ""
+		}
+	}
+	return false, true, filepath.Dir(target)
+}
+
+// FolderStore supplies the approved-folder list used for read gating.
+type FolderStore interface {
+	ApprovedFolders() []string
+}
+
+// readHandler is the /v1/read endpoint: resolve -> gate -> read.
+func readHandler(directory string, store FolderStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Path   string `json:"path"`
+			Offset int    `json:"offset"`
+			Limit  int    `json:"limit"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+			return
+		}
+		target := req.Path
+		if target == "" {
+			http.Error(w, `{"error":"path required"}`, http.StatusBadRequest)
+			return
+		}
+		approved := store.ApprovedFolders()
+		ok, needsApproval, approvePath := readAllowed(directory, target, approved)
+		if !ok {
+			if needsApproval {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]any{
+					"error":         "read denied: outside project and not covered by an approved folder",
+					"needsApproval": true,
+					"path":          approvePath,
+				})
+				return
+			}
+			http.Error(w, `{"error":"read denied: sensitive file"}`, http.StatusForbidden)
+			return
+		}
+
+		info, err := os.Stat(target)
+		if err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
+			return
+		}
+		if info.IsDir() {
+			entries, err := os.ReadDir(target)
+			if err != nil {
+				http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+				return
+			}
+			names := make([]string, 0, len(entries))
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"content": names})
+			return
+		}
+
+		data, err := os.ReadFile(target)
+		if err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+			return
+		}
+		lines := strings.Split(string(data), "\n")
+		start := req.Offset
+		if start < 1 {
+			start = 1
+		}
+		end := len(lines)
+		if req.Limit > 0 && start+req.Limit-1 < end {
+			end = start + req.Limit - 1
+		}
+		if start > end {
+			start = end
+		}
+		content := strings.Join(lines[start-1:end], "\n")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"content": content})
+	}
+}
+
+// mountRead wires the /v1/read endpoint into the router.
+func mountRead(r *chi.Mux, directory string, store FolderStore) {
+	r.Post("/v1/read", readHandler(directory, store))
+}

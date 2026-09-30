@@ -315,9 +315,8 @@ function M.accept(proposal, content_override, baseline_override)
 			applied_content = nil,
 		})
 		M.set_status(proposal, "accepted")
-vim.notify("🔐 folder approved: " .. proposal.path, vim.log.levels.INFO)
-		return true
-	end
+		vim.notify("🔐 folder approved: " .. proposal.path, vim.log.levels.INFO)
+end
 
 	-- Goal suggestions are not file changes: accepting them applies the
 	-- suggestion through the goals adapter (daemon apply endpoint).
@@ -349,6 +348,7 @@ vim.notify("🔐 folder approved: " .. proposal.path, vim.log.levels.INFO)
 		vim.notify("🎯 goal suggestion accepted: #" .. tostring(id), vim.log.levels.INFO)
 		return true
 	end
+	local path = resolve_path(proposal)
 	local path = resolve_path(proposal)
 	if not path then
 		return refuse(proposal, "accept")

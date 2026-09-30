@@ -1,0 +1,10 @@
+# /home/jmeyer/projects/portal/.tbls.yml FINAL
+# tbls database documentation config.
+# DSN uses the existing `viewer` role (SELECT-only on clerk schema, managed by
+# terraform/apps/database/user-viewer.tf). Credentials come from environment
+# variables — same source as `make db-readonly-url`:
+#   VIEWER_PASSWORD from Infisical /roles, DB_HOST/DB_PORT/DB_NAME from /databases.
+dsn: postgres://viewer:${VIEWER_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}?sslmode=require
+
+# Where generated docs are written. tbls default is `dbdoc`.
+docPath: dbdoc

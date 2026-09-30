@@ -1,0 +1,78 @@
+// /home/jmeyer/.config/opencode/plugins/lib/tools/read.ts FINAL
+/**
+ * read — overrides opencode's built-in read (same tool name takes precedence).
+ * Thin client: normalize the path, call the daemon /v1/read, return the gated
+ * result. Enforcement lives in the daemon (state.db folders table), not here.
+ */
+import { tool } from "@opencode-ai/plugin";
+import { homedir } from "os";
+import { isAbsolute, resolve } from "path";
+import { daemonRequest, ensureDaemon } from "../daemon";
+
+function normalizePath(p: string, directory: string): string {
+  let out = p.trim();
+  if (out === "~") {
+    out = homedir();
+  } else if (out.startsWith("~/")) {
+    out = homedir() + out.slice(1);
+  }
+  if (!isAbsolute(out)) {
+    out = resolve(directory, out);
+  }
+  return out;
+}
+
+export function readTool(directory: string) {
+  return tool({
+    description:
+      "Read a file or directory, gated by the manage permission list. " +
+      "Absolute paths preferred; ~ and relative paths are resolved against " +
+      "the project. Files return line-numbered content; directories return a " +
+      "sorted listing. Reads outside the project require an approved folder " +
+      "(manage folders panel: <leader>aa).",
+    args: {
+      filePath: tool.schema
+        .string()
+        .describe("Absolute path to the file or directory to read."),
+      offset: tool.schema
+        .number()
+        .optional()
+        .describe("1-indexed line to start reading from (default 1)."),
+      limit: tool.schema
+        .number()
+        .optional()
+        .describe("Maximum number of lines to read (default: all)."),
+    },
+    async execute(args: any, _context: any) {
+      const path = normalizePath(String(args.filePath ?? ""), directory);
+      await ensureDaemon();
+      const res = await daemonRequest(
+        "POST",
+        "/v1/read",
+        JSON.stringify({
+          directory,
+          path,
+          offset: typeof args.offset === "number" ? args.offset : 0,
+          limit: typeof args.limit === "number" ? args.limit : 0,
+        }),
+      );
+      let body: any;
+      try {
+        body = JSON.parse(res.body);
+      } catch {
+        throw new Error("[manage] read: bad daemon response (" + res.status + ")");
+      }
+      if (res.status !== 200 || !body.ok) {
+        throw new Error(body?.error || "[manage] read failed (" + res.status + ")");
+      }
+      if (body.type === "directory") {
+        return `[directory] ${body.path}\n${(body.entries || []).join("\n")}`;
+      }
+      let out = body.content || "";
+      if (body.truncated) {
+        out += `\n[truncated after ${body.limit} line(s) — read more with a higher offset]`;
+      }
+      return out;
+    },
+  });
+}

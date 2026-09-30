@@ -1,0 +1,80 @@
+package tickets
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/Glass6444/portal-clientserver/db"
+	"github.com/Glass6444/portal-clientserver/internal/app"
+	"github.com/Glass6444/portal-clientserver/internal/queries"
+	"github.com/Glass6444/portal-shared/helpers/usererr"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+)
+
+type TicketSubmitRequest struct {
+	EntityIDs   []string `schema:"entity_ids"`
+	Reason      string   `schema:"reason"      validate:"required"`
+	Description string   `schema:"description" validate:"required"`
+	ElectionID  string   `schema:"election_id" validate:"required,uuid"`
+}
+
+func TicketSubmit(a *app.App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+
+		var req TicketSubmitRequest
+		if err := a.Validator.ParseAndValidate(r, &req, nil); err != nil {
+			a.Flash.Flash(w, "error", "Invalid request").Log(err).Status(http.StatusBadRequest)
+			return
+		}
+
+		electionPG := pgtype.UUID{Bytes: uuid.MustParse(req.ElectionID), Valid: true}
+		userID := a.Session.GetUserID(r.Context())
+		userPG := pgtype.UUID{Bytes: userID, Valid: true}
+
+		if err := a.WithTx(r.Context(), app.RLSUser, func(q *db.Queries) error {
+			for _, raw := range req.EntityIDs {
+				parts := strings.SplitN(raw, ":", 2)
+				if len(parts) != 2 {
+					return fmt.Errorf("invalid entity format: %s", raw)
+				}
+				entityType := parts[0]
+				entityID := parts[1]
+
+				prID, err := queries.UpsertProofingRecord(r.Context(), db.UpsertProofingRecordParams{
+					ElectionID:  electionPG,
+					EntityType:  entityType,
+					EntityID:    pgtype.UUID{Bytes: uuid.MustParse(entityID), Valid: true},
+					Status:      "needs_revision",
+					Notes:       pgtype.Text{String: fmt.Sprintf("Ticket: %s - %s", req.Reason, req.Description), Valid: true},
+					SubmittedBy: userPG,
+				}, q)
+				if err != nil {
+					return fmt.Errorf("failed to upsert proofing record: %w", err)
+				}
+
+				_, err = queries.CreateTicket(r.Context(), db.CreateTicketParams{
+					ElectionID:       electionPG,
+					ProofingRecordID: prID,
+					EntityType:       entityType,
+					EntityID:         pgtype.UUID{Bytes: uuid.MustParse(entityID), Valid: true},
+					Title:            req.Reason,
+					Description:      pgtype.Text{String: req.Description, Valid: true},
+					CreatedBy:        userPG,
+				}, q)
+				if err != nil {
+					return fmt.Errorf("failed to create ticket: %w", err)
+				}
+			}
+			return nil
+		}); err != nil {
+			a.Flash.Flash(w, "error", usererr.UserMessage(err)).Log(err).Status(http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("HX-Trigger", "closeTicket")
+		a.Flash.Flash(w, "success", "Ticket(s) submitted successfully").Log(nil).Status(http.StatusOK)
+	}
+}

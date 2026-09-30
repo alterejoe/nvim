@@ -1,0 +1,114 @@
+import { appendProposal } from "../proposals"
+
+interface ReadArgs {
+  filePath: string
+  offset?: number
+  limit?: number
+}
+
+interface ToolContext {
+  sessionID?: string
+  directory?: string
+}
+
+function dirname(p: string): string {
+  const i = p.lastIndexOf("/")
+  return i > 0 ? p.slice(0, i) : "/"
+}
+
+// findPendingApproval returns true if a pending folder-approve row for this
+// path already exists in the session journal (dedup — one proposal per path).
+async function findPendingApproval(
+  directory: string,
+  sessionID: string,
+  path: string,
+): Promise<boolean> {
+  try {
+    const fs = await import("node:fs")
+    const file = `${directory}/.ai-proposals/${sessionID}.jsonl`
+    if (!fs.existsSync(file)) return false
+    const rows = fs.readFileSync(file, "utf8").split("\n")
+    for (const row of rows) {
+      if (!row.trim()) continue
+      try {
+        const p = JSON.parse(row)
+        if (
+          p.operation === "folder-approve" &&
+          p.path === path &&
+          p.status === "pending"
+        ) {
+          return true
+        }
+      } catch {
+        /* skip malformed rows */
+      }
+    }
+  } catch {
+    /* journal unreadable — allow re-emit */
+  }
+  return false
+}
+
+export const readTool = (directory: string) => ({
+  name: "read",
+  description:
+    "Read a file or directory, gated by the manage daemon. Project-internal reads are allowed except sensitive files (*.env, *.env.*, *.pem, *.key, envs/**). External reads emit a folder-approval proposal for the user to accept or reject in the review console (<leader>ar), then retry.",
+  parameters: {
+    type: "object",
+    properties: {
+      filePath: {
+        type: "string",
+        description: "Absolute path to the file or directory to read.",
+      },
+      offset: {
+        type: "number",
+        description: "1-indexed line to start reading from (default 1).",
+      },
+      limit: {
+        type: "number",
+        description: "Maximum number of lines to read (default: all).",
+      },
+    },
+    required: ["filePath"],
+  },
+  async execute(args: ReadArgs, context: ToolContext) {
+    const port = process.env.MANAGE_DAEMON_PORT ?? "4096"
+    const res = await fetch(`http://localhost:${port}/v1/read`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: args.filePath,
+        offset: args.offset ?? 0,
+        limit: args.limit ?? 0,
+      }),
+    })
+    if (res.ok) {
+      const data = await res.json()
+      return data.content
+    }
+    let body: any = {}
+    try {
+      body = await res.json()
+    } catch {
+      /* non-JSON error body */
+    }
+    if (res.status === 403 && body.needsApproval) {
+      const sessionID = context?.sessionID ?? ""
+      const approvePath: string = body.path ?? dirname(args.filePath)
+      const existing = await findPendingApproval(directory, sessionID, approvePath)
+      if (!existing) {
+        await appendProposal(directory, sessionID, {
+          operation: "folder-approve",
+          path: approvePath,
+          content: approvePath,
+          reason: `read of ${args.filePath} requires folder approval`,
+          group: "read-folder-approval",
+          ts: Date.now(),
+          status: "pending",
+        })
+      }
+      return `read denied: ${args.filePath} is outside the project and not covered by an approved folder. A folder-approval proposal for ${approvePath} has been emitted — accept or reject it in the review console (<leader>ar), then retry the read.`
+    }
+    throw new Error(body.error ?? `read failed (${res.status})`)
+  },
+})

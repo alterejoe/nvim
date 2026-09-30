@@ -1,0 +1,195 @@
+// /home/jmeyer/projects/opencode-manage/internal/handlers/read.go FINAL
+// read endpoint (phase 1 of the managed-fs work): gated file/directory reads
+// through the daemon. Permission comes from the project's state.db `folders`
+// table (owned by the nvim folders panel, doc 23 PM1): a path inside the
+// project directory is always allowed; a path outside must be covered by an
+// `approved` folder row (most-specific match wins, so an `avoid` child
+// overrides an `approved` parent). The daemon is the enforcement boundary —
+// opencode's own external_directory is never consulted.
+package handlers
+
+import (
+	"database/sql"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+)
+
+// mountRead registers the /v1/read endpoint.
+func mountRead(r chi.Router) {
+	r.Post("/v1/read", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Directory string `json:"directory"`
+			Path      string `json:"path"`
+			Offset    int    `json:"offset"`
+			Limit     int    `json:"limit"`
+		}
+		if !decode(w, r, &req) {
+			return
+		}
+		if req.Directory == "" || req.Path == "" {
+			fail(w, http.StatusUnprocessableEntity, "[manage] read needs directory and path")
+			return
+		}
+		target, err := resolveReadPath(req.Path, req.Directory)
+		if err != nil {
+			fail(w, http.StatusUnprocessableEntity, "[manage] "+err.Error())
+			return
+		}
+		allowed, err := readAllowed(req.Directory, target)
+		if err != nil {
+			fail(w, http.StatusInternalServerError, "[manage] permission lookup failed: "+err.Error())
+			return
+		}
+		if !allowed {
+			fail(w, http.StatusForbidden, "[manage] read denied: "+target+" is outside the project and not covered by an approved folder (folders panel: <leader>aa)")
+			return
+		}
+		result, err := readTarget(target, req.Offset, req.Limit)
+		if err != nil {
+			fail(w, http.StatusNotFound, "[manage] read failed: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+}
+
+// resolveReadPath expands a leading ~/ and resolves relative paths against the
+// project directory, returning a clean absolute path.
+func resolveReadPath(p, directory string) (string, error) {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return "", fmt.Errorf("read path is empty")
+	}
+	if p == "~" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		p = home
+	} else if strings.HasPrefix(p, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		p = home + p[1:]
+	}
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(directory, p)
+	}
+	return filepath.Clean(p), nil
+}
+
+// readAllowed decides whether the daemon may read target. Project-internal
+// paths are always allowed; external paths require an approved folder row in
+// the project's state.db. The most-specific (longest) covering row wins.
+func readAllowed(directory, target string) (bool, error) {
+	if isWithin(directory, target) {
+		return true, nil
+	}
+	dbPath := filepath.Join(directory, ".opencode", "state.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return false, nil // no store → fail closed (deny external)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+	rows, err := db.Query("SELECT path, status FROM folders")
+	if err != nil {
+		return false, nil // no folders table → fail closed (deny external)
+	}
+	defer rows.Close()
+	best, bestStatus := "", ""
+	for rows.Next() {
+		var p, status string
+		if err := rows.Scan(&p, &status); err != nil {
+			continue
+		}
+		if coveredBy(target, p) && len(p) > len(best) {
+			best, bestStatus = p, status
+		}
+	}
+	if best == "" {
+		return false, nil
+	}
+	return bestStatus == "approved", nil
+}
+
+// readTarget reads a file (line-numbered content, offset/limit applied) or a
+// directory (sorted listing, dirs with a trailing slash).
+func readTarget(p string, offset, limit int) (map[string]any, error) {
+	info, err := os.Stat(p)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() {
+		entries, err := os.ReadDir(p)
+		if err != nil {
+			return nil, err
+		}
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() {
+				name += "/"
+			}
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return map[string]any{"ok": true, "path": p, "type": "directory", "entries": names}, nil
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(data), "\n")
+	start := offset
+	if start < 1 {
+		start = 1
+	}
+	if start > len(lines) {
+		start = len(lines)
+	}
+	end := len(lines)
+	if limit > 0 && start+limit-1 < end {
+		end = start + limit - 1
+	}
+	truncated := end < len(lines)
+	var sb strings.Builder
+	for i := start - 1; i < end; i++ {
+		fmt.Fprintf(&sb, "%d: %s\n", i+1, lines[i])
+	}
+	return map[string]any{
+		"ok": true, "path": p, "type": "file", "content": sb.String(),
+		"offset": start, "limit": limit, "truncated": truncated,
+	}, nil
+}
+
+// normPath expands ~/ and strips trailing slashes.
+func normPath(p string) string {
+	if strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = home + p[1:]
+		}
+	}
+	return strings.TrimRight(filepath.Clean(p), "/")
+}
+
+// coveredBy reports whether path equals dir or sits under it.
+func coveredBy(path, dir string) bool {
+	p := normPath(path)
+	d := normPath(dir)
+	return p == d || strings.HasPrefix(p, d+"/")
+}
+
+// isWithin reports whether path is the project directory or under it.
+func isWithin(directory, path string) bool {
+	return coveredBy(path, directory)
+}
