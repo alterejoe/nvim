@@ -1,11 +1,6 @@
--- /home/jmeyer/.config/nvim/lua/opencode-ext/db.lua FINAL
+-- /home/altjoe/.config/nvim/lua/opencode-ext/db.lua FINAL
 local DB_PATH = vim.fn.expand("~/.local/share/opencode/opencode.db")
 local M = {}
-
--- The session picker ('s' in the viewer) only needs the most recent sessions.
--- Scanning every session's message/part history for the full list is what made
--- the picker take ~10s to open.
-local PICKER_LIMIT = 10
 
 local function db_query(sql)
 	local ok, chk = pcall(vim.fn.executable, "sqlite3")
@@ -40,9 +35,8 @@ local function db_query_write(sql)
 	return true
 end
 
---- Fetch the most recent PICKER_LIMIT session rows with the latest message
---- state for health detection. Timestamps remain in the database's native
---- units; callers normalize them.
+--- Fetch session rows with the latest message state for health detection.
+--- Timestamps remain in the database's native units; callers normalize them.
 --- @return table[]|nil, string|nil
 function M.fetch_sessions()
 	local sql = [[
@@ -76,9 +70,6 @@ function M.fetch_sessions()
 		) ORDER BY s.time_updated DESC)
 		FROM session s
 		JOIN project p ON p.id = s.project_id
-		WHERE s.id IN (
-			SELECT id FROM session ORDER BY time_updated DESC LIMIT ]] .. PICKER_LIMIT .. [[
-		)
 	]]
 	local res, err = db_query(sql)
 	if not res then
