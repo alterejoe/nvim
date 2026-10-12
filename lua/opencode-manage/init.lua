@@ -1,4 +1,4 @@
--- /home/altjoe/.config/nvim/lua/opencode-manage/init.lua FINAL-4
+-- /home/altjoe/.config/nvim/lua/opencode-manage/init.lua FINAL-5
 -- opencode-manage: the review console for the opencode manage plugin.
 -- Proposal review + change journal + registry review + verdict store/viewer
 -- + metrics interface + references + skills lifecycle + permissions folders
@@ -13,6 +13,9 @@
 -- COMMANDS: :ManageMetrics, :ManagePrune, :ManageFolders, :ManageGoals,
 -- :ManageIndex, :ManageVault, :ManageRef, :ManageRefs, :ManageRefPrune,
 -- and :ManageHandoff.
+-- LINKS: gd follows a doc/code link (markdown `[text](target)` or the
+-- `managesee: <id>` directive); with no link on the line it falls back to
+-- LSP definition.
 -- Focus: BufEnter writes the active file so refs can route by what you work on.
 
 local review = require("opencode-manage.review")
@@ -34,6 +37,7 @@ local goals = require("opencode-manage.goals")
 local goalsview = require("opencode-manage.goalsview")
 local bookmarks = require("opencode-manage.bookmarks")
 local bookmarksview = require("opencode-manage.bookmarksview")
+local links = require("opencode-manage.links")
 
 -- Keymaps
 vim.keymap.set("n", "<leader>ap", reviewview.open, { desc = "Manage: review proposals" })
@@ -49,6 +53,12 @@ vim.keymap.set("n", "<leader>ag", vaultview.open, { desc = "Manage: vault (globa
 vim.keymap.set("n", "<leader>ah", handoffview.open, { desc = "Manage: handoff catalogue" })
 vim.keymap.set("n", "<leader>am", goalsview.open, { desc = "Manage: goals and milestones" })
 vim.keymap.set("n", "<leader>ab", bookmarksview.open, { desc = "Manage: review session bookmarks" })
+
+-- gd: follow a doc/code link (markdown `[text](target)` or `managesee: id`).
+-- Falls back to LSP definition when the line carries no link, so the key
+-- keeps its normal meaning. Buffer-local in LSP buffers (see LspAttach).
+-- links.follow (not links.goto — Lua reserves `goto`).
+vim.keymap.set("n", "gd", links.follow, { desc = "Manage: follow doc/code link" })
 
 -- Stable commands
 vim.api.nvim_create_user_command("ManageMetrics", function()
@@ -138,6 +148,19 @@ vim.api.nvim_create_autocmd("VimEnter", {
   end,
 })
 
+-- gd in LSP buffers: override lspconfig's default gd with the link handler,
+-- scheduled so it lands AFTER on_attach's synchronous mappings. The handler
+-- still falls back to LSP definition, so nothing is lost.
+vim.api.nvim_create_autocmd("LspAttach", {
+  callback = function(args)
+    vim.schedule(function()
+      if vim.api.nvim_buf_is_valid(args.buf) then
+        vim.keymap.set("n", "gd", links.follow, { buffer = args.buf, desc = "Manage: link or definition" })
+      end
+    end)
+  end,
+})
+
 -- R1: focus routing - write the active file so refs match what you work on.
 vim.api.nvim_create_autocmd("BufEnter", {
   callback = function()
@@ -171,6 +194,7 @@ return {
   handoffview = handoffview,
   goals = goals,
   goalsview = goalsview,
+  links = links,
   proposals = require("opencode-manage.proposals"),
   journal = require("opencode-manage.journal"),
   registry = require("opencode-manage.registry"),

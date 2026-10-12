@@ -1,31 +1,32 @@
--- /home/altjoe/.config/nvim/lua/opencode-manage/reviewview.lua FINAL-2
+-- /home/altjoe/.config/nvim/lua/opencode-manage/reviewview.lua FINAL-3
 -- opencode-manage.reviewview — proposals review panel (console adapter).
--- The richest adapter: editable AFTER pane, revision ordering, scope filter,
--- hunk navigation, group apply, copy+open, rerun.
---   j/k move · gg/G jump · [/] hunks · f scope filter (all / session /
+-- The richest adapter: revision ordering, scope filter, hunk navigation,
+-- group apply, copy+open, rerun.
+--   j/k move · gg/G jump · [/] changes · f scope filter (all / session /
 --   files / neither) · r refresh · o/CR open in origin · da accept
---   (snapshot + write the RIGHT pane) · dr reject (status only) ·
+--   (writes the proposal's computed content) · dr reject (status only) ·
 --   rr rerun (open for re-eval) · ga GROUP-APPLY (the newest row per
 --   target in the current group; older revisions are skipped
 --   automatically — revision ordering is internal, never your job) ·
 --   y yank row state · c CLEAN (purge accepted/rejected rows from the
 --   journals — verdicts stay in state.db) · Q kill.
+-- SINGLE-PANE PREVIEW (layout "detail"): one pane below the list shows the
+-- file AS DA WILL WRITE IT. No git-style +/- prefixes and no @@ header —
+-- what changes is shown by highlight alone: added/changed lines green
+-- (ManageAdd), removed lines red (ManageRemove), everything else plain.
+-- A new file is shown clean with a "NEW FILE +N" winbar; a delete shows the
+-- current file in red ("DELETE → _old"). The winbar carries the counts
+-- ("AFTER +N −M path"). [ / ] jumps between change blocks (not prefixes).
 -- ACCEPTED ROWS STAY: the list shows pending + accepted rows; accepted
 -- ones render dim-green [applied] and older revisions render dim-struck
 -- [superseded], so the review history is explicit.
--- Partial (edit_range) rows: LEFT pane = the unified diff itself
--- (@@ header, context, - removed red / + added green); RIGHT pane = the
--- full file with the range applied (editable — da writes it verbatim, so
--- a partial can never truncate a file). create/replace rows: LEFT = the
--- unified diff (disk vs proposed), RIGHT = proposed content. Panes open
--- positioned at the first change; [ / ] jumps between hunks.
 -- Row colors: green=NEW · blue=EDIT · magenta=RERUN · red=DELETE ·
 -- dim=APPLIED · strike=REJECTED · strike-italic=SUPERSEDED · yellow=MISMATCH.
 -- The cursor stays on the selected PROPOSAL across refreshes (identity-
 -- based restore), and row ordering is fully deterministic.
 -- The engine (opencode-manage.console) owns windows/keymaps/state; this
 -- file owns the proposals-specific logic: row classification (row_state),
--- CURRENT/AFTER previews (diff building), and the actions.
+-- the AFTER preview, and the actions.
 
 local proposals = require("opencode-manage.proposals")
 local diff = require("opencode-manage.reviewview.diff")
@@ -403,170 +404,179 @@ local function rows(items)
 	return out
 end
 
---- CURRENT (left) vs AFTER (right) for the selected proposal.
---- For edit_range: LEFT = unified diff (- removed / + added, red/green),
---- RIGHT = the full file with the range applied (editable — da writes it).
---- For create/replace: LEFT = unified diff (disk vs proposed), RIGHT =
---- proposed content. Panes open at the first change; [ / ] jumps hunks.
+--- The single AFTER pane for the selected proposal.
+--- One buffer, the file AS DA WILL WRITE IT. The change is shown by
+--- highlight only — added/changed lines green (ManageAdd), removed lines
+--- red (ManageRemove), context plain — no +/- prefixes, no @@ header.
+--- For a new file: shown clean, winbar "NEW FILE +N". For a delete: the
+--- current file in red, winbar "DELETE → _old".
+--- Change-block start lines are cached on the console state so [ / ] can
+--- jump between them (prefixes are gone, so hunk detection cannot scan).
 --- @param p table
+--- @param h table|nil  console handle
 --- @return table
-local function preview(p)
+local function preview(p, h)
+	-- Cache the change line numbers for [ / ] navigation.
+	local function set_changes(list)
+		if h and h.state then
+			h.state.change_lines = list or {}
+		end
+	end
+
 	local path = resolve_path(p)
 	local is_delete = p.operation == "delete"
 	local is_range = p.operation == "edit_range" and p.start_line ~= nil
 
-	local cur_lines, after_lines
-	local after_span -- 1-based inclusive line span of the added block
-	local first_change -- diff line of the first change (create/replace rows)
-	local first_added -- proposed-content line of the first added line
-
-	if is_delete and vim.fn.filereadable(path) == 1 then
-		cur_lines = vim.fn.readfile(path)
-		after_lines = { "<moved to _old> — da prompts the move" }
-	else
+	-- DELETE: the file moves to _old. Show what is being removed, in red.
+	if is_delete then
 		local disk = {}
-		if vim.fn.filereadable(path) == 1 then
+		if path ~= "" and vim.fn.filereadable(path) == 1 then
 			disk = vim.fn.readfile(path)
 		end
-		if is_range then
-			-- AFTER = full file with the range replaced; the preview IS the
-			-- file da writes, so a partial can never truncate anything.
-			local block = vim.split(p.content or "", "\n", { plain = true })
-			if block[#block] == "" then
-				table.remove(block)
-			end
-			local s = math.max(1, math.floor(num(p.start_line, 1)))
-			local e = math.max(s, math.floor(num(p.end_line, s)))
-			local head, tail = {}, {}
-			for i = 1, math.min(s - 1, #disk) do
-				head[i] = disk[i]
-			end
-			for i = e + 1, #disk do
-				tail[#tail + 1] = disk[i]
-			end
-			after_lines = {}
-			for _, l in ipairs(head) do
-				after_lines[#after_lines + 1] = l
-			end
-			for _, l in ipairs(block) do
-				after_lines[#after_lines + 1] = l
-			end
-			for _, l in ipairs(tail) do
-				after_lines[#after_lines + 1] = l
-			end
-			if #block > 0 then
-				after_span = { s, math.min(s + #block - 1, #after_lines) }
-			end
+		local hl = {}
+		for i = 1, #disk do
+			hl[i] = "ManageRemove"
+		end
+		set_changes({})
+		return {
+			left = {
+				lines = (#disk > 0) and disk or { "<file does not exist>" },
+				name = "DELETE: " .. p.path,
+				ft = vim.filetype.match({ filename = p.path }) or "",
+				modifiable = false,
+				winbar = string.format("DELETE → _old  %s", p._rel or p.path),
+				hl = hl,
+			},
+			focus = { left = 1 },
+		}
+	end
 
-			-- LEFT pane = the DIFF ITSELF: hunk header, a little context,
-			-- removed lines (-, red) and added lines (+, green).
-			local ctx = 2
-			local diff_lines = {}
-			table.insert(
-				diff_lines,
-				string.format("@@ -%d,%d +%d,%d @@", s, math.max(0, math.min(e, #disk) - s + 1), s, #block)
-			)
-			local cs = math.max(1, s - ctx)
-			for i = cs, s - 1 do
-				table.insert(diff_lines, " " .. (disk[i] or ""))
+	local disk = {}
+	if path ~= "" and vim.fn.filereadable(path) == 1 then
+		disk = vim.fn.readfile(path)
+	end
+
+	-- AFTER content: the full file as da will write it.
+	local after
+	if is_range then
+		local block = vim.split(p.content or "", "\n", { plain = true })
+		if block[#block] == "" then
+			table.remove(block)
+		end
+		local s = math.max(1, math.floor(num(p.start_line, 1)))
+		local e = math.max(s, math.floor(num(p.end_line, s)))
+		after = {}
+		for i = 1, math.min(s - 1, #disk) do
+			after[#after + 1] = disk[i]
+		end
+		for _, l in ipairs(block) do
+			after[#after + 1] = l
+		end
+		for i = e + 1, #disk do
+			after[#after + 1] = disk[i]
+		end
+	else
+		after = vim.split(p.content or "", "\n", { plain = true })
+		if after[#after] == "" then
+			table.remove(after)
+		end
+	end
+
+	-- New file: nothing to compare — show it clean, all of it is new.
+	if #disk == 0 then
+		set_changes({})
+		return {
+			left = {
+				lines = (#after > 0) and after or { "" },
+				name = "NEW: " .. p.path,
+				ft = vim.filetype.match({ filename = p.path }) or "",
+				modifiable = false,
+				winbar = string.format("NEW FILE  +%d lines  %s", #after, p._rel or p.path),
+			},
+			focus = { left = 1 },
+		}
+	end
+
+	-- Inline change view: the resulting file with removed lines red and
+	-- added lines green. No prefixes, no @@ header.
+	local diff_lines = diff.build_diff(disk, after)
+	local lines, hl = {}, {}
+	local added, removed = 0, 0
+	local change_lines = {}
+	local prev_change = false
+	for _, l in ipairs(diff_lines) do
+		local mark = l:sub(1, 1)
+		local text = l:sub(2)
+		local ln = #lines + 1
+		if mark == "+" then
+			lines[ln] = text
+			hl[ln] = "ManageAdd"
+			added = added + 1
+			if not prev_change then
+				change_lines[#change_lines + 1] = ln
 			end
-			for i = s, math.min(e, #disk) do
-				table.insert(diff_lines, "-" .. (disk[i] or ""))
+			prev_change = true
+		elseif mark == "-" then
+			lines[ln] = text
+			hl[ln] = "ManageRemove"
+			removed = removed + 1
+			if not prev_change then
+				change_lines[#change_lines + 1] = ln
 			end
-			for i = 1, #block do
-				table.insert(diff_lines, "+" .. block[i])
-			end
-			for i = e + 1, math.min(e + ctx, #disk) do
-				table.insert(diff_lines, " " .. (disk[i] or ""))
-			end
-			cur_lines = diff_lines
+			prev_change = true
 		else
-			-- create/replace: LEFT = unified diff (disk vs proposed),
-			-- RIGHT = proposed content. The change is visible at a glance
-			-- and [ / ] jumps between hunks.
-			after_lines = vim.split(p.content or "", "\n", { plain = true })
-			if after_lines[#after_lines] == "" then
-				table.remove(after_lines)
-			end
-			if #disk == 0 then
-				cur_lines = {}
-				for _, l in ipairs(after_lines) do
-					cur_lines[#cur_lines + 1] = "+" .. l
-				end
-				first_change = 1
-				first_added = 1
-			else
-				cur_lines, first_change, first_added = diff.build_diff(disk, after_lines)
-			end
+			lines[ln] = text
+			prev_change = false
 		end
 	end
-
-	-- Diff highlights: red = being deleted, green = being added.
-	local left_hl, right_hl = {}, {}
-	if is_range or first_change then
-		for ln, l in ipairs(cur_lines or {}) do
-			local prefix = l:sub(1, 1)
-			if prefix == "-" then
-				left_hl[ln] = "ManageRemove"
-			elseif prefix == "+" then
-				left_hl[ln] = "ManageAdd"
-			end
-		end
+	if #lines == 0 then
+		lines = { "" }
 	end
-	if after_span then
-		for ln = after_span[1], after_span[2] do
-			right_hl[ln] = "ManageAdd"
-		end
-	end
-
-	local opdesc = p.operation
-	if is_range then
-		opdesc = string.format(
-			"%s %d-%d",
-			p.operation,
-			num(p.start_line, 0),
-			num(p.end_line, num(p.start_line, 0))
-		)
-	end
-	local what = "proposal content"
-	if is_delete then
-		what = "moved to _old"
-	elseif is_range then
-		what = "range applied"
-	end
-
-	-- Position: open both panes at the first change (diff rows) or the
-	-- added block (range rows); everything else starts at the top.
-	-- The AFTER pane focuses the PROPOSED-content line (first_added), not
-	-- the diff line — the two buffers have different line numbers.
-	local left_focus = 1
-	local right_focus = 1
-	if is_range then
-		right_focus = after_span and after_span[1] or 1
-	elseif first_change then
-		left_focus = first_change
-		right_focus = first_added or first_change
-	end
+	set_changes(change_lines)
+	local focus_line = change_lines[1] or 1
 
 	return {
 		left = {
-			lines = cur_lines or { "" },
-			name = "CURRENT: " .. p.path,
-			ft = vim.filetype.match({ filename = p.path }) or "",
-			modifiable = false,
-			winbar = string.format("CURRENT %s  [%s]", p._rel or p.path, opdesc),
-			hl = left_hl,
-		},
-		right = {
-			lines = after_lines or { "" },
+			lines = lines,
 			name = "AFTER: " .. p.path,
 			ft = vim.filetype.match({ filename = p.path }) or "",
-			modifiable = true,
-			winbar = string.format("AFTER — %s · da writes this  %s", what, p._rel or p.path),
-			hl = right_hl,
+			modifiable = false,
+			winbar = string.format("AFTER  +%d −%d  %s", added, removed, p._rel or p.path),
+			hl = hl,
 		},
-		focus = { left = left_focus, right = right_focus },
+		focus = { left = focus_line },
 	}
+end
+
+--- [ / ]: jump to the FIRST ROW of the previous / next group. Groups are
+--- contiguous in display order and the console drops separators from the
+--- cursor set, so a group's first row is simply where the group changes.
+--- Bound on every pane, so it works from the list or from inside the preview.
+--- @param delta number  -1 (previous group) or 1 (next group)
+--- @param h table  console handle
+local function hunk_jump(delta, h)
+	local items = h.state.items
+	if not items or #items == 0 then
+		return
+	end
+	local function group_of(i)
+		return (items[i] and items[i].group) or "misc"
+	end
+	local starts = { 1 }
+	for i = 2, #items do
+		if group_of(i) ~= group_of(i - 1) then
+			starts[#starts + 1] = i
+		end
+	end
+	local cur = 1
+	for k, s in ipairs(starts) do
+		if s <= h.state.idx then
+			cur = k
+		end
+	end
+	local target = math.max(1, math.min(#starts, cur + delta))
+	h.state.idx = starts[target]
+	h.refresh()
 end
 
 --- Counts per scope from a single scan — cheap, one read of the manifests.
@@ -671,11 +681,12 @@ local function rerun_open(p, h)
 	open_in_origin(p, h)
 end
 
---- da: accept the selected proposal. Writes the RIGHT pane verbatim —
---- for edit_range that pane is the full file with the range applied, so
---- partials are safe. Rerun guard confirms before clobbering newer work.
---- Older revisions of a target are refused automatically (revision
---- ordering is an internal function — never the user's job to order rows).
+--- da: accept the selected proposal. Writes the proposal's COMPUTED content
+--- verbatim (range-apply for edit_range, full content for create/replace) —
+--- the single preview pane is display-only, so accept never reads a buffer.
+--- Rerun guard confirms before clobbering newer work. Older revisions of a
+--- target are refused automatically (revision ordering is internal — never
+--- the user's job to order rows).
 --- @param p table
 --- @param h table  console handle
 local function accept_current(p, h)
@@ -702,30 +713,30 @@ local function accept_current(p, h)
 	end
 	if p.operation == "delete" then
 		handle_delete(p)
-	else
-		if st == "rerun" then
-			local choice = vim.fn.confirm(
-				"⚠️ File changed since this proposal was written.\n\n"
-					.. "Accepting will OVERWRITE newer work on:\n  "
-					.. resolve_path(p)
-					.. "\n\n"
-					.. "Continue?",
-				"&Yes\n&No",
-				2
-			)
-			if choice ~= 1 then
-				return
-			end
-		end
-		local current = vim.api.nvim_buf_get_lines(h.state.after_buf, 0, -1, false)
-		-- Baseline for the verdict: for edit_range it is the full after-content
-		-- (never the replacement fragment); other ops keep proposal.content.
-		local baseline = nil
-		if p.operation == "edit_range" then
-			baseline = after_content(p, resolve_path(p))
-		end
-		proposals.accept(p, table.concat(current, "\n"), baseline)
+		return
 	end
+	if st == "rerun" then
+		local choice = vim.fn.confirm(
+			"⚠️ File changed since this proposal was written.\n\n"
+				.. "Accepting will OVERWRITE newer work on:\n  "
+				.. resolve_path(p)
+				.. "\n\n"
+				.. "Continue?",
+			"&Yes\n&No",
+			2
+		)
+		if choice ~= 1 then
+			return
+		end
+	end
+	local content = after_content(p, resolve_path(p))
+	-- Baseline for the verdict: for edit_range it is the full after-content
+	-- (never the replacement fragment); other ops keep proposal.content.
+	local baseline = nil
+	if p.operation == "edit_range" then
+		baseline = content
+	end
+	proposals.accept(p, content, baseline)
 	h.refresh()
 end
 
@@ -880,7 +891,7 @@ end
 function M.open()
 	console.open({
 		name = "Review",
-		layout = "pair",
+		layout = "detail",
 		list = function()
 			local out = {}
 			local cur = current_session()
@@ -950,10 +961,7 @@ function M.open()
 			return p.path .. "\0" .. (p._file or "") .. "\0" .. tostring(p.ts)
 		end,
 		scroll = "hunks",
-		hunk_jump = function(delta, h)
-			diff.jump_hunk(h.state, delta)
-		end,
-		right_editable = true,
+		hunk_jump = hunk_jump,
 	})
 end
 

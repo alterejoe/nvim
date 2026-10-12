@@ -1,9 +1,9 @@
--- /home/altjoe/.config/nvim/lua/opencode-manage/console.lua FINAL-2
+-- /home/altjoe/.config/nvim/lua/opencode-manage/console.lua FINAL-3
 -- opencode-manage.console — the shared review console engine.
 -- ONE recognizable review/application interface for every reviewable panel:
 -- proposals, registry, journal, skills, verdicts, metrics, refs, vault.
 -- A panel is a thin ADAPTER (spec) implementing a small contract; the engine
--- owns the windows, keymaps, state, kill/refresh, legend, and focus-return.
+-- owns the windows, keymaps, state, kill/refresh, legend, and focus.
 --
 -- SPEC CONTRACT:
 --   name          string          panel name (winbar / notify / re-entry key)
@@ -19,7 +19,9 @@
 --   preview(item, h) -> { left = { lines, name, ft, modifiable, winbar, hl },
 --                         right = {...},            -- pair layout only
 --                         focus = { left = n, right = n } }
---                      hl = { [line] = "ManageAdd" } etc — applied after write.
+--                      hl = { [line] = "ManageAdd" } etc — applied after write;
+--                      ManageAdd / ManageRemove lines ALSO get a sign-column
+--                      marker (▎ green / red) so a change is unmistakable.
 --   actions       table           optional: primary (<CR>, primary_desc),
 --                                  accept (da), reject (dr), group_apply (ga),
 --                                  open (o), yank (y), rerun (rr) — fn(item, h)
@@ -38,12 +40,14 @@
 --   hunk_jump     fn(delta, h)    required when scroll == "hunks"
 --   right_editable bool           right pane editable (da writes it)
 --
--- The engine maps the FULL key set on EVERY buffer — nothing is dead by
--- focus. Q kills; r refreshes; y yanks the row's state (paste into a
--- session to ask about it); the WinEnter autocmd returns focus to the
--- list (deferred via vim.schedule — never switch windows synchronously
--- inside nvim_win_call). Re-opening a panel replaces its own viewer
--- instead of stacking; different panels coexist.
+-- FOCUS: the panes are real windows — C-w w / C-w j move into a preview and
+-- j/k scroll it LINE BY LINE (native). Row navigation (j/k, gg/G) is bound
+-- ONLY on the list buffer; <C-n>/<C-p> step rows from ANY pane so you can
+-- change proposal without leaving the preview. [/] jumps hunks in every
+-- pane. Q kills; r refreshes; y yanks the row's state; the WinEnter focus
+-- pin is gone, so focus stays where you put it.
+-- Re-opening a panel replaces its own viewer instead of stacking; different
+-- panels coexist.
 
 local M = {}
 
@@ -94,6 +98,9 @@ function M.define_hls()
 	-- diff panes: what a partial deletes (left) / adds (right)
 	hl(0, "ManageAdd", { bg = "#1e3b2a" })
 	hl(0, "ManageRemove", { bg = "#3b1f1f" })
+	-- diff sign-column markers (▎ in the signcolumn)
+	hl(0, "ManageAddSign", { fg = "#4ec9b0" })
+	hl(0, "ManageRemoveSign", { fg = "#f44747" })
 end
 
 --- Build the default legend from the spec's actions + extra keys.
@@ -102,6 +109,7 @@ end
 local function build_legend(spec)
 	local parts = { "j/k move", "gg/G jump" }
 	table.insert(parts, spec.scroll == "hunks" and "[/] hunks" or "[/] scroll")
+	table.insert(parts, "C-w w pane")
 	local a = spec.actions or {}
 	if a.primary then
 		table.insert(parts, "<CR> " .. (a.primary_desc or "apply"))
@@ -146,10 +154,13 @@ function M.open(spec)
 	end
 	M.define_hls()
 
+	local sign_ns = vim.api.nvim_create_namespace("manage-signs")
+
 	local state = {
 		items = {},
 		idx = 1,
 		row_info = {},
+		change_lines = {},
 		list_buf = nil,
 		cur_buf = nil,
 		after_buf = nil,
@@ -259,6 +270,33 @@ function M.open(spec)
 		end
 	end
 
+	--- Place a ▎ sign in the signcolumn for every line whose pane highlight is
+	--- ManageAdd / ManageRemove — the same hl map the adapter already returns,
+	--- so both reviewview and journalview get change markers for free.
+	--- @param buf number
+	--- @param hl_map table|nil
+	local function place_signs(buf, hl_map)
+		if not buf or not vim.api.nvim_buf_is_valid(buf) then
+			return
+		end
+		vim.api.nvim_buf_clear_namespace(buf, sign_ns, 0, -1)
+		for ln, hl in pairs(hl_map or {}) do
+			local group
+			if hl == "ManageAdd" then
+				group = "ManageAddSign"
+			elseif hl == "ManageRemove" then
+				group = "ManageRemoveSign"
+			end
+			if group then
+				pcall(vim.api.nvim_buf_set_extmark, buf, sign_ns, ln - 1, 0, {
+					sign_text = "▎",
+					sign_hl_group = group,
+					priority = 4096,
+				})
+			end
+		end
+	end
+
 	local function render_previews()
 		local item = state.items[state.idx]
 		if not item and not spec.preview_empty then
@@ -281,7 +319,7 @@ function M.open(spec)
 				if vim.bo[pane.buf].modifiable == false then
 					vim.bo[pane.buf].modifiable = true
 				end
-local pl = {}
+				local pl = {}
 				for _, l in ipairs(p.lines or { "" }) do
 					if type(l) == "string" and l:find("\n") then
 						for _, s in ipairs(vim.split(l, "\n", { plain = true })) do
@@ -300,6 +338,7 @@ local pl = {}
 				for ln, hl in pairs(p.hl or {}) do
 					vim.api.nvim_buf_add_highlight(pane.buf, ns, hl, ln - 1, 0, -1)
 				end
+				place_signs(pane.buf, p.hl)
 				if pane.win and vim.api.nvim_win_is_valid(pane.win) then
 					vim.wo[pane.win].winbar = p.winbar or (p.name or spec.name)
 				end
@@ -406,7 +445,7 @@ local pl = {}
 		render_previews()
 	end
 
-local function scroll_previews(delta)
+	local function scroll_previews(delta)
 		local amount = delta * 8
 		for _, w in ipairs({ state.cur_win, state.after_win }) do
 			if w and vim.api.nvim_win_is_valid(w) then
@@ -474,8 +513,8 @@ local function scroll_previews(delta)
 	--- popup then shows "what comes next" on prefix keys (d, g, r, [, ]).
 	--- Guarded: which-key is optional; without it the winbar legend still
 	--- documents every key. Buffer-scoped, so registrations die with the
-	--- panel buffers.
-	local function register_whichkey(buf)
+	--- panel buffers. Row-navigation specs are list-buffer only.
+	local function register_whichkey(buf, is_list)
 		local ok, wk = pcall(require, "which-key")
 		if not ok then
 			return
@@ -485,13 +524,15 @@ local function scroll_previews(delta)
 			overrides[k.key] = true
 		end
 		local specs = {
-			{ "j", desc = "next row", buffer = buf },
-			{ "k", desc = "prev row", buffer = buf },
 			{ "<C-n>", desc = "next row", buffer = buf },
 			{ "<C-p>", desc = "prev row", buffer = buf },
-			{ "gg", desc = "jump to top", buffer = buf },
-			{ "G", desc = "jump to bottom", buffer = buf },
 		}
+		if is_list then
+			specs[#specs + 1] = { "j", desc = "next row", buffer = buf }
+			specs[#specs + 1] = { "k", desc = "prev row", buffer = buf }
+			specs[#specs + 1] = { "gg", desc = "jump to top", buffer = buf }
+			specs[#specs + 1] = { "G", desc = "jump to bottom", buffer = buf }
+		end
 		if not overrides["["] and not overrides["]"] then
 			if spec.scroll == "hunks" then
 				specs[#specs + 1] = { "[", desc = "prev hunk", buffer = buf }
@@ -531,26 +572,32 @@ local function scroll_previews(delta)
 		wk.add(specs)
 	end
 
-	local function map_keys(buf)
+	--- Map keys on a panel buffer. is_list=true gets row navigation (j/k,
+	--- gg/G); every buffer gets <C-n>/<C-p> row stepping, [/], actions,
+	--- yank, refresh and kill — so the preview stays fully usable.
+	local function map_keys(buf, is_list)
 		local opts = { buffer = buf, nowait = true, noremap = true, silent = true }
-		vim.keymap.set("n", "j", function()
-			move(1)
-		end, vim.tbl_extend("force", opts, { desc = "next row" }))
-		vim.keymap.set("n", "k", function()
-			move(-1)
-		end, vim.tbl_extend("force", opts, { desc = "prev row" }))
+		if is_list then
+			vim.keymap.set("n", "j", function()
+				move(1)
+			end, vim.tbl_extend("force", opts, { desc = "next row" }))
+			vim.keymap.set("n", "k", function()
+				move(-1)
+			end, vim.tbl_extend("force", opts, { desc = "prev row" }))
+			vim.keymap.set("n", "gg", function()
+				jump(false)
+			end, vim.tbl_extend("force", opts, { desc = "jump to top" }))
+			vim.keymap.set("n", "G", function()
+				jump(true)
+			end, vim.tbl_extend("force", opts, { desc = "jump to bottom" }))
+		end
+		-- Row stepping from ANY pane (does not clash with line j/k).
 		vim.keymap.set("n", "<C-n>", function()
 			move(1)
 		end, vim.tbl_extend("force", opts, { desc = "next row" }))
 		vim.keymap.set("n", "<C-p>", function()
 			move(-1)
 		end, vim.tbl_extend("force", opts, { desc = "prev row" }))
-		vim.keymap.set("n", "gg", function()
-			jump(false)
-		end, vim.tbl_extend("force", opts, { desc = "jump to top" }))
-		vim.keymap.set("n", "G", function()
-			jump(true)
-		end, vim.tbl_extend("force", opts, { desc = "jump to bottom" }))
 		-- Adapter keys may override the default [/] behavior (e.g. goals
 		-- uses them for suggestion selection).
 		local overrides = {}
@@ -617,7 +664,7 @@ local function scroll_previews(delta)
 			end, vim.tbl_extend("force", opts, { desc = k.desc }))
 		end
 		vim.keymap.set("n", "Q", kill_viewer, vim.tbl_extend("force", opts, { desc = "kill viewer" }))
-		register_whichkey(buf)
+		register_whichkey(buf, is_list)
 	end
 
 	-- Layout: list column right of origin; preview below; pair adds a right sibling
@@ -643,43 +690,34 @@ local function scroll_previews(delta)
 	end
 
 	-- Word-wrap every pane: long rows and previews read as paragraphs.
+	-- signcolumn "auto" on the preview panes: the ▎ change markers appear
+	-- only when there is something to mark.
 	for _, w in ipairs({ state.list_win, state.cur_win, state.after_win }) do
 		if w and vim.api.nvim_win_is_valid(w) then
 			vim.wo[w].wrap = true
 			vim.wo[w].linebreak = true
 		end
 	end
+	for _, w in ipairs({ state.cur_win, state.after_win }) do
+		if w and vim.api.nvim_win_is_valid(w) then
+			vim.wo[w].signcolumn = "auto"
+		end
+	end
 
 	vim.api.nvim_set_current_win(state.list_win)
 
-	-- Full key set on ALL buffers so nothing is a dead key by focus.
-	local bufs = { state.list_buf, state.cur_buf }
-	if state.after_buf then
-		bufs[#bufs + 1] = state.after_buf
+	-- Row navigation on the list only; the preview keeps native j/k (line
+	-- movement) and still gets [/], <C-n>/<C-p>, actions, yank, refresh, kill.
+	map_keys(state.list_buf, true)
+	if state.cur_buf then
+		map_keys(state.cur_buf, false)
 	end
-	for _, b in ipairs(bufs) do
-		map_keys(b)
+	if state.after_buf then
+		map_keys(state.after_buf, false)
 	end
 
-	state.autocmd = vim.api.nvim_create_autocmd("WinEnter", {
-		callback = function()
-			local cur = vim.api.nvim_get_current_win()
-			if
-				state.list_win
-				and vim.api.nvim_win_is_valid(state.list_win)
-				and (cur == state.cur_win or cur == state.after_win or cur == state.list_win)
-			then
-				-- Deferred: never switch windows synchronously inside a
-				-- nvim_win_call (disallowed) or mid-render — the focus
-				-- return lands on the next tick.
-				vim.schedule(function()
-					if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
-						vim.api.nvim_set_current_win(state.list_win)
-					end
-				end)
-			end
-		end,
-	})
+	-- No WinEnter focus pin: the panes are real windows you can move into
+	-- (C-w w / C-w j) and scroll line by line. Focus stays where you put it.
 
 	local infos = spec.rows(raw) or {}
 	local items = {}

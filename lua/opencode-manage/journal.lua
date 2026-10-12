@@ -1,38 +1,84 @@
--- opencode-manage.journal — the safety net.
--- Snapshots every accepted change to .ai-journal/ BEFORE it lands, and
--- records the transition in journal.jsonl. Restore = copy the .orig back
--- (or delete, for created files; or move back, for _old moves).
--- No git. Plain copies + JSONL.
---
--- M1g: entries carry a `group`; restore_group reverts a whole change.
--- Revert-is-an-event: a restore snapshots the CURRENT state first and
--- records op="restore", so reverting the revert works.
--- Restore is never blind: preview_lines builds CURRENT vs AFTER-RESTORE
--- content, shown in the journal viewer (or peek_and_confirm for the
--- one-shot picker path).
--- CWD-proof: finds EVERY .ai-journal dir — walking up AND globbing down.
-
+-- /home/altjoe/.config/nvim/lua/opencode-manage/journal.lua FINAL
+-- opencode-manage.journal — daemon-backed journal client.
+-- The Go daemon (internal/handlers/journal.go) owns the journal: before-image
+-- BLOBs + transition rows in manage.db, plus a git-committable
+-- .ai-journal/journal.jsonl mirror. nvim is the apply surface — it calls
+-- begin (capture the before-image, strictly before the write), writes the
+-- file, then record. Revert-is-an-event lives daemon-side now.
+-- This module PRESERVES the public API every writer/viewer already calls
+-- (snapshot · record · list · groups · describe_target · preview_lines ·
+-- peek_and_confirm · restore · restore_group · delete), so only the internals
+-- change: HTTP over the daemon socket instead of files on disk.
+-- API quirk kept for compatibility: snapshot(path) returns the SNAPSHOT ID
+-- (a number) or nil when the file does not exist — callers use `snap ~= nil`
+-- as the `existed` flag, exactly as before.
 local M = {}
 
---- Find all .ai-journal directories: walk up from cwd (nearest first)
---- AND glob down two levels. Deduplicated.
---- @return string[]
-local function journal_dirs()
-	local dirs = {}
-	local seen = {}
+local socket = vim.fn.expand("~/.local/share/opencode-manage/manage.sock")
+local binary = vim.env.MANAGE_BIN or vim.fn.expand("~/projects/opencode-manage/bin/manage")
+local base_url = "http://localhost"
 
-	local function add(d)
-		if d and not seen[d] then
-			seen[d] = true
-			table.insert(dirs, d)
-		end
+--- Spawn the daemon if its socket is absent; wait up to 3s.
+--- @return boolean
+local function ensure_daemon()
+	if vim.fn.filereadable(socket) == 1 then
+		return true
 	end
+	vim.fn.jobstart({ binary }, { detach = true, stdio = "ignore" })
+	vim.wait(3000, function()
+		return vim.fn.filereadable(socket) == 1
+	end, 20)
+	return vim.fn.filereadable(socket) == 1
+end
 
+--- POST/GET JSON over the daemon unix socket.
+--- @param method string
+--- @param path string
+--- @param body table|nil
+--- @return table|nil, string|nil  decoded body, error
+local function request(method, path, body)
+	if not ensure_daemon() then
+		return nil, "manage daemon is unavailable"
+	end
+	local args = {
+		"curl",
+		"--silent",
+		"--show-error",
+		"--fail-with-body",
+		"--unix-socket",
+		socket,
+		"-X",
+		method,
+		base_url .. path,
+	}
+	if body ~= nil then
+		table.insert(args, "--header")
+		table.insert(args, "Content-Type: application/json")
+		table.insert(args, "--data-raw")
+		table.insert(args, vim.json.encode(body))
+	end
+	local result = vim.system(args, { text = true }):wait()
+	if result.code ~= 0 then
+		return nil, result.stderr ~= "" and result.stderr or "daemon request failed"
+	end
+	if result.stdout == "" then
+		return {}, nil
+	end
+	local ok, decoded = pcall(vim.json.decode, result.stdout)
+	if not ok then
+		return nil, "daemon returned invalid JSON"
+	end
+	return decoded, nil
+end
+
+--- The project root owning cwd's journal: nearest ancestor with .opencode or
+--- .ai-journal, else cwd. Matches the old journal_dir() walk-up discovery.
+--- @return string
+local function project_root()
 	local dir = vim.fn.getcwd()
 	for _ = 1, 12 do
-		local candidate = dir .. "/.ai-journal"
-		if vim.fn.isdirectory(candidate) == 1 then
-			add(candidate)
+		if vim.fn.isdirectory(dir .. "/.opencode") == 1 or vim.fn.isdirectory(dir .. "/.ai-journal") == 1 then
+			return dir
 		end
 		local parent = vim.fn.fnamemodify(dir, ":h")
 		if parent == dir then
@@ -40,80 +86,81 @@ local function journal_dirs()
 		end
 		dir = parent
 	end
-
-	for _, d in ipairs(vim.fn.glob(vim.fn.getcwd() .. "/.ai-journal", false, true)) do
-		add(d)
-	end
-	for _, d in ipairs(vim.fn.glob(vim.fn.getcwd() .. "/*/.ai-journal", false, true)) do
-		add(d)
-	end
-	for _, d in ipairs(vim.fn.glob(vim.fn.getcwd() .. "/*/*/.ai-journal", false, true)) do
-		add(d)
-	end
-
-	return dirs
+	return vim.fn.getcwd()
 end
 
---- Prefer the nearest (first found) journal dir; fall back to cwd.
---- @return string
-local function journal_dir()
-	local dirs = journal_dirs()
-	return dirs[1] or (vim.fn.getcwd() .. "/.ai-journal")
+M.project_root = project_root
+
+--- Normalize a daemon row to the entry shape the viewers/writers expect.
+--- parent_ts carries the parent row id (review.lua renders "from <parent>").
+--- @param r table
+--- @return table
+local function normalize(r)
+	return {
+		id = r.id,
+		ts = r.ts,
+		sessionID = r.session_id,
+		group = r.group,
+		project = r.project,
+		path = r.path,
+		op = r.op,
+		existed = r.existed,
+		snapshot_id = r.snapshot_id,
+		moved_to = r.moved_to,
+		parent_id = r.parent_id,
+		parent_ts = r.parent_id,
+		reason = r.reason,
+		after_hash = r.after_hash,
+		stale = r.stale,
+	}
 end
 
---- @return string
-local function journal_file()
-	return journal_dir() .. "/journal.jsonl"
-end
-
---- Snapshot a file. No-op if the file doesn't exist.
+--- Capture the before-image (strictly before the write).
 --- @param path string  absolute path
---- @return string|nil  snapshot path, or nil if nothing to snapshot
+--- @return number|nil  snapshot id, or nil when the file does not exist
 function M.snapshot(path)
-	if vim.fn.filereadable(path) ~= 1 then
+	local data, err = request("POST", "/v1/journal/begin", { path = path })
+	if not data then
+		vim.notify("❌ journal begin failed: " .. tostring(err), vim.log.levels.ERROR)
 		return nil
 	end
-	local ts = tostring(os.time() * 1000)
-	local snap = journal_dir() .. "/" .. path:gsub("^/", "") .. ".snap/" .. ts .. ".orig"
-	vim.fn.mkdir(vim.fn.fnamemodify(snap, ":h"), "p")
-	local ok, err = vim.loop.fs_copyfile(path, snap)
-	if not ok then
-		vim.notify("❌ Snapshot failed: " .. tostring(err), vim.log.levels.ERROR)
-		return nil
-	end
-	return snap
+	return data.snapshot_id
 end
 
---- Append a journal entry.
---- @param entry table  { ts, path, group, op, snapshot, existed, parent_ts, reason, sessionID }
+--- Record a transition. API fields map to the daemon wire shape:
+--- `snapshot` -> snapshot_id, `parent_ts` -> parent_id.
+--- @param entry table  { ts, path, group, op, snapshot, existed, moved_to, parent_ts, reason, sessionID, project }
+--- @return table|nil  the inserted row
 function M.record(entry)
-	local file = journal_file()
-	vim.fn.mkdir(journal_dir(), "p")
-	local line = vim.json.encode(entry)
-	local fd = vim.loop.fs_open(file, "a", 420)
-	if fd then
-		vim.loop.fs_write(fd, line .. "\n", -1)
-		vim.loop.fs_close(fd)
+	local data, err = request("POST", "/v1/journal/record", {
+		ts = entry.ts,
+		session_id = entry.sessionID,
+		group = entry.group,
+		project = entry.project or project_root(),
+		path = entry.path,
+		op = entry.op,
+		existed = entry.existed == true,
+		snapshot_id = entry.snapshot,
+		moved_to = entry.moved_to or "",
+		parent_id = entry.parent_ts,
+		reason = entry.reason or "",
+	})
+	if not data then
+		vim.notify("❌ journal record failed: " .. tostring(err), vim.log.levels.ERROR)
 	end
+	return data
 end
 
---- Read the full journal timeline (oldest first), from every journal dir.
+--- The full timeline, NEWEST first — matching the proposals console order.
 --- @return table[]
 function M.list()
+	local data, err = request("POST", "/v1/journal/list", { limit = 500 })
+	if not data then
+		return {}
+	end
 	local out = {}
-	for _, dir in ipairs(journal_dirs()) do
-		local file = dir .. "/journal.jsonl"
-		if vim.fn.filereadable(file) == 1 then
-			local lines = vim.fn.readfile(file)
-			for _, line in ipairs(lines) do
-				if line ~= "" then
-					local ok, entry = pcall(vim.json.decode, line)
-					if ok and type(entry) == "table" then
-						table.insert(out, entry)
-					end
-				end
-			end
-		end
+	for _, r in ipairs(data.entries or {}) do
+		out[#out + 1] = normalize(r)
 	end
 	return out
 end
@@ -121,8 +168,7 @@ end
 --- Distinct groups present in the journal (non-nil).
 --- @return string[]
 function M.groups()
-	local seen = {}
-	local out = {}
+	local seen, out = {}, {}
 	for _, e in ipairs(M.list()) do
 		if e.group and not seen[e.group] then
 			seen[e.group] = true
@@ -133,20 +179,19 @@ function M.groups()
 end
 
 --- What will the file become if this entry is restored?
---- Returns a short one-line description of the target state.
 --- @param entry table
 --- @return string
 function M.describe_target(entry)
 	if not entry then
 		return "?"
 	end
-	if entry.op == "move" and entry.moved_to then
+	if entry.op == "move" and entry.moved_to and entry.moved_to ~= "" then
 		if vim.fn.filereadable(entry.moved_to) == 1 then
 			return "moves back from _old/ (file restored)"
 		end
 		return "file already gone from _old/"
 	end
-	if entry.snapshot and vim.fn.filereadable(entry.snapshot) == 1 then
+	if entry.snapshot_id then
 		return "restores snapshot (" .. tostring(entry.ts) .. ")"
 	end
 	if entry.existed == false then
@@ -155,72 +200,55 @@ function M.describe_target(entry)
 	return "no restorable state"
 end
 
---- The source file a restore will apply from (snapshot or _old file).
---- @param entry table
---- @return string|nil
-local function restore_source(entry)
-	if entry.op == "move" and entry.moved_to and vim.fn.filereadable(entry.moved_to) == 1 then
-		return entry.moved_to
-	end
-	if entry.snapshot and vim.fn.filereadable(entry.snapshot) == 1 then
-		return entry.snapshot
-	end
-	return nil
-end
-
---- Build CURRENT vs AFTER-RESTORE content for an entry — the live journal
---- viewer renders this in its preview pane.
+--- CURRENT vs AFTER-RESTORE content, computed daemon-side (the before-image
+--- lives in the DB — nvim never reads snapshot files).
 --- @param entry table
 --- @return table  { path, what, current = string[], after = string[], restorable = boolean }
 function M.preview_lines(entry)
-	local out = {
-		path = entry.path or "?",
-		what = M.describe_target(entry),
-		current = {},
-		after = {},
-		restorable = false,
+	local data, err = request("POST", "/v1/journal/preview", { id = entry and entry.id })
+	if not data then
+		return {
+			path = (entry and entry.path) or "?",
+			what = "preview unavailable: " .. tostring(err),
+			current = {},
+			after = {},
+			restorable = false,
+		}
+	end
+	return {
+		path = data.path or (entry and entry.path) or "?",
+		what = data.what or "?",
+		current = data.current or {},
+		after = data.after or {},
+		restorable = data.restorable == true,
 	}
-	local src = restore_source(entry)
-	if entry.path and vim.fn.filereadable(entry.path) == 1 then
-		out.current = vim.fn.readfile(entry.path)
-	end
-	if src then
-		out.after = vim.fn.readfile(src)
-		out.restorable = true
-	elseif entry.existed == false then
-		out.after = { "<file does not exist>" }
-		out.restorable = true
-	end
-	return out
 end
 
---- Peek at what a restore will do: show the target content (snapshot or
---- the _old file) so the revert is never blind. Confirm before applying.
+--- Peek at what a restore will do (vsplit CURRENT vs AFTER). Confirm before
+--- applying. Returns true only for the create-delete confirm path (the
+--- vsplit path is preview-only and returns false so the user re-runs).
 --- @param entry table
---- @return boolean  true if the user confirmed
+--- @return boolean
 function M.peek_and_confirm(entry)
 	if not entry or not entry.path then
 		vim.notify("❌ Invalid journal entry", vim.log.levels.WARN)
 		return false
 	end
-
-	local src = restore_source(entry)
-	local what = M.describe_target(entry)
-	if src then
-		local cur = vim.fn.filereadable(entry.path) == 1 and vim.fn.readfile(entry.path) or {}
-		local nxt = vim.fn.readfile(src)
+	local pl = M.preview_lines(entry)
+	if pl.restorable and #pl.after > 0 then
 		local buf = vim.api.nvim_create_buf(false, true)
-		local lines = {}
-		table.insert(lines, "RESTORE: " .. entry.path)
-		table.insert(lines, "→ " .. what)
-		table.insert(lines, "───────────────────────────")
-		table.insert(lines, "CURRENT:")
-		for _, l in ipairs(cur) do
+		local lines = {
+			"RESTORE: " .. entry.path,
+			"→ " .. pl.what,
+			"───────────────────────────",
+			"CURRENT:",
+		}
+		for _, l in ipairs(pl.current) do
 			table.insert(lines, "  " .. l)
 		end
 		table.insert(lines, "───────────────────────────")
 		table.insert(lines, "AFTER RESTORE:")
-		for _, l in ipairs(nxt) do
+		for _, l in ipairs(pl.after) do
 			table.insert(lines, "  " .. l)
 		end
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -232,10 +260,8 @@ function M.peek_and_confirm(entry)
 		vim.keymap.set("n", "q", function()
 			vim.cmd("close!")
 		end, { buffer = buf, nowait = true, noremap = true, silent = true })
-		return false -- preview only; the user re-runs restore after reviewing
+		return false
 	end
-
-	-- No content to peek (create-deletes): confirm directly
 	if entry.existed == false then
 		local choice = vim.fn.confirm("Restore will DELETE the created file:\n  " .. entry.path, "&Yes\n&No", 2)
 		return choice == 1
@@ -244,41 +270,15 @@ function M.peek_and_confirm(entry)
 	return false
 end
 
---- Undo ONE transition on a file, depending on the entry's op.
---- Returns true if the file state changed.
+--- Restore a single entry. With skip_peek the viewer pane already previews.
+--- The revert is itself a journal event (recorded daemon-side).
 --- @param entry table
---- @return boolean
-local function undo_entry(entry)
-	if entry.op == "move" and entry.moved_to then
-		if vim.fn.filereadable(entry.moved_to) == 1 then
-			vim.fn.mkdir(vim.fn.fnamemodify(entry.path, ":h"), "p")
-			return vim.loop.fs_rename(entry.moved_to, entry.path) == true
-		end
-		return false
-	end
-	if entry.snapshot and vim.fn.filereadable(entry.snapshot) == 1 then
-		return vim.loop.fs_copyfile(entry.snapshot, entry.path) == true
-	end
-	if entry.existed == false then
-		if vim.fn.filereadable(entry.path) == 1 then
-			vim.fn.delete(entry.path)
-			return true
-		end
-	end
-	return false
-end
-
---- Restore a single entry. With skip_peek (the journal viewer already shows
---- the current-vs-after pane), a simple confirm is used instead of the
---- one-shot vsplit preview. The restore is itself a journal event.
---- @param entry table
---- @param skip_peek boolean|nil  true when the viewer pane already previews
+--- @param skip_peek boolean|nil
 function M.restore(entry, skip_peek)
 	if not entry or not entry.path then
 		vim.notify("❌ Invalid journal entry", vim.log.levels.WARN)
 		return
 	end
-
 	if skip_peek then
 		local choice = vim.fn.confirm(
 			"Restore this entry?\n  " .. entry.path .. "\n  → " .. M.describe_target(entry),
@@ -289,74 +289,57 @@ function M.restore(entry, skip_peek)
 			return
 		end
 	elseif not M.peek_and_confirm(entry) then
-		return -- preview shown or cancelled; nothing applied
+		return
 	end
-
-	local current_snap = M.snapshot(entry.path)
-	local restored = undo_entry(entry)
-	if not restored then
+	local data, err = request("POST", "/v1/journal/restore", {
+		id = entry.id,
+		session_id = entry.sessionID,
+	})
+	if not data then
+		vim.notify("❌ Restore failed: " .. tostring(err), vim.log.levels.ERROR)
+		return
+	end
+	if (data.restored or 0) == 0 then
 		vim.notify("❌ Nothing to restore for this entry", vim.log.levels.WARN)
 		return
 	end
-
-	M.record({
-		ts = os.time() * 1000,
-		path = entry.path,
-		group = entry.group,
-		op = "restore",
-		snapshot = current_snap,
-		existed = current_snap ~= nil,
-		parent_ts = entry.ts,
-		reason = "restored from " .. (entry.op or "?") .. " (" .. tostring(entry.ts) .. ")",
-		sessionID = entry.sessionID,
-	})
 	vim.notify("↩️ Restored " .. entry.path .. " — revert recorded in journal", vim.log.levels.INFO)
 end
 
---- Revert a whole change: undo every accepted entry in the group.
+--- Revert a whole change: every entry in the group (recorded as one revert
+--- each, daemon-side). Project is resolved from the group's own entries.
 --- @param group string
 function M.restore_group(group)
 	if not group or group == "" then
 		vim.notify("❌ No group given", vim.log.levels.WARN)
 		return
 	end
-	local entries = M.list()
-	local hits = {}
-	for _, e in ipairs(entries) do
+	local project
+	for _, e in ipairs(M.list()) do
 		if e.group == group then
-			table.insert(hits, e)
+			project = e.project
+			break
 		end
 	end
-	if #hits == 0 then
+	if not project then
 		vim.notify("ℹ️ No journal entries for group: " .. group, vim.log.levels.INFO)
 		return
 	end
-	local ok_count = 0
-	for _, e in ipairs(hits) do
-		local current_snap = M.snapshot(e.path)
-		if undo_entry(e) then
-			ok_count = ok_count + 1
-			M.record({
-				ts = os.time() * 1000,
-				path = e.path,
-				group = e.group,
-				op = "restore",
-				snapshot = current_snap,
-				existed = current_snap ~= nil,
-				parent_ts = e.ts,
-				reason = "group revert of " .. group,
-				sessionID = e.sessionID,
-			})
-		end
+	local data, err = request("POST", "/v1/journal/restore", { group = group, project = project })
+	if not data then
+		vim.notify("❌ Group revert failed: " .. tostring(err), vim.log.levels.ERROR)
+		return
 	end
-	vim.notify(string.format("↩️ Group reverted: %s (%d/%d files)", group, ok_count, #hits), vim.log.levels.INFO)
+	vim.notify(
+		string.format("↩️ Group reverted: %s (%d files)", group, data.restored or 0),
+		vim.log.levels.INFO
+	)
 end
 
---- Remove an entry from the journal by its ts (rewrites the JSONL).
---- Also removes its snapshot file, if any. CONFIRMS first.
+--- Remove an entry AND its snapshot (unrecoverable). Confirms first.
 --- @param entry table
 function M.delete(entry)
-	if not entry or not entry.ts then
+	if not entry or not entry.id then
 		vim.notify("❌ Invalid journal entry", vim.log.levels.WARN)
 		return
 	end
@@ -370,38 +353,18 @@ function M.delete(entry)
 			.. ")\n\n"
 			.. "Removes the entry AND its snapshot — unrecoverable.",
 		"&Yes\n&No",
-		2 -- default to No
+		2
 	)
 	if choice ~= 1 then
 		vim.notify("Entry kept", vim.log.levels.INFO)
 		return
 	end
-	local file = journal_file()
-	if vim.fn.filereadable(file) ~= 1 then
+	local data, err = request("POST", "/v1/journal/delete", { id = entry.id })
+	if not data then
+		vim.notify("❌ Delete failed: " .. tostring(err), vim.log.levels.ERROR)
 		return
 	end
-	local lines = vim.fn.readfile(file)
-	local kept = {}
-	local removed = false
-	for _, line in ipairs(lines) do
-		if line ~= "" then
-			local ok, e = pcall(vim.json.decode, line)
-			if ok and type(e) == "table" and e.ts == entry.ts then
-				removed = true
-			else
-				table.insert(kept, line)
-			end
-		end
-	end
-	if removed then
-		vim.fn.writefile(kept, file)
-		if entry.snapshot and vim.fn.filereadable(entry.snapshot) == 1 then
-			vim.fn.delete(entry.snapshot)
-		end
-		vim.notify("🗑️ Journal entry removed: " .. (entry.path or "?"), vim.log.levels.INFO)
-	else
-		vim.notify("ℹ️ Entry not found (already removed?)", vim.log.levels.INFO)
-	end
+	vim.notify("🗑️ Journal entry removed: " .. (entry.path or "?"), vim.log.levels.INFO)
 end
 
 return M
