@@ -21,6 +21,15 @@ return {
         },
         init = function()
             vim.g.db_ui_use_nerd_fonts = 1
+            -- opencode-manage state: proposals, journal, notes cache.
+            -- vim.g.dbs is converted to a Lua table on read, so it must be
+            -- assigned back — mutating it in place is discarded.
+            local dbs = vim.g.dbs or {}
+            dbs[#dbs + 1] = {
+                name = "manage",
+                url = "sqlite:" .. vim.fn.expand("~/.local/share/opencode-manage/manage.db"),
+            }
+            vim.g.dbs = dbs
         end,
     },
 

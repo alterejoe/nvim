@@ -1,3 +1,4 @@
+-- /home/jmeyer/.config/nvim/lua/opencode-manage/proposals.lua FINAL-3
 -- opencode-manage.proposals — the review data.
 -- Reads .ai-proposals/*.jsonl (written by the opencode manage plugin),
 -- accepts (snapshot → write → record → status), rejects, and "deletes"
@@ -87,7 +88,11 @@ end
 --- Every .ai-proposals dir: cwd-reachable plus SCAN_ROOTS. Value = whether
 --- the dir is cwd-reachable (the SESSION predicate).
 --- @return table<string, boolean>
-local function all_dirs()
+local session = require("opencode-manage.session")
+
+--- Legacy queues: cwd-reachable plus SCAN_ROOTS. Their only remaining job is the
+--- fallback session scan; the reader still lists them during the migration.
+local function legacy_dirs()
 	local dirs = cwd_dirs()
 	for _, root in ipairs(SCAN_ROOTS) do
 		for _, d in ipairs(vim.fn.glob(root .. "/*/.ai-proposals", false, true)) do
@@ -95,6 +100,47 @@ local function all_dirs()
 		end
 	end
 	return dirs
+end
+
+M.current_session = function()
+	return session.current_session(legacy_dirs)
+end
+
+M.session_store_dir = function()
+	local id = M.current_session()
+	if not id then
+		return nil
+	end
+	return session.store_root() .. "/" .. id
+end
+
+--- The dirs the console reads: the stores of the sessions this tmux session is
+--- running — and, when no pointer resolves yet, every session store on the
+--- machine.
+---
+--- The pointer is written on the first tool call, so a cold nvim has none. The
+--- console must not render empty because of that: a session store is still the
+--- truth, and a directory guess never is. Legacy queues remain the last resort.
+--- @return table<string, boolean>
+local function all_dirs()
+	local dirs = {}
+	for _, id in ipairs(session.session_ids(legacy_dirs)) do
+		dirs[session.store_root() .. "/" .. id] = true
+	end
+	if next(dirs) then
+		return dirs
+	end
+
+	for _, d in ipairs(vim.fn.glob(session.store_root() .. "/*", false, true)) do
+		if vim.fn.isdirectory(d) == 1 then
+			dirs[d] = true
+		end
+	end
+	if next(dirs) then
+		return dirs
+	end
+
+	return legacy_dirs()
 end
 
 --- Exported for consumers that need the same discovery (e.g. the review
@@ -293,6 +339,137 @@ end
 ---   fragment — fragment-vs-file comparisons flagged every accept as corrected.
 --- @return boolean  true when written
 function M.accept(proposal, content_override, baseline_override)
+	-- A group marked do-not-apply cannot be applied.
+	if proposal.operation ~= "mark-proposals" and proposal.operation ~= "reject-proposals" then
+		for _, mp in ipairs(M.list_all()) do
+			if (mp.status or "pending") ~= "rejected" and mp.operation == "mark-proposals" then
+				local ok, spec = pcall(vim.json.decode, mp.content or "")
+				if ok and type(spec) == "table" and spec.mark == "do-not-apply"
+					and (mp.group or "misc") == (proposal.group or "misc") then
+					vim.notify("⛔ Refused: group marked do-not-apply — " .. tostring(mp.reason), vim.log.levels.ERROR)
+					return false
+				end
+			end
+		end
+	end
+	-- Directory move: one row, one rename. Never expanded into per-file
+	-- creates/deletes, and never routed through _old — the content is
+	-- preserved exactly, only its location changes.
+	-- Rename: one row, one in-place change. The body and zettel id are
+	-- identity; only the title, slug, and path move. The daemon has already
+	-- updated referrer links; the row carries a human-readable reason.
+	if proposal.operation == "rename" then
+		local src = resolve_path(proposal)
+		if not src then
+			return refuse(proposal, "rename")
+		end
+		local okjson, spec = pcall(vim.json.decode, proposal.content or "")
+		if not okjson or type(spec) ~= "table" then
+			vim.notify("❌ Refused: rename content is not valid JSON", vim.log.levels.ERROR)
+			return false
+		end
+		local dst = tostring(spec.target or "")
+		if dst:sub(1, 1) ~= "/" then
+			vim.notify("❌ Refused: rename target must be absolute: " .. dst, vim.log.levels.ERROR)
+			return false
+		end
+		if vim.fn.filereadable(src) ~= 1 then
+			vim.notify("❌ Refused: rename source is not readable: " .. src, vim.log.levels.ERROR)
+			return false
+		end
+		if vim.fn.filereadable(dst) == 1 or vim.fn.isdirectory(dst) == 1 then
+			vim.notify("❌ Refused: rename target already exists: " .. dst, vim.log.levels.ERROR)
+			return false
+		end
+		local snap = journal.snapshot(src)
+		local lines = vim.split(tostring(spec.content or ""), "\n", { plain = true })
+		if lines[#lines] == "" then
+			table.remove(lines)
+		end
+		vim.fn.mkdir(vim.fn.fnamemodify(dst, ":h"), "p")
+		vim.fn.writefile(lines, dst)
+		vim.loop.fs_unlink(src)
+		journal.record({
+			ts = proposal.ts,
+			path = src,
+			group = proposal.group,
+			op = "rename",
+			snapshot = snap,
+			moved_to = dst,
+			existed = true,
+			reason = proposal.reason,
+			sessionID = proposal.sessionID,
+		})
+		verdicts.record({
+			ts = os.time() * 1000,
+			session_id = proposal.sessionID,
+			proposal_id = proposal.ts,
+			group_name = proposal.group,
+			path = src,
+			operation = proposal.operation,
+			verdict = "accepted",
+			reason = proposal.reason,
+			proposed_content = dst,
+			applied_content = dst,
+		})
+		M.set_status(proposal, "accepted")
+		vim.notify("✏️ Renamed: " .. src .. " → " .. dst, vim.log.levels.INFO)
+		return true
+	end
+
+	-- Directory move: one row, one rename. Never expanded into per-file
+	if proposal.operation == "move" then
+		local src = resolve_path(proposal)
+		if not src then
+			return refuse(proposal, "move")
+		end
+		local dst = tostring(proposal.content or "")
+		if dst:sub(1, 1) ~= "/" then
+			vim.notify("❌ Refused: move destination must be absolute: " .. dst, vim.log.levels.ERROR)
+			return false
+		end
+		if vim.fn.isdirectory(src) ~= 1 then
+			vim.notify("❌ Refused: move source is not a directory: " .. src, vim.log.levels.ERROR)
+			return false
+		end
+		if vim.fn.isdirectory(dst) == 1 or vim.fn.filereadable(dst) == 1 then
+			vim.notify("❌ Refused: move target already exists: " .. dst, vim.log.levels.ERROR)
+			return false
+		end
+		vim.fn.mkdir(vim.fn.fnamemodify(dst, ":h"), "p")
+		local ok, err = vim.loop.fs_rename(src, dst)
+		if not ok then
+			vim.notify("❌ Move failed: " .. tostring(err), vim.log.levels.ERROR)
+			return false
+		end
+		journal.record({
+			ts = proposal.ts,
+			path = src,
+			group = proposal.group,
+			op = "move",
+			snapshot = nil,
+			moved_to = dst,
+			existed = true,
+			reason = proposal.reason,
+			sessionID = proposal.sessionID,
+		})
+		verdicts.record({
+			ts = os.time() * 1000,
+			session_id = proposal.sessionID,
+			proposal_id = proposal.ts,
+			group_name = proposal.group,
+			path = src,
+			operation = proposal.operation,
+			verdict = "accepted",
+			reason = proposal.reason,
+			proposed_content = dst,
+			applied_content = dst,
+		})
+		M.set_status(proposal, "accepted")
+		vim.notify("📦 Moved: " .. src .. " → " .. dst, vim.log.levels.INFO)
+		return true
+	end
+
 	-- Folder-approval proposals are not file changes: accepting them
 	-- approves the folder in state.db (folders table) and flips status.
 	if proposal.operation == "folder-approve" then
@@ -315,7 +492,7 @@ function M.accept(proposal, content_override, baseline_override)
 			applied_content = nil,
 		})
 		M.set_status(proposal, "accepted")
-vim.notify("🔐 folder approved: " .. proposal.path, vim.log.levels.INFO)
+		vim.notify("🔐 folder approved: " .. proposal.path, vim.log.levels.INFO)
 		return true
 	end
 
@@ -349,6 +526,57 @@ vim.notify("🔐 folder approved: " .. proposal.path, vim.log.levels.INFO)
 		vim.notify("🎯 goal suggestion accepted: #" .. tostring(id), vim.log.levels.INFO)
 		return true
 	end
+	-- Rejection proposals are not file changes: applying one marks the
+	-- selected pending proposals rejected (a verdict per row) and flips
+	-- this row accepted. Dismissing it leaves everything untouched.
+	if proposal.operation == "reject-proposals" then
+		local ok, sel = pcall(vim.json.decode, proposal.content or "")
+		if not ok or type(sel) ~= "table" then
+			vim.notify("reject-proposals: content is not valid JSON", vim.log.levels.ERROR)
+			return false
+		end
+		local group = sel.group or ""
+		local paths = {}
+		for _, tp in ipairs(sel.paths or {}) do
+			paths[tp] = true
+		end
+		local n = 0
+		for _, t in ipairs(M.list_all()) do
+			if
+				(t.status or "pending") == "pending"
+				and ((group ~= "" and (t.group or "misc") == group) or paths[t.path])
+			then
+				M.set_status(t, "rejected")
+				verdicts.record({
+					ts = os.time() * 1000,
+					session_id = t.sessionID,
+					proposal_id = t.ts,
+					group_name = t.group,
+					path = resolve_path(t),
+					operation = t.operation,
+					verdict = "rejected",
+					reason = proposal.reason,
+					proposed_content = t.content,
+					applied_content = nil,
+				})
+				n = n + 1
+			end
+		end
+		M.set_status(proposal, "accepted")
+		vim.notify(
+			string.format("🤖 Rejection applied: %d proposal(s) — %s", n, proposal.reason or ""),
+			vim.log.levels.INFO
+		)
+		return true
+	end
+
+	-- Mark rows are metadata only: never a file write.
+	if proposal.operation == "mark-proposals" then
+		M.set_status(proposal, "accepted")
+		vim.notify("🏷 Marked: " .. tostring(proposal.reason), vim.log.levels.INFO)
+		return true
+	end
+
 	local path = resolve_path(proposal)
 	if not path then
 		return refuse(proposal, "accept")
@@ -419,7 +647,7 @@ vim.notify("🔐 folder approved: " .. proposal.path, vim.log.levels.INFO)
 		if ext == "ts" or ext == "tsx" or ext == "js" or ext == "lua" then
 			local depth = 0
 			for ch in content:gmatch("[%{%(}%)]") do
-				if ch == "{" or ch == "(" then
+				if ch == "\123" or ch == "\40" then
 					depth = depth + 1
 				else
 					depth = depth - 1
@@ -588,7 +816,7 @@ end
 --- Reject a proposal: status flip + verdict. Nothing written. Rejection is
 --- allowed for legacy relative rows too — it clears them from the queue.
 --- @param proposal table
-function M.reject(proposal)
+function M.reject(proposal, quiet)
 	M.set_status(proposal, "rejected")
 
 	-- T2 verdict capture
@@ -609,7 +837,140 @@ function M.reject(proposal)
 		verdicts.promote_if_cross_project(path, "rejected")
 	end
 
-	vim.notify("❌ Rejected: " .. proposal.path, vim.log.levels.INFO)
+	if not quiet then
+		vim.notify("❌ Rejected: " .. proposal.path, vim.log.levels.INFO)
+	end
+end
+
+--- Reject every pending proposal in a group. Status + verdict only; nothing
+--- is written. Rows already accepted/rejected are left alone.
+--- @param group string
+--- @param mode string|nil  scope filter (see in_scope)
+--- @return number  rows rejected
+function M.reject_group(group, mode)
+	local n = 0
+	for _, p in ipairs(M.list_all()) do
+		if (p.status or "pending") == "pending" and (p.group or "misc") == group and in_scope(p, mode) then
+			M.reject(p, true)
+			n = n + 1
+		end
+	end
+	return n
+end
+
+-- Ensure the daemon is accepting before a raw curl apply. The opencode tools
+-- spawn it on demand; the console bypasses that, so it waits for /healthz and
+-- starts bin/manage when the socket is gone (or the daemon is still starting).
+local function ensure_daemon(socket)
+	local function healthy()
+		local r = vim.system(
+			{ "curl", "-sS", "--fail", "--unix-socket", socket, "http://localhost/healthz" },
+			{ text = true }
+		):wait()
+		return r.code == 0
+	end
+	local sleep = (vim.uv or vim.loop).sleep
+	-- Give an in-flight start a moment before spawning a second daemon.
+	for _ = 1, 10 do
+		if healthy() then
+			return true
+		end
+		sleep(100)
+	end
+	local bin = vim.env.MANAGE_BIN or ((vim.env.HOME or "") .. "/projects/opencode-manage/bin/manage")
+	if vim.fn.filereadable(bin) == 0 then
+		return false
+	end
+	local log = (vim.env.HOME or "") .. "/.local/share/opencode-manage/manage.log"
+	vim.fn.system({
+		"sh",
+		"-c",
+		"nohup " .. vim.fn.shellescape(bin) .. " >>" .. vim.fn.shellescape(log) .. " 2>&1 &",
+	})
+	for _ = 1, 30 do
+		if healthy() then
+			return true
+		end
+		sleep(100)
+	end
+	return false
+end
+
+--- Apply an entire proposal group atomically via the daemon endpoint
+--- POST /v1/proposals/apply-group. The daemon validates all rows, snapshots
+--- before-images, writes/moves files, consumes fleeting thoughts, reindexes,
+--- and rolls back on any error.
+function M.apply_group_atomic(group, batch, project)
+	if not batch or #batch == 0 then
+		return false, 0
+	end
+	local socket = vim.fn.expand("~/.local/share/opencode-manage/manage.sock")
+	if not ensure_daemon(socket) then
+		vim.notify("❌ apply-group: manage daemon is unreachable at " .. socket, vim.log.levels.ERROR)
+		return false, 0
+	end
+	local rows = {}
+	local session_id = ""
+	for _, entry in ipairs(batch) do
+		local it = entry.proposal
+		if session_id == "" and it.sessionID then
+			session_id = it.sessionID
+		end
+		table.insert(rows, {
+			ts = it.ts,
+			session_id = it.sessionID,
+			group = group,
+			path = entry.path,
+			operation = it.operation,
+			content = entry.content,
+			target = it.target,
+			reason = it.reason,
+		})
+	end
+	local payload = vim.json.encode({
+		group = group,
+		project = project,
+		session_id = session_id,
+		rows = rows,
+	})
+	local res = vim.system({
+		"curl",
+		"--silent",
+		"--show-error",
+		"--fail-with-body",
+		"--unix-socket",
+		socket,
+		"-X",
+		"POST",
+		"--header",
+		"Content-Type: application/json",
+		"--data-raw",
+		payload,
+		"http://localhost/v1/proposals/apply-group",
+	}, { text = true }):wait()
+	if res.code ~= 0 then
+		local detail = (res.stdout ~= "" and res.stdout) or res.stderr or "apply-group failed"
+		vim.notify("❌ Atomic group apply aborted: " .. detail, vim.log.levels.ERROR)
+		return false, 0
+	end
+	for _, entry in ipairs(batch) do
+		local it = entry.proposal
+		M.set_status(it, "accepted")
+		verdicts.record({
+			ts = os.time() * 1000,
+			session_id = it.sessionID,
+			proposal_id = it.ts,
+			group_name = it.group,
+			path = entry.path,
+			operation = it.operation,
+			verdict = "accepted",
+			reason = it.reason,
+			proposed_content = entry.content,
+			applied_content = entry.content,
+		})
+		verdicts.promote_if_cross_project(entry.path, "accepted")
+	end
+	return true, #batch
 end
 
 return M

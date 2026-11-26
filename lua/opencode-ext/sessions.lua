@@ -1,4 +1,4 @@
--- /home/altjoe/.config/nvim/lua/opencode-ext/sessions.lua FINAL
+-- /home/jmeyer/.config/nvim/lua/opencode-ext/sessions.lua FINAL-2
 -- Manages OpenCode in dedicated tmux sessions.
 
 local M = {}
@@ -23,7 +23,40 @@ local function project_key(cwd)
 	return key:gsub("[%.%:]", "_")
 end
 
+--- The tmux session this nvim is in, or nil outside tmux.
+local function tmux_session_name()
+	local ok, out = pcall(vim.fn.system, { "tmux", "display-message", "-p", "#{session_name}" })
+	if not ok or vim.v.shell_error ~= 0 then
+		return nil
+	end
+	local name = vim.trim(out or "")
+	if name == "" then
+		return nil
+	end
+	return name
+end
+
+--- Where a new opencode starts: the tmux session's own directory. Falls back to
+--- the caller's cwd when tmux is absent or reports nothing usable.
+local function root_dir(fallback)
+	local ok, out = pcall(vim.fn.system, { "tmux", "display-message", "-p", "#{session_path}" })
+	if ok and vim.v.shell_error == 0 then
+		local p = vim.trim(out or "")
+		if p ~= "" and vim.fn.isdirectory(p) == 1 then
+			return p
+		end
+	end
+	return fallback or vim.fn.getcwd()
+end
+
+--- One opencode per tmux session: <leader>oo is the same session wherever nvim
+--- is rooted, and a second one is a second tmux session. Outside tmux the old
+--- project key is still the best available answer.
 local function session_name(cwd)
+	local mine = tmux_session_name()
+	if mine then
+		return OC_PREFIX .. mine:gsub("[^%w_%-]", "_")
+	end
 	return OC_PREFIX .. project_key(cwd)
 end
 
@@ -32,8 +65,10 @@ local function session_exists(name)
 	return vim.v.shell_error == 0
 end
 
+--- The buffer follows the session key, not the project, or <leader>oo would
+--- open a second buffer for one session.
 local function find_oc_buf(cwd)
-	local bufname = "opencode-term-" .. project_key(cwd)
+	local bufname = "opencode-term-" .. session_name(cwd)
 	for _, buf in ipairs(vim.api.nvim_list_bufs()) do
 		if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf):find(bufname, 1, true) then
 			return buf
@@ -58,14 +93,7 @@ local function resize_and_repaint(name, win)
 	end
 	local cols = math.max(1, vim.api.nvim_win_get_width(win))
 	local rows = math.max(1, vim.api.nvim_win_get_height(win))
-	tmux(
-		"resize-window -t "
-			.. vim.fn.shellescape(name)
-			.. " -x "
-			.. cols
-			.. " -y "
-			.. rows
-	)
+	tmux("resize-window -t " .. vim.fn.shellescape(name) .. " -x " .. cols .. " -y " .. rows)
 end
 
 --- Keep the pane synced only when nvim's geometry actually changes.
@@ -162,8 +190,12 @@ local function maybe_reassign(cwd)
 end
 
 local function open_oc_buffer(name, cwd)
-	local bufname = "opencode-term-" .. project_key(cwd)
-	vim.cmd("vsplit")
+	-- Root the session at the tmux session's own directory, not the subdirectory
+	-- nvim happens to be in: <leader>oo must be the same opencode wherever you
+	-- are standing, and a new one must not start in a random child.
+	cwd = root_dir(cwd)
+	local bufname = "opencode-term-" .. session_name(cwd)
+	vim.cmd("rightbelow vsplit")
 	local win = vim.api.nvim_get_current_win()
 	local cols = vim.api.nvim_win_get_width(win)
 	local rows = vim.api.nvim_win_get_height(win)
@@ -299,11 +331,28 @@ local function session_preview_lines(name)
 end
 
 --- <leader>oo -- start/toggle ---------------------------------------------
-
 vim.keymap.set("n", "<leader>oo", function()
 	if not in_tmux() then
 		vim.notify("opencode: not in tmux", vim.log.levels.WARN)
 		return
+	end
+
+	local target = nil
+	local from_viewer = false
+	local okc, console = pcall(require, "opencode-manage.console")
+	if okc then
+		target = console.split_target_for(vim.api.nvim_get_current_win())
+		from_viewer = target ~= nil
+	end
+	if not target then
+		local okp, preview = pcall(require, "opencode-manage.previewview")
+		if okp then
+			target = preview.split_target_for(vim.api.nvim_get_current_win())
+			from_viewer = target ~= nil
+		end
+	end
+	if target and vim.api.nvim_win_is_valid(target) then
+		vim.api.nvim_set_current_win(target)
 	end
 
 	local name = session_name()
@@ -315,13 +364,19 @@ vim.keymap.set("n", "<leader>oo", function()
 				vim.api.nvim_win_close(win, true)
 			end
 		else
-			vim.cmd("vsplit")
+			vim.cmd("rightbelow vsplit")
 			vim.api.nvim_win_set_buf(0, existing_buf)
+			if from_viewer then
+				vim.cmd("wincmd L")
+			end
 			sync_on_enter(name, existing_buf)
 			vim.cmd("startinsert")
 		end
 	else
 		open_oc_buffer(name, vim.fn.getcwd())
+		if from_viewer then
+			vim.cmd("wincmd L")
+		end
 	end
 end, { desc = "OpenCode: start/toggle" })
 

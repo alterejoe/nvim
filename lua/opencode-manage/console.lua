@@ -24,6 +24,7 @@
 --                      marker (▎ green / red) so a change is unmistakable.
 --   actions       table           optional: primary (<CR>, primary_desc),
 --                                  accept (da), reject (dr), group_apply (ga),
+--                                  group_reject (gr),
 --                                  open (o), yank (y), rerun (rr) — fn(item, h)
 --   yank(item, h) optional override for the universal y (row-state yank);
 --                                  default: row text + known item fields
@@ -78,10 +79,14 @@ function M.define_hls()
 	hl(0, "ManageRejected", { fg = "#808080", strikethrough = true }) -- dim: rejected
 	hl(0, "ManageSuperseded", { fg = "#6e6e6e", italic = true, strikethrough = true }) -- dim: older revision
 	hl(0, "ManageMismatch", { fg = "#dcdcaa", bold = true }) -- yellow: mismatch
+	hl(0, "ManageReject", { fg = "#f44747", bold = true }) -- red: rejection proposal
 	hl(0, "ManageManual", { fg = "#dcdcaa" }) -- yellow: manual-y
 	hl(0, "ManageRestore", { fg = "#c586c0" }) -- magenta: restore (revert)
 	hl(0, "ManageDead", { fg = "#808080", strikethrough = true }) -- dim: not restorable
 	hl(0, "ManageGroup", { fg = "#808080", italic = true }) -- group headers
+	hl(0, "ManageNote", { fg = "#4ec9b0", bold = true }) -- note proposals (not file emissions)
+	hl(0, "ManageNoteTag", { fg = "#dcdcaa", bold = true }) -- yellow: note tag
+	hl(0, "ManageEmitTag", { fg = "#569cd6", bold = true }) -- blue: emit tag
 	-- registry
 	hl(0, "ManageRegShared", { fg = "#f44747" }) -- red: shared (central)
 	hl(0, "ManageRegCanonical", { fg = "#569cd6" }) -- blue: canonical
@@ -122,6 +127,9 @@ local function build_legend(spec)
 	end
 	if a.group_apply then
 		table.insert(parts, "ga group")
+	end
+	if a.group_reject then
+		table.insert(parts, "gr reject group")
 	end
 	if a.open then
 		table.insert(parts, "o open")
@@ -230,7 +238,13 @@ function M.open(spec)
 			else
 				local marker = (info.item == cur) and ">" or " "
 				table.insert(lines, marker .. " " .. (info.text or ""))
-				row_of[#lines] = { hl = info.hl, col = info.col or 2 }
+				row_of[#lines] = {
+					hl = info.hl,
+					col = info.col or 2,
+					tag_hl = info.tag_hl,
+					tag_col = info.tag_col,
+					tag_end = info.tag_end,
+				}
 				if info.item == cur then
 					cursor_line = #lines
 				end
@@ -260,6 +274,9 @@ function M.open(spec)
 		for ln, r in pairs(row_of) do
 			if r.hl then
 				vim.api.nvim_buf_add_highlight(state.list_buf, ns, r.hl, ln - 1, r.col, -1)
+			end
+			if r.tag_hl then
+				vim.api.nvim_buf_add_highlight(state.list_buf, ns, r.tag_hl, ln - 1, r.tag_col or 0, r.tag_end or -1)
 			end
 		end
 
@@ -557,6 +574,9 @@ function M.open(spec)
 		if a.group_apply then
 			specs[#specs + 1] = { "ga", desc = "group apply", buffer = buf }
 		end
+		if a.group_reject then
+			specs[#specs + 1] = { "gr", desc = "reject group", buffer = buf }
+		end
 		if a.open then
 			specs[#specs + 1] = { "o", desc = "open", buffer = buf }
 		end
@@ -646,6 +666,11 @@ function M.open(spec)
 				a.group_apply(state.items[state.idx], handle)
 			end, vim.tbl_extend("force", opts, { desc = "group apply" }))
 		end
+		if a.group_reject then
+			vim.keymap.set("n", "gr", function()
+				a.group_reject(state.items[state.idx], handle)
+			end, vim.tbl_extend("force", opts, { desc = "reject group" }))
+		end
 		if a.open then
 			vim.keymap.set("n", "o", function()
 				a.open(state.items[state.idx], handle)
@@ -734,6 +759,35 @@ function M.open(spec)
 	render_previews()
 	set_legend()
 	return handle
+end
+
+--- Return the window a panel was opened from, when win is one of its panes.
+--- Other keymaps use this so a split is made next to the viewer, not inside
+--- one of its panes.
+function M.origin_for(win)
+	for _, h in pairs(actives) do
+		local s = h.state
+		if win == s.list_win or win == s.cur_win or win == s.after_win or win == s.outer_win then
+			return s.origin_win
+		end
+	end
+	return nil
+end
+
+--- Return the window a panel was opened from, when win is one of its panes,
+--- so an external split is created OUTSIDE the viewer. The caller then moves
+--- it to the far right with wincmd L. Splitting a pane would break the viewer.
+function M.split_target_for(win)
+	for _, h in pairs(actives) do
+		local s = h.state
+		if win == s.list_win or win == s.cur_win or win == s.after_win or win == s.outer_win then
+			if s.origin_win and vim.api.nvim_win_is_valid(s.origin_win) then
+				return s.origin_win
+			end
+			return s.outer_win or s.list_win
+		end
+	end
+	return nil
 end
 
 return M

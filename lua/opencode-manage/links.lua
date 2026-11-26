@@ -167,9 +167,36 @@ function M.link_under_cursor()
 	return find_directive(line)
 end
 
+local function fleeting_jump()
+	local name = vim.api.nvim_buf_get_name(0)
+	local base = vim.fn.fnamemodify(name, ":t")
+	if base ~= "_fleeting.md" and base ~= "_fleeting.tags.md" then
+		return false
+	end
+	local id = vim.api.nvim_get_current_line():match("^%s*%-%s*(%d+)%s*·")
+	if not id then
+		return false
+	end
+	local sibling = base == "_fleeting.md" and "_fleeting.tags.md" or "_fleeting.md"
+	local path = vim.fn.fnamemodify(name, ":h") .. "/" .. sibling
+	if vim.fn.filereadable(path) ~= 1 then
+		return false
+	end
+	vim.cmd("edit " .. vim.fn.fnameescape(path))
+	local found = vim.fn.search("^\\s*-\\s*" .. id .. "\\s*·", "w")
+	if found == 0 then
+		vim.notify("manage links: no " .. sibling .. " row for " .. id, vim.log.levels.WARN)
+	end
+	return true
+end
+
 --- Jump to the doc/code link on the cursor line. Falls back to LSP
---- definition when the line carries no link.
+--- definition when the line carries no link. In the fleeting files, gd jumps
+--- by id to the sibling line first.
 function M.follow()
+	if fleeting_jump() then
+		return
+	end
 	local target = M.link_under_cursor()
 	if target and trim(target) ~= "" then
 		if open_target(target) then

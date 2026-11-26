@@ -23,7 +23,27 @@ end
 
 local function open_terminal(split_cmd, target_dir)
 	target_dir = target_dir or vim.fn.getcwd()
+	local target = nil
+	local from_viewer = false
+	local okc, console = pcall(require, "opencode-manage.console")
+	if okc then
+		target = console.split_target_for(vim.api.nvim_get_current_win())
+		from_viewer = target ~= nil
+	end
+	if not target then
+		local okp, preview = pcall(require, "opencode-manage.previewview")
+		if okp then
+			target = preview.split_target_for(vim.api.nvim_get_current_win())
+			from_viewer = target ~= nil
+		end
+	end
+	if target and vim.api.nvim_win_is_valid(target) then
+		vim.api.nvim_set_current_win(target)
+	end
 	vim.cmd(split_cmd .. " | terminal")
+	if from_viewer and split_cmd:find("vsplit", 1, true) then
+		vim.cmd("wincmd L")
+	end
 	vim.cmd("startinsert")
 	vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("cd " .. target_dir .. "<CR>", true, false, true), "n", true)
 end
